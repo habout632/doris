@@ -26,6 +26,7 @@ import org.apache.doris.catalog.PrimitiveType;
 import org.apache.doris.catalog.ScalarFunction;
 import org.apache.doris.catalog.ScalarType;
 import org.apache.doris.catalog.Type;
+import org.apache.doris.catalog.TypeUtils;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.Reference;
@@ -218,6 +219,13 @@ public class BinaryPredicate extends Predicate implements Writable {
     }
 
     @Override
+    public String toString() {
+        StringBuilder builder = new StringBuilder();
+        builder.append(children.get(0)).append(" ").append(op).append(" ").append(children.get(1));
+        return builder.toString();
+    }
+
+    @Override
     public Expr negate() {
         Operator newOp = null;
         switch (op) {
@@ -320,6 +328,11 @@ public class BinaryPredicate extends Predicate implements Writable {
     }
 
     private Type getCmpType() throws AnalysisException {
+        if (!getChild(0).isConstantImpl() && getChild(1).isConstantImpl()) {
+            getChild(1).compactForLiteral(getChild(0).getType());
+        } else if (!getChild(1).isConstantImpl() && getChild(0).isConstantImpl()) {
+            getChild(0).compactForLiteral(getChild(1).getType());
+        }
         PrimitiveType t1 = getChild(0).getType().getResultType().getPrimitiveType();
         PrimitiveType t2 = getChild(1).getType().getResultType().getPrimitiveType();
 
@@ -352,15 +365,11 @@ public class BinaryPredicate extends Predicate implements Writable {
         if (t1 == PrimitiveType.VARCHAR && t2 == PrimitiveType.VARCHAR) {
             return Type.VARCHAR;
         }
-        if (t1 == PrimitiveType.STRING && t2 == PrimitiveType.STRING
-                || t1 == PrimitiveType.STRING && t2 == PrimitiveType.VARCHAR
-                || t1 == PrimitiveType.VARCHAR && t2 == PrimitiveType.STRING) {
+        if ((t1 == PrimitiveType.STRING && (t2 == PrimitiveType.VARCHAR || t2 == PrimitiveType.STRING)) || (
+                t2 == PrimitiveType.STRING && (t1 == PrimitiveType.VARCHAR || t1 == PrimitiveType.STRING))) {
             return Type.STRING;
         }
         if (t1 == PrimitiveType.BIGINT && t2 == PrimitiveType.BIGINT) {
-            return Type.getAssignmentCompatibleType(getChild(0).getType(), getChild(1).getType(), false);
-        }
-        if (t1.isDecimalV3Type() || t2.isDecimalV3Type()) {
             return Type.getAssignmentCompatibleType(getChild(0).getType(), getChild(1).getType(), false);
         }
         if ((t1 == PrimitiveType.BIGINT || t1 == PrimitiveType.DECIMALV2)
@@ -371,6 +380,10 @@ public class BinaryPredicate extends Predicate implements Writable {
                 && (t2 == PrimitiveType.BIGINT || t2 == PrimitiveType.LARGEINT)) {
             return Type.LARGEINT;
         }
+        // MySQL will try to parse string as bigint, if failed, will take string as 0.
+        if (t1 == PrimitiveType.BIGINT && t2.isCharFamily()) {
+            return Type.BIGINT;
+        }
 
         // Implicit conversion affects query performance.
         // For a common example datekey='20200825' which datekey is int type.
@@ -380,12 +393,17 @@ public class BinaryPredicate extends Predicate implements Writable {
         // So it is also compatible with Mysql.
 
         if (t1.isStringType() || t2.isStringType()) {
-            if ((t1 == PrimitiveType.BIGINT || t1 == PrimitiveType.LARGEINT) && Type.canParseTo(getChild(1), t1)) {
+            if ((t1 == PrimitiveType.BIGINT || t1 == PrimitiveType.LARGEINT) && TypeUtils.canParseTo(getChild(1), t1)) {
                 return Type.fromPrimitiveType(t1);
             }
-            if ((t2 == PrimitiveType.BIGINT || t2 == PrimitiveType.LARGEINT) && Type.canParseTo(getChild(0), t2)) {
+            if ((t2 == PrimitiveType.BIGINT || t2 == PrimitiveType.LARGEINT) && TypeUtils.canParseTo(getChild(0), t2)) {
                 return Type.fromPrimitiveType(t2);
             }
+        }
+
+        if ((t1.isDecimalV3Type() && !t2.isStringType() && !t2.isFloatingPointType())
+                || (t2.isDecimalV3Type() && !t1.isStringType() && !t1.isFloatingPointType())) {
+            return Type.getAssignmentCompatibleType(getChild(0).getType(), getChild(1).getType(), false);
         }
 
         return Type.DOUBLE;
@@ -394,6 +412,7 @@ public class BinaryPredicate extends Predicate implements Writable {
     @Override
     public void analyzeImpl(Analyzer analyzer) throws AnalysisException {
         super.analyzeImpl(analyzer);
+        this.checkIncludeBitmap();
 
         for (Expr expr : children) {
             if (expr instanceof Subquery) {
@@ -633,8 +652,8 @@ public class BinaryPredicate extends Predicate implements Writable {
     }
 
     @Override
-    public Expr getResultValue() throws AnalysisException {
-        recursiveResetChildrenResult();
+    public Expr getResultValue(boolean inView) throws AnalysisException {
+        recursiveResetChildrenResult(inView);
         final Expr leftChildValue = getChild(0);
         final Expr rightChildValue = getChild(1);
         if (!(leftChildValue instanceof LiteralExpr)

@@ -24,6 +24,9 @@ namespace config {
 // Dir of custom config file
 CONF_String(custom_config_dir, "${DORIS_HOME}/conf");
 
+// Dir of jdbc drivers
+CONF_String(jdbc_drivers_dir, "${DORIS_HOME}/jdbc_drivers");
+
 // cluster id
 CONF_Int32(cluster_id, "-1");
 // port on which BackendService is exported
@@ -32,7 +35,8 @@ CONF_Int32(be_port, "9060");
 // port for brpc
 CONF_Int32(brpc_port, "8060");
 
-// the number of bthreads for brpc, the default value is set to -1, which means the number of bthreads is #cpu-cores
+// the number of bthreads for brpc, the default value is set to -1,
+// which means the number of bthreads is #cpu-cores
 CONF_Int32(brpc_num_threads, "-1");
 
 // port to brpc server for single replica load
@@ -57,6 +61,29 @@ CONF_String(memory_mode, "moderate");
 // must larger than 0. and if larger than physical memory size,
 // it will be set to physical memory size.
 CONF_String(mem_limit, "80%");
+
+// Soft memory limit as a fraction of hard memory limit.
+CONF_Double(soft_mem_limit_frac, "0.9");
+
+// The maximum low water mark of the system `/proc/meminfo/MemAvailable`, Unit byte, default 1.6G,
+// actual low water mark=min(1.6G, MemTotal * 10%), avoid wasting too much memory on machines
+// with large memory larger than 16G.
+// Turn up max. On machines with more than 16G memory, more memory buffers will be reserved for Full GC.
+// Turn down max. will use as much memory as possible.
+CONF_Int64(max_sys_mem_available_low_water_mark_bytes, "1717986918");
+
+// The size of the memory that gc wants to release each time, as a percentage of the mem limit.
+CONF_mString(process_minor_gc_size, "10%");
+CONF_mString(process_full_gc_size, "20%");
+
+// If true, when the process does not exceed the soft mem limit, the query memory will not be limited;
+// when the process memory exceeds the soft mem limit, the query with the largest ratio between the currently
+// used memory and the exec_mem_limit will be canceled.
+// If false, cancel query when the memory used exceeds exec_mem_limit, same as before.
+CONF_mBool(enable_query_memroy_overcommit, "true");
+
+// The maximum time a thread waits for a full GC. Currently only query will wait for full gc.
+CONF_mInt32(thread_wait_gc_max_milliseconds, "1000");
 
 // the port heartbeat service used
 CONF_Int32(heartbeat_service_port, "9050");
@@ -148,6 +175,8 @@ CONF_Bool(doris_enable_scanner_thread_pool_per_disk, "true");
 CONF_mInt64(doris_blocking_priority_queue_wait_timeout_ms, "500");
 // number of olap scanner thread pool size
 CONF_Int32(doris_scanner_thread_pool_thread_num, "48");
+// max number of remote scanner thread pool size
+CONF_Int32(doris_max_remote_scanner_thread_pool_thread_num, "512");
 // number of olap scanner thread pool queue size
 CONF_Int32(doris_scanner_thread_pool_queue_size, "102400");
 // default thrift client connect timeout(in seconds)
@@ -183,7 +212,7 @@ CONF_mInt64(memory_limitation_per_thread_for_schema_change_bytes, "2147483648");
 CONF_mInt64(memory_limitation_per_thread_for_storage_migration_bytes, "100000000");
 
 // the clean interval of file descriptor cache and segment cache
-CONF_mInt32(cache_clean_interval, "1800");
+CONF_mInt32(cache_clean_interval, "60");
 CONF_mInt32(disk_stat_monitor_interval, "5");
 CONF_mInt32(unused_rowset_monitor_interval, "30");
 CONF_String(storage_root_path, "${DORIS_HOME}/storage");
@@ -203,6 +232,8 @@ CONF_mInt32(tablet_rowset_stale_sweep_time_sec, "300");
 // garbage sweep policy
 CONF_Int32(max_garbage_sweep_interval, "3600");
 CONF_Int32(min_garbage_sweep_interval, "180");
+// garbage sweep every batch will sleep 1ms
+CONF_mInt32(garbage_sweep_batch_size, "100");
 CONF_mInt32(snapshot_expire_time_sec, "172800");
 // It is only a recommended value. When the disk space is insufficient,
 // the file storage period under trash dose not have to comply with this parameter.
@@ -223,19 +254,35 @@ CONF_Int32(storage_page_cache_shard_size, "16");
 // all storage page cache will be divided into data_page_cache and index_page_cache
 CONF_Int32(index_page_cache_percentage, "10");
 // whether to disable page cache feature in storage
-CONF_Bool(disable_storage_page_cache, "false");
+CONF_Bool(disable_storage_page_cache, "true");
 
 CONF_Bool(enable_storage_vectorization, "true");
 
 CONF_Bool(enable_low_cardinality_optimize, "true");
+CONF_Bool(enable_low_cardinality_cache_code, "true");
 
 // be policy
+// whether check compaction checksum
+CONF_mBool(enable_compaction_checksum, "false");
 // whether disable automatic compaction task
 CONF_mBool(disable_auto_compaction, "false");
 // whether enable vectorized compaction
 CONF_Bool(enable_vectorized_compaction, "true");
 // whether enable vectorized schema change/material-view/rollup task.
 CONF_Bool(enable_vectorized_alter_table, "true");
+// whether enable vertical compaction
+CONF_mBool(enable_vertical_compaction, "false");
+// whether enable ordered data compaction
+CONF_mBool(enable_ordered_data_compaction, "false");
+// In vertical compaction, column number for every group
+CONF_mInt32(vertical_compaction_num_columns_per_group, "5");
+// In vertical compaction, max memory usage for row_source_buffer
+CONF_Int32(vertical_compaction_max_row_source_memory_mb, "200");
+// In vertical compaction, max dest segment file size
+CONF_mInt64(max_segment_size_in_vertical_compaction, "268435456");
+
+// In ordered data compaction, min segment size for input rowset
+CONF_mInt32(ordered_data_compaction_min_segment_size, "10485760");
 
 // check the configuration of auto compaction in seconds when auto compaction disabled
 CONF_mInt32(check_auto_compaction_interval_seconds, "5");
@@ -269,7 +316,7 @@ CONF_mInt64(cumulative_size_based_compaction_lower_size_mbytes, "64");
 
 // cumulative compaction policy: min and max delta file's number
 CONF_mInt64(min_cumulative_compaction_num_singleton_deltas, "5");
-CONF_mInt64(max_cumulative_compaction_num_singleton_deltas, "1000");
+CONF_mInt64(max_cumulative_compaction_num_singleton_deltas, "100");
 
 // if compaction of a tablet failed, this tablet should not be chosen to
 // compaction until this interval passes.
@@ -352,8 +399,15 @@ CONF_Int32(single_replica_load_download_num_workers, "64");
 CONF_Int64(load_data_reserve_hours, "4");
 // log error log will be removed after this time
 CONF_mInt64(load_error_log_reserve_hours, "48");
-CONF_Int32(number_tablet_writer_threads, "16");
-CONF_Int32(number_slave_replica_download_threads, "64");
+
+// be brpc interface is classified into two categories: light and heavy
+// each category has diffrent thread number
+// threads to handle heavy api interface, such as transmit_data/transmit_block etc
+CONF_Int32(brpc_heavy_work_pool_threads, "192");
+// threads to handle light api interface, such as exec_plan_fragment_prepare/exec_plan_fragment_start
+CONF_Int32(brpc_light_work_pool_threads, "32");
+CONF_Int32(brpc_heavy_work_pool_max_queue_size, "10240");
+CONF_Int32(brpc_light_work_pool_max_queue_size, "10240");
 
 // The maximum amount of data that can be processed by a stream load
 CONF_mInt64(streaming_load_max_mb, "10240");
@@ -422,7 +476,7 @@ CONF_Int32(min_chunk_reserved_bytes, "1024");
 // of gperftools tcmalloc central lock.
 // Jemalloc or google tcmalloc have core cache, Chunk Allocator may no longer be needed after replacing
 // gperftools tcmalloc.
-CONF_mBool(disable_chunk_allocator_in_vec, "false");
+CONF_mBool(disable_chunk_allocator_in_vec, "true");
 
 // The probing algorithm of partitioned hash table.
 // Enable quadratic probing hash table
@@ -430,6 +484,8 @@ CONF_Bool(enable_quadratic_probing, "false");
 
 // for pprof
 CONF_String(pprof_profile_dir, "${DORIS_HOME}/log");
+// for jeprofile in jemalloc
+CONF_mString(jeprofile_dir, "${DORIS_HOME}/log");
 
 // to forward compatibility, will be removed later
 CONF_mBool(enable_token_check, "true");
@@ -461,8 +517,15 @@ CONF_String(buffer_pool_limit, "20%");
 // This is the percentage of buffer_pool_limit
 CONF_String(buffer_pool_clean_pages_limit, "50%");
 
-// Sleep time in seconds between memory maintenance iterations
-CONF_mInt64(memory_maintenance_sleep_time_s, "10");
+// Sleep time in milliseconds between memory maintenance iterations
+CONF_mInt32(memory_maintenance_sleep_time_ms, "100");
+
+// After full gc, no longer full gc and minor gc during sleep.
+// After minor gc, no minor gc during sleep, but full gc is possible.
+CONF_mInt32(memory_gc_sleep_time_s, "1");
+
+// Sleep time in milliseconds between load channel memory refresh iterations
+CONF_mInt64(load_channel_memory_refresh_sleep_time_ms, "100");
 
 // Alignment
 CONF_Int32(memory_max_alignment, "16");
@@ -472,6 +535,8 @@ CONF_mInt64(write_buffer_size, "209715200");
 
 // max buffer size used in memtable for the aggregated table
 CONF_mInt64(memtable_max_buffer_size, "419430400");
+// write buffer size in push task for sparkload, default 1GB
+CONF_mInt64(flush_size_for_sparkload, "1073741824");
 
 // following 2 configs limit the memory consumption of load process on a Backend.
 // eg: memory limit to 80% of mem limit config but up to 100GB(default)
@@ -541,6 +606,7 @@ CONF_mInt32(path_gc_check_interval_second, "86400");
 CONF_mInt32(path_gc_check_step, "1000");
 CONF_mInt32(path_gc_check_step_interval_ms, "10");
 CONF_mInt32(path_scan_interval_second, "86400");
+CONF_mInt32(path_scan_step_interval_ms, "70");
 
 // The following 2 configs limit the max usage of disk capacity of a data dir.
 // If both of these 2 threshold reached, no more data can be writen into that data dir.
@@ -551,7 +617,7 @@ CONF_mInt64(storage_flood_stage_left_capacity_bytes, "1073741824"); // 1GB
 // number of thread for flushing memtable per store
 CONF_Int32(flush_thread_num_per_store, "6");
 // number of thread for flushing memtable per store, for high priority load task
-CONF_Int32(high_priority_flush_thread_num_per_store, "1");
+CONF_Int32(high_priority_flush_thread_num_per_store, "6");
 
 // config for tablet meta checkpoint
 CONF_mInt32(tablet_meta_checkpoint_min_new_rowsets_num, "10");
@@ -578,7 +644,7 @@ CONF_mInt64(max_runnings_transactions_per_txn_map, "100");
 
 // tablet_map_lock shard size, the value is 2^n, n=0,1,2,3,4
 // this is a an enhancement for better performance to manage tablet
-CONF_Int32(tablet_map_shard_size, "1");
+CONF_Int32(tablet_map_shard_size, "4");
 
 // txn_map_lock shard size, the value is 2^n, n=0,1,2,3,4
 // this is a an enhancement for better performance to manage txn
@@ -593,9 +659,6 @@ CONF_Bool(ignore_load_tablet_failure, "false");
 
 // Whether to continue to start be when load tablet from header failed.
 CONF_mBool(ignore_rowset_stale_unconsistent_delete, "false");
-
-// Soft memory limit as a fraction of hard memory limit.
-CONF_Double(soft_mem_limit_frac, "0.9");
 
 // Set max cache's size of query results, the unit is M byte
 CONF_Int32(query_cache_max_size_mb, "256");
@@ -785,7 +848,7 @@ CONF_mInt32(orc_natural_read_size_mb, "8");
 CONF_mInt32(bloom_filter_predicate_check_row_num, "204800");
 
 //whether turn on quick compaction feature
-CONF_Bool(enable_quick_compaction, "false");
+CONF_Bool(enable_quick_compaction, "true");
 // For continuous versions that rows less than quick_compaction_max_rows will  trigger compaction quickly
 CONF_Int32(quick_compaction_max_rows, "1000");
 // min compaction versions
@@ -846,10 +909,28 @@ CONF_Int32(segcompaction_threshold_segment_num, "10");
 // The segment whose row number above the threshold will be compacted during segcompaction
 CONF_Int32(segcompaction_small_threshold, "1048576");
 
-CONF_String(jvm_max_heap_size, "1024M");
-
 // enable java udf and jdbc scannode
 CONF_Bool(enable_java_support, "true");
+
+// Set config randomly to check more issues in github workflow
+CONF_Bool(enable_fuzzy_mode, "false");
+
+// max depth of expression tree allowed.
+CONF_Int32(max_depth_of_expr_tree, "600");
+
+CONF_mBool(enable_stack_trace, "true");
+
+// enable shrink memory, default is false
+CONF_Bool(enable_shrink_memory, "false");
+
+// Allow invalid decimalv2 literal for compatible with old version. Recommend set it false strongly.
+CONF_mBool(allow_invalid_decimalv2_literal, "false");
+
+// data page size for primary key index.
+CONF_Int32(primary_key_data_page_size, "32768");
+
+// the max package size be thrift server can receive,avoid accepting error or too large package causing OOM,default 20M
+CONF_Int32(be_thrift_max_pkg_bytes, "20000000");
 
 #ifdef BE_TEST
 // test s3

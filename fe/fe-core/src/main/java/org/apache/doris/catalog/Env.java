@@ -99,6 +99,7 @@ import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.ClientPool;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.ConfigBase;
+import org.apache.doris.common.ConfigException;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
@@ -126,6 +127,7 @@ import org.apache.doris.datasource.CatalogMgr;
 import org.apache.doris.datasource.EsExternalCatalog;
 import org.apache.doris.datasource.ExternalMetaCacheMgr;
 import org.apache.doris.datasource.InternalCatalog;
+import org.apache.doris.datasource.hive.event.MetastoreEventsProcessor;
 import org.apache.doris.deploy.DeployManager;
 import org.apache.doris.deploy.impl.AmbariDeployManager;
 import org.apache.doris.deploy.impl.K8sDeployManager;
@@ -208,12 +210,11 @@ import org.apache.doris.qe.JournalObservable;
 import org.apache.doris.qe.VariableMgr;
 import org.apache.doris.resource.Tag;
 import org.apache.doris.service.FrontendOptions;
-import org.apache.doris.statistics.AnalysisJobScheduler;
+import org.apache.doris.statistics.AnalysisManager;
 import org.apache.doris.statistics.StatisticsCache;
 import org.apache.doris.statistics.StatisticsJobManager;
 import org.apache.doris.statistics.StatisticsJobScheduler;
 import org.apache.doris.statistics.StatisticsManager;
-import org.apache.doris.statistics.StatisticsRepository;
 import org.apache.doris.statistics.StatisticsTaskScheduler;
 import org.apache.doris.system.Backend;
 import org.apache.doris.system.Frontend;
@@ -263,7 +264,6 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Map.Entry;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.BlockingQueue;
@@ -319,6 +319,7 @@ public class Env {
     private DeleteHandler deleteHandler;
     private DbUsedDataQuotaInfoCollector dbUsedDataQuotaInfoCollector;
     private PartitionInMemoryInfoCollector partitionInMemoryInfoCollector;
+    private MetastoreEventsProcessor metastoreEventsProcessor;
 
     private MasterDaemon labelCleaner; // To clean old LabelInfo, ExportJobInfos
     private MasterDaemon txnCleaner; // To clean aborted or timeout txns
@@ -440,9 +441,7 @@ public class Env {
 
     private MTMVJobManager mtmvJobManager;
 
-    private final AnalysisJobScheduler analysisJobScheduler;
-
-    private final StatisticsCache statisticsCache;
+    private AnalysisManager analysisManager;
 
     private ExternalMetaCacheMgr extMetaCacheMgr;
 
@@ -557,6 +556,7 @@ public class Env {
         this.deleteHandler = new DeleteHandler();
         this.dbUsedDataQuotaInfoCollector = new DbUsedDataQuotaInfoCollector();
         this.partitionInMemoryInfoCollector = new PartitionInMemoryInfoCollector();
+        this.metastoreEventsProcessor = new MetastoreEventsProcessor();
 
         this.replayedJournalId = new AtomicLong(0L);
         this.isElectable = false;
@@ -644,9 +644,10 @@ public class Env {
         this.refreshManager = new RefreshManager();
         this.policyMgr = new PolicyMgr();
         this.mtmvJobManager = new MTMVJobManager();
-        this.analysisJobScheduler = new AnalysisJobScheduler();
-        this.statisticsCache = new StatisticsCache();
         this.extMetaCacheMgr = new ExternalMetaCacheMgr();
+        if (!isCheckpointCatalog) {
+            this.analysisManager = new AnalysisManager();
+        }
     }
 
     public static void destroyCheckpoint() {
@@ -1323,6 +1324,7 @@ public class Env {
         this.masterHttpPort = Config.http_port;
         MasterInfo info = new MasterInfo(this.masterIp, this.masterHttpPort, this.masterRpcPort);
         editLog.logMasterInfo(info);
+        LOG.info("logMasterInfo:{}", info);
 
         // for master, the 'isReady' is set behind.
         // but we are sure that all metadata is replayed if we get here.
@@ -1431,6 +1433,10 @@ public class Env {
         this.statisticsJobScheduler.start();
         this.statisticsTaskScheduler.start();
         new InternalSchemaInitializer().start();
+        if (Config.enable_hms_events_incremental_sync) {
+            metastoreEventsProcessor.start();
+        }
+
     }
 
     // start threads that should running on all FE
@@ -1646,7 +1652,7 @@ public class Env {
     }
 
     public StatisticsCache getStatisticsCache() {
-        return statisticsCache;
+        return analysisManager.getStatisticsCache();
     }
 
     public boolean hasReplayer() {
@@ -1835,6 +1841,10 @@ public class Env {
         newChecksum ^= size;
         for (int i = 0; i < size; i++) {
             AlterJobV2 alterJobV2 = AlterJobV2.read(dis);
+            if (alterJobV2.isExpire()) {
+                LOG.info("alter job {} is expired, type: {}, ignore it", alterJobV2.getJobId(), alterJobV2.getType());
+                continue;
+            }
             if (type == JobType.ROLLUP || type == JobType.SCHEMA_CHANGE) {
                 if (type == JobType.ROLLUP) {
                     this.getMaterializedViewHandler().addAlterJobV2(alterJobV2);
@@ -2075,7 +2085,7 @@ public class Env {
         int jobSize = dbToLoadJob.size();
         checksum ^= jobSize;
         dos.writeInt(jobSize);
-        for (Entry<Long, List<LoadJob>> entry : dbToLoadJob.entrySet()) {
+        for (Map.Entry<Long, List<LoadJob>> entry : dbToLoadJob.entrySet()) {
             long dbId = entry.getKey();
             checksum ^= dbId;
             dos.writeLong(dbId);
@@ -2589,7 +2599,7 @@ public class Env {
                 haProtocol.removeElectableNode(fe.getNodeName());
                 helperNodes.remove(Pair.of(host, port));
                 BDBHA ha = (BDBHA) haProtocol;
-                ha.removeUnReadyElectableNode(nodeName, getFollowerCount());
+                ha.removeUnReadyElectableNode(fe.getNodeName(), getFollowerCount());
             }
             editLog.logRemoveFrontend(fe);
         } finally {
@@ -2807,7 +2817,8 @@ public class Env {
                 // There MUST BE 2 space in front of each column description line
                 // sqlalchemy requires this to parse SHOW CREATE TABLE stmt.
                 if (table.getType() == TableType.OLAP) {
-                    sb.append("  ").append(column.toSql(((OlapTable) table).getKeysType() == KeysType.UNIQUE_KEYS));
+                    sb.append("  ").append(
+                            column.toSql(((OlapTable) table).getKeysType() == KeysType.UNIQUE_KEYS, true));
                 } else {
                     sb.append("  ").append(column.toSql());
                 }
@@ -2971,16 +2982,16 @@ public class Env {
             sb.append(",\n\"").append(PropertyAnalyzer.PROPERTIES_STORAGE_FORMAT).append("\" = \"");
             sb.append(olapTable.getStorageFormat()).append("\"");
 
-            // remote storage
-            String remoteStoragePolicy = olapTable.getRemoteStoragePolicy();
-            if (!Strings.isNullOrEmpty(remoteStoragePolicy)) {
-                sb.append(",\n\"").append(PropertyAnalyzer.PROPERTIES_REMOTE_STORAGE_POLICY).append("\" = \"");
-                sb.append(remoteStoragePolicy).append("\"");
-            }
             // compression type
             if (olapTable.getCompressionType() != TCompressionType.LZ4F) {
                 sb.append(",\n\"").append(PropertyAnalyzer.PROPERTIES_COMPRESSION).append("\" = \"");
                 sb.append(olapTable.getCompressionType()).append("\"");
+            }
+
+            // estimate_partition_size
+            if (!olapTable.getEstimatePartitionSize().equals("")) {
+                sb.append(",\n\"").append(PropertyAnalyzer.PROPERTIES_ESTIMATE_PARTITION_SIZE).append("\" = \"");
+                sb.append(olapTable.getEstimatePartitionSize()).append("\"");
             }
 
             // unique key table with merge on write
@@ -3109,7 +3120,8 @@ public class Env {
             sb.append("\"max_docvalue_fields\" = \"").append(esTable.getMaxDocValueFields()).append("\",\n");
             sb.append("\"enable_keyword_sniff\" = \"").append(esTable.isEnableKeywordSniff()).append("\",\n");
             sb.append("\"nodes_discovery\" = \"").append(esTable.isNodesDiscovery()).append("\",\n");
-            sb.append("\"http_ssl_enabled\" = \"").append(esTable.isHttpSslEnabled()).append("\"\n");
+            sb.append("\"http_ssl_enabled\" = \"").append(esTable.isHttpSslEnabled()).append("\",\n");
+            sb.append("\"like_push_down\" = \"").append(esTable.isLikePushDown()).append("\"\n");
             sb.append(")");
         } else if (table.getType() == TableType.HIVE) {
             HiveTable hiveTable = (HiveTable) table;
@@ -3147,7 +3159,8 @@ public class Env {
             addTableComment(jdbcTable, sb);
             sb.append("\nPROPERTIES (\n");
             sb.append("\"resource\" = \"").append(jdbcTable.getResourceName()).append("\",\n");
-            sb.append("\"table\" = \"").append(jdbcTable.getJdbcTable()).append("\"");
+            sb.append("\"table\" = \"").append(jdbcTable.getJdbcTable()).append("\",\n");
+            sb.append("\"table_type\" = \"").append(jdbcTable.getJdbcTypeName()).append("\"");
             sb.append("\n)");
         }
 
@@ -3429,8 +3442,10 @@ public class Env {
                             DataProperty hddProperty = new DataProperty(TStorageMedium.HDD);
                             partitionInfo.setDataProperty(partition.getId(), hddProperty);
                             storageMediumMap.put(partitionId, TStorageMedium.HDD);
-                            LOG.debug("partition[{}-{}-{}] storage medium changed from SSD to HDD", dbId, tableId,
-                                    partitionId);
+                            LOG.info("partition[{}-{}-{}] storage medium changed from SSD to HDD. "
+                                            + "cooldown time: {}. current time: {}", dbId, tableId, partitionId,
+                                    TimeUtils.longToTimeString(dataProperty.getCooldownTimeMs()),
+                                    TimeUtils.longToTimeString(currentTimeMs));
 
                             // log
                             ModifyPartitionInfo info = new ModifyPartitionInfo(db.getId(), olapTable.getId(),
@@ -3611,6 +3626,8 @@ public class Env {
         this.masterIp = info.getIp();
         this.masterHttpPort = info.getHttpPort();
         this.masterRpcPort = info.getRpcPort();
+        LOG.info("setMaster MasterInfo:{}", info);
+
     }
 
     public boolean canRead() {
@@ -4145,11 +4162,25 @@ public class Env {
         // 4. modify distribution info
         DistributionInfo distributionInfo = table.getDefaultDistributionInfo();
         if (distributionInfo.getType() == DistributionInfoType.HASH) {
+            // modify default distribution info
             List<Column> distributionColumns = ((HashDistributionInfo) distributionInfo).getDistributionColumns();
             for (Column column : distributionColumns) {
                 if (column.getName().equalsIgnoreCase(colName)) {
                     column.setName(newColName);
                     break;
+                }
+            }
+            // modify distribution info inside partitions
+            for (Partition p : table.getPartitions()) {
+                DistributionInfo partDistInfo = p.getDistributionInfo();
+                if (partDistInfo.getType() != DistributionInfoType.HASH) {
+                    continue;
+                }
+                List<Column> partDistColumns = ((HashDistributionInfo) partDistInfo).getDistributionColumns();
+                for (Column column : partDistColumns) {
+                    if (column.getName().equalsIgnoreCase(colName)) {
+                        column.setName(newColName);
+                    }
                 }
             }
         }
@@ -4381,13 +4412,10 @@ public class Env {
                 }
                 if (distributionInfo.getType() == DistributionInfoType.HASH) {
                     HashDistributionInfo hashDistributionInfo = (HashDistributionInfo) distributionInfo;
-                    List<Column> newDistriCols = hashDistributionInfo.getDistributionColumns();
-                    List<Column> defaultDistriCols
-                            = ((HashDistributionInfo) defaultDistributionInfo).getDistributionColumns();
-                    if (!newDistriCols.equals(defaultDistriCols)) {
-                        throw new DdlException(
-                                "Cannot assign hash distribution with different distribution cols. " + "default is: "
-                                        + defaultDistriCols);
+                    if (!hashDistributionInfo.sameDistributionColumns((HashDistributionInfo) defaultDistributionInfo)) {
+                        throw new DdlException("Cannot assign hash distribution with different distribution cols. "
+                                + "new is: " + hashDistributionInfo.getDistributionColumns() + " default is: "
+                                + ((HashDistributionInfo) distributionInfo).getDistributionColumns());
                     }
                 }
 
@@ -4445,7 +4473,19 @@ public class Env {
             throw new DdlException(ErrorCode.ERR_UNKNOWN_CATALOG.formatErrorMsg(catalogName),
                     ErrorCode.ERR_UNKNOWN_CATALOG);
         }
+
+        String currentDB = ctx.getDatabase();
+        if (StringUtils.isNotEmpty(currentDB)) {
+            // When dropped the current catalog in current context, the current catalog will be null.
+            if (ctx.getCurrentCatalog() != null) {
+                catalogMgr.addLastDBOfCatalog(ctx.getCurrentCatalog().getName(), currentDB);
+            }
+        }
         ctx.changeDefaultCatalog(catalogName);
+        String lastDb = catalogMgr.getLastDB(catalogName);
+        if (StringUtils.isNotEmpty(lastDb)) {
+            ctx.setDatabase(lastDb);
+        }
         if (catalogIf instanceof EsExternalCatalog) {
             ctx.setDatabase(SystemInfoService.DEFAULT_CLUSTER + ClusterNamespace.CLUSTER_DELIMITER
                     + EsExternalCatalog.DEFAULT_DB);
@@ -4454,7 +4494,7 @@ public class Env {
 
     // Change current database of this session.
     public void changeDb(ConnectContext ctx, String qualifiedDb) throws DdlException {
-        if (!auth.checkDbPriv(ctx, qualifiedDb, PrivPredicate.SHOW)) {
+        if (!auth.checkDbPriv(ctx, ctx.getDefaultCatalog(), qualifiedDb, PrivPredicate.SHOW)) {
             ErrorReport.reportDdlException(ErrorCode.ERR_DBACCESS_DENIED_ERROR, ctx.getQualifiedUser(), qualifiedDb);
         }
 
@@ -4774,7 +4814,7 @@ public class Env {
     public void createFunction(CreateFunctionStmt stmt) throws UserException {
         FunctionName name = stmt.getFunctionName();
         Database db = getInternalCatalog().getDbOrDdlException(name.getDb());
-        db.addFunction(stmt.getFunction());
+        db.addFunction(stmt.getFunction(), stmt.isIfNotExists());
     }
 
     public void replayCreateFunction(Function function) throws MetaNotFoundException {
@@ -4786,7 +4826,7 @@ public class Env {
     public void dropFunction(DropFunctionStmt stmt) throws UserException {
         FunctionName name = stmt.getFunctionName();
         Database db = getInternalCatalog().getDbOrDdlException(name.getDb());
-        db.dropFunction(stmt.getFunction());
+        db.dropFunction(stmt.getFunction(), stmt.isIfExists());
     }
 
     public void replayDropFunction(FunctionSearchDesc functionSearchDesc) throws MetaNotFoundException {
@@ -4800,7 +4840,11 @@ public class Env {
         Preconditions.checkState(configs.size() == 1);
 
         for (Map.Entry<String, String> entry : configs.entrySet()) {
-            ConfigBase.setMutableConfig(entry.getKey(), entry.getValue());
+            try {
+                ConfigBase.setMutableConfig(entry.getKey(), entry.getValue());
+            } catch (ConfigException e) {
+                throw new DdlException(e.getMessage());
+            }
         }
     }
 
@@ -5232,15 +5276,15 @@ public class Env {
         return count;
     }
 
-    public AnalysisJobScheduler getAnalysisJobScheduler() {
-        return analysisJobScheduler;
-    }
-
     // TODO:
     //  1. handle partition level analysis statement properly
     //  2. support sample job
     //  3. support period job
     public void createAnalysisJob(AnalyzeStmt analyzeStmt) {
-        StatisticsRepository.createAnalysisJob(analyzeStmt);
+        analysisManager.createAnalysisJob(analyzeStmt);
+    }
+
+    public AnalysisManager getAnalysisManager() {
+        return analysisManager;
     }
 }

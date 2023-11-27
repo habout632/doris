@@ -199,6 +199,65 @@ Total: 1296.4 MB
 
 这个命令的输出与HEAP PROFILE的输出及查看方式一样，这里就不再详细说明。这个命令只有在执行的过程中才会开启统计，相比HEAP PROFILE对于进程性能的影响有限。
 
+#### JEMALLOC HEAP PROFILE
+
+##### 1. runtime heap dump by http 
+在`start_be.sh` 中`JEMALLOC_CONF` 增加 `,prof:true,lg_prof_sample:10` 并重启BE，然后使用jemalloc heap dump http接口，在对应的BE机器上生成heap dump文件。
+
+heap dump文件所在目录可以在 ``be.conf`` 中通过``jeprofile_dir``变量进行配置，默认为``${DORIS_HOME}/log``
+
+```shell
+curl http://be_host:be_webport/jeheap/dump
+```
+
+`prof`: 打开后jemalloc将根据当前内存使用情况生成heap dump文件，heap profile采样存在少量性能损耗，性能测试时可关闭。
+`lg_prof_sample`: heap profile采样间隔，默认值19，即默认采样间隔为512K(2^19 B)，这会导致heap profile记录的内存通常只有10%，`lg_prof_sample:10`可以减少采样间隔到1K (2^10 B), 更频繁的采样会使heap profile接近真实内存，但这会带来更大的性能损耗。
+
+详细参数说明参考 https://linux.die.net/man/3/jemalloc。
+
+#### 2. jemalloc heap dump profiling
+
+1.  单个heap dump文件生成纯文本分析结果
+```shell
+   jeprof lib/doris_be heap_dump_file_1
+   ```
+
+2.  分析两个heap dump的diff
+   ```shell
+   jeprof lib/doris_be --base=heap_dump_file_1 heap_dump_file_2
+   ```
+   
+3. 生成调用关系图片
+
+   安装绘图所需的依赖项
+   ```shell
+   yum install ghostscript graphviz
+   ```
+   通过在一短时间内多次运行上述命令可以生成多份dump 文件，可以选取第一份dump 文件作为baseline 进行diff对比分析
+   
+   ```shell
+   jeprof --dot lib/doris_be --base=heap_dump_file_1 heap_dump_file_2
+   ```
+   执行完上述命令，终端中会输出dot语法的图，将其贴到[在线dot绘图网站](http://www.webgraphviz.com/)，生成内存分配图，然后进行分析，此种方式能够直接通过终端输出结果进行绘图，比较适用于传输文件不是很方便的服务器。
+   
+   也可以通过如下命令直接生成调用关系result.pdf文件传输到本地后进行查看
+   ```shell
+   jeprof --pdf lib/doris_be --base=heap_dump_file_1 heap_dump_file_2 > result.pdf
+   ```
+
+##### 3. heap dump by JEMALLOC_CONF
+通过更改`start_be.sh` 中`JEMALLOC_CONF` 变量后重新启动BE 来进行heap dump
+
+1. 每1MB dump一次:
+
+   `JEMALLOC_CONF`变量中新增两个变量设置`prof:true,lg_prof_interval:20`  其中`prof:true`是打开profiling，`lg_prof_interval:20`中表示每1MB(2^20)生成一次dump 
+2. 每次达到新高时dump:
+   
+   `JEMALLOC_CONF`变量中新增两个变量设置`prof:true,prof_gdump:true` 其中`prof:true`是打开profiling，`prof_gdump:true` 代表内存使用达到新高时生成dump
+3. 程序退出时内存泄漏dump:
+   
+   `JEMALLOC_CONF`变量中新增三个变量设置`prof_leak:true,lg_prof_sample:0,prof_final:true`
+
 #### LSAN
 
 [LSAN](https://github.com/google/sanitizers/wiki/AddressSanitizerLeakSanitizer)是一个地址检查工具，GCC已经集成。在我们编译代码的时候开启相应的编译选项，就能够开启这个功能。当程序发生可以确定的内存泄露时，会将泄露堆栈打印。Doris BE已经集成了这个工具，只需要在编译的时候使用如下的命令进行编译就能够生成带有内存泄露检测版本的BE二进制

@@ -26,6 +26,7 @@ import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
 import org.apache.doris.common.util.PrintableMap;
+import org.apache.doris.common.util.TimeUtils;
 import org.apache.doris.persist.gson.GsonUtils;
 import org.apache.doris.resource.Tag;
 import org.apache.doris.system.HeartbeatResponse.HbStatus;
@@ -587,13 +588,12 @@ public class Backend implements Writable {
             // When first upgrade from old version, tags may be null
             tagMap = Maps.newHashMap();
         }
-        if (!tagMap.containsKey(Tag.TYPE_LOCATION)) {
+        if (!locationTag.value.equals(tagMap.get(Tag.TYPE_LOCATION))) {
             // ATTN: here we use Tag.TYPE_LOCATION directly, not locationTag.type,
             // because we need to make sure the previous tag must be a location type tag,
             // and if not, convert it to location type.
             tagMap.put(Tag.TYPE_LOCATION, locationTag.value);
         }
-        locationTag = Tag.createNotCheck(Tag.TYPE_LOCATION, tagMap.get(Tag.TYPE_LOCATION));
     }
 
     public static Backend read(DataInput in) throws IOException {
@@ -632,6 +632,7 @@ public class Backend implements Writable {
     @Override
     public String toString() {
         return "Backend [id=" + id + ", host=" + host + ", heartbeatPort=" + heartbeatPort + ", alive=" + isAlive.get()
+                + ", lastStartTime=" + TimeUtils.longToTimeString(lastStartTime)
                 + ", tags: " + tagMap + "]";
     }
 
@@ -673,7 +674,7 @@ public class Backend implements Writable {
      * handle Backend's heartbeat response.
      * return true if any port changed, or alive state is changed.
      */
-    public boolean handleHbResponse(BackendHbResponse hbResponse) {
+    public boolean handleHbResponse(BackendHbResponse hbResponse, boolean isReplay) {
         boolean isChanged = false;
         if (hbResponse.getStatus() == HbStatus.OK) {
             if (!this.version.equals(hbResponse.getVersion())) {
@@ -706,17 +707,21 @@ public class Backend implements Writable {
             if (!isAlive.get()) {
                 isChanged = true;
                 this.lastStartTime = hbResponse.getBeStartTime();
-                LOG.info("{} is alive, last start time: {}", this.toString(), hbResponse.getBeStartTime());
+                LOG.info("{} is back to alive", this.toString());
                 this.isAlive.set(true);
-            } else if (this.lastStartTime <= 0) {
-                this.lastStartTime = hbResponse.getBeStartTime();
             }
 
+            if (this.lastStartTime != hbResponse.getBeStartTime() && hbResponse.getBeStartTime() > 0) {
+                LOG.info("{} update last start time to {}", this.toString(), hbResponse.getBeStartTime());
+                this.lastStartTime = hbResponse.getBeStartTime();
+                isChanged = true;
+            }
             heartbeatErrMsg = "";
             this.heartbeatFailureCounter = 0;
         } else {
             // Only set backend to dead if the heartbeat failure counter exceed threshold.
-            if (++this.heartbeatFailureCounter >= Config.max_backend_heartbeat_failure_tolerance_count) {
+            // And if it is a replay process, must set backend to dead.
+            if (isReplay || ++this.heartbeatFailureCounter >= Config.max_backend_heartbeat_failure_tolerance_count) {
                 if (isAlive.compareAndSet(true, false)) {
                     isChanged = true;
                     LOG.warn("{} is dead,", this.toString());

@@ -32,6 +32,7 @@ import org.apache.doris.common.DdlException;
 import org.apache.doris.common.LabelAlreadyUsedException;
 import org.apache.doris.common.MetaNotFoundException;
 import org.apache.doris.common.PatternMatcher;
+import org.apache.doris.common.PatternMatcherWrapper;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.io.Writable;
 import org.apache.doris.common.util.LogBuilder;
@@ -239,24 +240,31 @@ public class LoadManager implements Writable {
             throws AnalysisException {
         String label = stmt.getLabel();
         String state = stmt.getState();
-        PatternMatcher matcher = PatternMatcher.createMysqlPattern(label, CaseSensibility.LABEL.getCaseSensibility());
-        matchLoadJobs.addAll(loadJobs.stream().filter(job -> {
-            if (stmt.getOperator() != null) {
-                // compound
-                boolean labelFilter =
-                        label.contains("%") ? matcher.match(job.getLabel()) : job.getLabel().equalsIgnoreCase(label);
-                boolean stateFilter = job.getState().name().equalsIgnoreCase(state);
-                return Operator.AND.equals(stmt.getOperator()) ? labelFilter && stateFilter :
-                        labelFilter || stateFilter;
-            }
-            if (StringUtils.isNotEmpty(label)) {
-                return label.contains("%") ? matcher.match(job.getLabel()) : job.getLabel().equalsIgnoreCase(label);
-            }
-            if (StringUtils.isNotEmpty(state)) {
-                return job.getState().name().equalsIgnoreCase(state);
-            }
-            return false;
-        }).collect(Collectors.toList()));
+        PatternMatcher matcher = PatternMatcherWrapper.createMysqlPattern(label,
+                CaseSensibility.LABEL.getCaseSensibility());
+        matchLoadJobs.addAll(
+            loadJobs.stream()
+                    .filter(job -> job.getState() != JobState.CANCELLED)
+                    .filter(job -> {
+                        if (stmt.getOperator() != null) {
+                            // compound
+                            boolean labelFilter =
+                                    label.contains("%") ? matcher.match(job.getLabel())
+                                            : job.getLabel().equalsIgnoreCase(label);
+                            boolean stateFilter = job.getState().name().equalsIgnoreCase(state);
+                            return Operator.AND.equals(stmt.getOperator()) ? labelFilter && stateFilter :
+                                    labelFilter || stateFilter;
+                        }
+                        if (StringUtils.isNotEmpty(label)) {
+                            return label.contains("%") ? matcher.match(job.getLabel())
+                                    : job.getLabel().equalsIgnoreCase(label);
+                        }
+                        if (StringUtils.isNotEmpty(state)) {
+                            return job.getState().name().equalsIgnoreCase(state);
+                        }
+                        return false;
+                    }).collect(Collectors.toList())
+        );
     }
 
     /**
@@ -482,7 +490,8 @@ public class LoadManager implements Writable {
                 } else {
                     // non-accurate match
                     PatternMatcher matcher =
-                            PatternMatcher.createMysqlPattern(labelValue, CaseSensibility.LABEL.getCaseSensibility());
+                            PatternMatcherWrapper.createMysqlPattern(labelValue,
+                                    CaseSensibility.LABEL.getCaseSensibility());
                     for (Map.Entry<String, List<LoadJob>> entry : labelToLoadJobs.entrySet()) {
                         if (matcher.match(entry.getKey())) {
                             loadJobList.addAll(entry.getValue());

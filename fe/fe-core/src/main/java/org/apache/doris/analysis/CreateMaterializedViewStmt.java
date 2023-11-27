@@ -105,6 +105,10 @@ public class CreateMaterializedViewStmt extends DdlStmt {
         this.isReplay = isReplay;
     }
 
+    public boolean isReplay() {
+        return isReplay;
+    }
+
     public String getMVName() {
         return mvName;
     }
@@ -191,7 +195,7 @@ public class CreateMaterializedViewStmt extends DdlStmt {
                 }
                 SlotRef slotRef = (SlotRef) selectListItemExpr;
                 // check duplicate column
-                String columnName = slotRef.getColumnName().toLowerCase();
+                String columnName = slotRef.getColumnName();
                 if (!mvColumnNameSet.add(columnName)) {
                     ErrorReport.reportAnalysisException(ErrorCode.ERR_DUP_FIELDNAME, columnName);
                 }
@@ -217,7 +221,7 @@ public class CreateMaterializedViewStmt extends DdlStmt {
                 List<SlotRef> slots = new ArrayList<>();
                 functionCallExpr.collect(SlotRef.class, slots);
                 Preconditions.checkArgument(slots.size() == 1);
-                String columnName = slots.get(0).getColumnName().toLowerCase();
+                String columnName = slots.get(0).getColumnName();
                 if (!mvColumnNameSet.add(columnName)) {
                     ErrorReport.reportAnalysisException(ErrorCode.ERR_DUP_FIELDNAME, columnName);
                 }
@@ -244,6 +248,10 @@ public class CreateMaterializedViewStmt extends DdlStmt {
             throw new AnalysisException("The materialized view only support one table in from clause.");
         }
         TableName tableName = tableRefList.get(0).getName();
+        if (tableName == null) {
+            throw new AnalysisException("table in from clause is invalid, please check if it's single table "
+                    + "and not sub-query");
+        }
         baseIndexName = tableName.getTbl();
         dbName = tableName.getDb();
     }
@@ -359,7 +367,7 @@ public class CreateMaterializedViewStmt extends DdlStmt {
         functionCallExpr.collect(SlotRef.class, slots);
         Preconditions.checkArgument(slots.size() == 1);
         SlotRef baseColumnRef = slots.get(0);
-        String baseColumnName = baseColumnRef.getColumnName().toLowerCase();
+        String baseColumnName = baseColumnRef.getColumnName();
         Column baseColumn = baseColumnRef.getColumn();
         Preconditions.checkNotNull(baseColumn);
         Type baseType = baseColumn.getOriginType();

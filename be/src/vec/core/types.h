@@ -284,9 +284,18 @@ struct Decimal {
     DECLARE_NUMERIC_CTOR(Int64)
     DECLARE_NUMERIC_CTOR(UInt32)
     DECLARE_NUMERIC_CTOR(UInt64)
-    DECLARE_NUMERIC_CTOR(Float32)
-    DECLARE_NUMERIC_CTOR(Float64)
+
 #undef DECLARE_NUMERIC_CTOR
+    Decimal(const Float32& value_) : value(value_) {
+        if constexpr (std::is_integral<T>::value) {
+            value = round(value_);
+        }
+    }
+    Decimal(const Float64& value_) : value(value_) {
+        if constexpr (std::is_integral<T>::value) {
+            value = round(value_);
+        }
+    }
 
     static Decimal double_to_decimal(double value_) {
         DecimalV2Value decimal_value;
@@ -413,6 +422,10 @@ inline constexpr bool IsDecimal128I<Decimal128I> = true;
 template <typename T>
 constexpr bool IsDecimalV2 = IsDecimal128<T> && !IsDecimal128I<T>;
 
+template <typename T, typename U>
+using DisposeDecimal = std::conditional_t<IsDecimalV2<T>, Decimal128,
+                                          std::conditional_t<IsDecimalNumber<T>, Decimal128I, U>>;
+
 template <typename T>
 constexpr bool IsFloatNumber = false;
 template <>
@@ -529,14 +542,13 @@ inline const char* getTypeName(TypeIndex idx) {
 } // namespace doris
 
 /// Specialization of `std::hash` for the Decimal<T> types.
-namespace std {
 template <typename T>
-struct hash<doris::vectorized::Decimal<T>> {
+struct std::hash<doris::vectorized::Decimal<T>> {
     size_t operator()(const doris::vectorized::Decimal<T>& x) const { return hash<T>()(x.value); }
 };
 
 template <>
-struct hash<doris::vectorized::Decimal128> {
+struct std::hash<doris::vectorized::Decimal128> {
     size_t operator()(const doris::vectorized::Decimal128& x) const {
         return std::hash<doris::vectorized::Int64>()(x.value >> 64) ^
                std::hash<doris::vectorized::Int64>()(
@@ -544,7 +556,7 @@ struct hash<doris::vectorized::Decimal128> {
     }
 };
 
-constexpr bool is_integer(doris::vectorized::TypeIndex index) {
+constexpr bool typeindex_is_int(doris::vectorized::TypeIndex index) {
     using TypeIndex = doris::vectorized::TypeIndex;
     switch (index) {
     case TypeIndex::UInt8:
@@ -564,4 +576,3 @@ constexpr bool is_integer(doris::vectorized::TypeIndex index) {
     }
     }
 }
-} // namespace std

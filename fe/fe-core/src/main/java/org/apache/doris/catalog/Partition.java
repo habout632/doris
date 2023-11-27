@@ -197,8 +197,10 @@ public class Partition extends MetaObject implements Writable {
 
     public MaterializedIndex deleteRollupIndex(long indexId) {
         if (this.idToVisibleRollupIndex.containsKey(indexId)) {
+            LOG.info("delete visible rollup index {} in partition {}-{}", indexId, id, name);
             return idToVisibleRollupIndex.remove(indexId);
         } else {
+            LOG.info("delete shadow rollup index {} in partition {}-{}", indexId, id, name);
             return idToShadowIndex.remove(indexId);
         }
     }
@@ -251,10 +253,10 @@ public class Partition extends MetaObject implements Writable {
         return indices;
     }
 
-    public long getDataSize() {
+    public long getDataSize(boolean singleReplica) {
         long dataSize = 0;
         for (MaterializedIndex mIndex : getMaterializedIndices(IndexExtState.VISIBLE)) {
-            dataSize += mIndex.getDataSize();
+            dataSize += mIndex.getDataSize(singleReplica);
         }
         return dataSize;
     }

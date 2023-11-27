@@ -150,24 +150,23 @@ MutableColumnPtr DataTypeDecimal<T>::create_column() const {
 }
 
 template <typename T>
-T DataTypeDecimal<T>::parse_from_string(const std::string& str) const {
+bool DataTypeDecimal<T>::parse_from_string(const std::string& str, T* res) const {
     StringParser::ParseResult result = StringParser::PARSE_SUCCESS;
-    T value = StringParser::string_to_decimal<__int128>(str.c_str(), str.size(), precision, scale,
-                                                        &result);
-    if (result != StringParser::PARSE_SUCCESS) {
-        LOG(WARNING) << "Failed to parse string of decimal";
-    }
-    return value;
+    *res = StringParser::string_to_decimal<__int128>(str.c_str(), str.size(), precision, scale,
+                                                     &result);
+    return result == StringParser::PARSE_SUCCESS;
 }
 
 DataTypePtr create_decimal(UInt64 precision_value, UInt64 scale_value, bool use_v2) {
     if (precision_value < min_decimal_precision() ||
         precision_value > max_decimal_precision<Decimal128>()) {
-        LOG(FATAL) << "Wrong precision";
+        LOG(WARNING) << "Wrong precision " << precision_value;
+        return nullptr;
     }
 
     if (static_cast<UInt64>(scale_value) > precision_value) {
-        LOG(FATAL) << "Negative scales and scales larger than precision are not supported";
+        LOG(WARNING) << "Negative scales and scales larger than precision are not supported";
+        return nullptr;
     }
 
     if (use_v2) {
@@ -200,30 +199,6 @@ Decimal128 DataTypeDecimal<Decimal128>::get_scale_multiplier(UInt32 scale) {
 template <>
 Decimal128I DataTypeDecimal<Decimal128I>::get_scale_multiplier(UInt32 scale) {
     return common::exp10_i128(scale);
-}
-
-template <typename T>
-void convert_to_decimal(T* from_value, T* to_value, int32_t from_scale, int32_t to_scale,
-                        bool* loss_accuracy) {
-    if (from_scale == to_scale) {
-        *to_value = *from_value;
-        return;
-    }
-    if (from_scale > to_scale) {
-        *to_value =
-                (*from_value) / static_cast<T>(DataTypeDecimal<Decimal<T>>::get_scale_multiplier(
-                                        from_scale - to_scale));
-        *loss_accuracy =
-                ((*from_value) % static_cast<T>(DataTypeDecimal<Decimal<T>>::get_scale_multiplier(
-                                         from_scale - to_scale))) != 0;
-    } else {
-        if (common::mul_overflow(*from_value,
-                                 static_cast<T>(DataTypeDecimal<Decimal<T>>::get_scale_multiplier(
-                                         to_scale - from_scale)),
-                                 *to_value)) {
-            LOG(WARNING) << "Decimal convert overflow";
-        }
-    }
 }
 
 template <typename T>

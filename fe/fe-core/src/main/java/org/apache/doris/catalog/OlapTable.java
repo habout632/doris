@@ -36,6 +36,7 @@ import org.apache.doris.catalog.Tablet.TabletStatus;
 import org.apache.doris.clone.TabletSchedCtx;
 import org.apache.doris.clone.TabletScheduler;
 import org.apache.doris.common.AnalysisException;
+import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.Pair;
@@ -46,9 +47,10 @@ import org.apache.doris.common.util.PropertyAnalyzer;
 import org.apache.doris.common.util.Util;
 import org.apache.doris.qe.OriginStatement;
 import org.apache.doris.resource.Tag;
-import org.apache.doris.statistics.AnalysisJob;
-import org.apache.doris.statistics.AnalysisJobInfo;
-import org.apache.doris.statistics.AnalysisJobScheduler;
+import org.apache.doris.statistics.AnalysisTaskInfo;
+import org.apache.doris.statistics.AnalysisTaskScheduler;
+import org.apache.doris.statistics.BaseAnalysisTask;
+import org.apache.doris.statistics.OlapAnalysisTask;
 import org.apache.doris.system.Backend;
 import org.apache.doris.system.SystemInfoService;
 import org.apache.doris.thrift.TCompressionType;
@@ -68,6 +70,7 @@ import com.google.common.collect.Sets;
 import org.apache.commons.codec.digest.DigestUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.parquet.Strings;
 
 import java.io.DataInput;
 import java.io.DataOutput;
@@ -350,6 +353,7 @@ public class OlapTable extends Table {
         if (indexId != baseIndexId) {
             rebuildFullSchema();
         }
+        LOG.info("delete index info {} in table {}-{}", indexName, id, name);
         return true;
     }
 
@@ -386,6 +390,9 @@ public class OlapTable extends Table {
 
     public List<MaterializedIndex> getVisibleIndex() {
         Optional<Partition> partition = idToPartition.values().stream().findFirst();
+        if (!partition.isPresent()) {
+            partition = tempPartitions.getAllPartitions().stream().findFirst();
+        }
         return partition.isPresent() ? partition.get().getMaterializedIndices(IndexExtState.VISIBLE)
                 : Collections.emptyList();
     }
@@ -428,9 +435,10 @@ public class OlapTable extends Table {
     /**
      * Reset properties to correct values.
      */
-    public void resetPropertiesForRestore(boolean reserveDynamicPartitionEnable, ReplicaAllocation replicaAlloc) {
+    public void resetPropertiesForRestore(boolean reserveDynamicPartitionEnable, boolean reserveReplica,
+                                          ReplicaAllocation replicaAlloc) {
         if (tableProperty != null) {
-            tableProperty.resetPropertiesForRestore(reserveDynamicPartitionEnable, replicaAlloc);
+            tableProperty.resetPropertiesForRestore(reserveDynamicPartitionEnable, reserveReplica, replicaAlloc);
         }
         // remove colocate property.
         setColocateGroup(null);
@@ -584,9 +592,13 @@ public class OlapTable extends Table {
         if (full) {
             return indexIdToMeta.get(indexId).getSchema();
         } else {
-            return indexIdToMeta.get(indexId).getSchema().stream().filter(column ->
-                    column.isVisible()).collect(Collectors.toList());
+            return indexIdToMeta.get(indexId).getSchema().stream().filter(column -> column.isVisible())
+                    .collect(Collectors.toList());
         }
+    }
+
+    public List<Column> getBaseSchemaKeyColumns() {
+        return getKeyColumnsByIndexId(baseIndexId);
     }
 
     public List<Column> getKeyColumnsByIndexId(Long indexId) {
@@ -995,8 +1007,8 @@ public class OlapTable extends Table {
     }
 
     @Override
-    public AnalysisJob createAnalysisJob(AnalysisJobScheduler scheduler, AnalysisJobInfo info) {
-        return new AnalysisJob(scheduler, info);
+    public BaseAnalysisTask createAnalysisTask(AnalysisTaskScheduler scheduler, AnalysisTaskInfo info) {
+        return new OlapAnalysisTask(scheduler, info);
     }
 
     @Override
@@ -1014,7 +1026,7 @@ public class OlapTable extends Table {
         long dataSize = 0;
         for (Map.Entry<Long, Partition> entry : idToPartition.entrySet()) {
             rowCount += entry.getValue().getBaseIndex().getRowCount();
-            dataSize += entry.getValue().getBaseIndex().getDataSize();
+            dataSize += entry.getValue().getBaseIndex().getDataSize(false);
         }
         if (rowCount > 0) {
             return dataSize / rowCount;
@@ -1027,7 +1039,7 @@ public class OlapTable extends Table {
     public long getDataLength() {
         long dataSize = 0;
         for (Map.Entry<Long, Partition> entry : idToPartition.entrySet()) {
-            dataSize += entry.getValue().getBaseIndex().getDataSize();
+            dataSize += entry.getValue().getBaseIndex().getDataSize(false);
         }
         return dataSize;
     }
@@ -1116,7 +1128,6 @@ public class OlapTable extends Table {
         }
         return false;
     }
-
 
     @Override
     public void write(DataOutput out) throws IOException {
@@ -1267,6 +1278,9 @@ public class OlapTable extends Table {
         if (in.readBoolean()) {
             tableProperty = TableProperty.read(in);
         }
+        if (isAutoBucket()) {
+            defaultDistributionInfo.markAutoBucket();
+        }
 
         // temp partitions
         tempPartitions = TempPartitions.read(in);
@@ -1294,8 +1308,13 @@ public class OlapTable extends Table {
         }
 
         // remove shadow index from copied table
-        List<MaterializedIndex> shadowIndex = copied.getPartitions().stream().findFirst()
-                .get().getMaterializedIndices(IndexExtState.SHADOW);
+        // NOTICE that there maybe not partition in table.
+        List<MaterializedIndex> shadowIndex = Lists.newArrayList();
+        Optional<Partition> firstPartition = copied.getPartitions().stream().findFirst();
+        if (firstPartition.isPresent()) {
+            shadowIndex = firstPartition.get().getMaterializedIndices(IndexExtState.SHADOW);
+        }
+
         for (MaterializedIndex deleteIndex : shadowIndex) {
             LOG.debug("copied table delete shadow index : {}", deleteIndex.getId());
             copied.deleteIndexInfo(copied.getIndexNameById(deleteIndex.getId()));
@@ -1377,7 +1396,7 @@ public class OlapTable extends Table {
     public long getDataSize() {
         long dataSize = 0;
         for (Partition partition : getAllPartitions()) {
-            dataSize += partition.getDataSize();
+            dataSize += partition.getDataSize(false);
         }
         return dataSize;
     }
@@ -1610,6 +1629,36 @@ public class OlapTable extends Table {
         tableProperty.buildInMemory();
     }
 
+    public Boolean isAutoBucket() {
+        if (tableProperty != null) {
+            return tableProperty.isAutoBucket();
+        }
+        return false;
+    }
+
+    public void setIsAutoBucket(boolean isAutoBucket) {
+        if (tableProperty == null) {
+            tableProperty = new TableProperty(new HashMap<>());
+        }
+        tableProperty.modifyTableProperties(PropertyAnalyzer.PROPERTIES_AUTO_BUCKET,
+                Boolean.valueOf(isAutoBucket).toString());
+    }
+
+    public void setEstimatePartitionSize(String estimatePartitionSize) {
+        if (tableProperty == null) {
+            tableProperty = new TableProperty(new HashMap<>());
+        }
+        tableProperty.modifyTableProperties(PropertyAnalyzer.PROPERTIES_ESTIMATE_PARTITION_SIZE,
+                estimatePartitionSize);
+    }
+
+    public String getEstimatePartitionSize() {
+        if (tableProperty != null) {
+            return tableProperty.getEstimatePartitionSize();
+        }
+        return "";
+    }
+
     public boolean getEnableLightSchemaChange() {
         if (tableProperty != null) {
             return tableProperty.getUseSchemaLightChange();
@@ -1627,7 +1676,11 @@ public class OlapTable extends Table {
         tableProperty.buildEnableLightSchemaChange();
     }
 
-    public void setStoragePolicy(String storagePolicy) {
+    public void setStoragePolicy(String storagePolicy) throws UserException {
+        if (!Config.enable_storage_policy && !Strings.isNullOrEmpty(storagePolicy)) {
+            throw new UserException("storage policy feature is disabled by default. "
+                    + "Enable it by setting 'enable_storage_policy=true' in fe.conf");
+        }
         if (tableProperty == null) {
             tableProperty = new TableProperty(new HashMap<>());
         }
@@ -1664,19 +1717,6 @@ public class OlapTable extends Table {
         }
         tableProperty.modifyDataSortInfoProperties(dataSortInfo);
         tableProperty.buildDataSortInfo();
-    }
-
-    /**
-     * set remote storage policy for table.
-     *
-     * @param remoteStoragePolicy remote storage policy name
-     */
-    public void setRemoteStoragePolicy(String remoteStoragePolicy) {
-        if (tableProperty == null) {
-            tableProperty = new TableProperty(new HashMap<>());
-        }
-        tableProperty.setRemoteStoragePolicy(remoteStoragePolicy);
-        tableProperty.buildRemoteStoragePolicy();
     }
 
     // return true if partition with given name already exist, both in partitions and temp partitions.
@@ -1846,18 +1886,6 @@ public class OlapTable extends Table {
         return tableProperty.getDataSortInfo();
     }
 
-    /**
-     * get remote storage policy name.
-     *
-     * @return remote storage policy name for this table.
-     */
-    public String getRemoteStoragePolicy() {
-        if (tableProperty == null) {
-            return "";
-        }
-        return tableProperty.getRemoteStoragePolicy();
-    }
-
     public void setEnableUniqueKeyMergeOnWrite(boolean speedup) {
         if (tableProperty == null) {
             tableProperty = new TableProperty(new HashMap<>());
@@ -1884,11 +1912,11 @@ public class OlapTable extends Table {
             return false;
         }
         List<Expr> partitionExps = aggregateInfo.getPartitionExprs() != null
-                ? aggregateInfo.getPartitionExprs() : groupingExps;
+                ? aggregateInfo.getPartitionExprs()
+                : groupingExps;
         DistributionInfo distribution = getDefaultDistributionInfo();
         if (distribution instanceof HashDistributionInfo) {
-            List<Column> distributeColumns =
-                    ((HashDistributionInfo) distribution).getDistributionColumns();
+            List<Column> distributeColumns = ((HashDistributionInfo) distribution).getDistributionColumns();
             PartitionInfo partitionInfo = getPartitionInfo();
             if (partitionInfo instanceof RangePartitionInfo) {
                 List<Column> rangeColumns = partitionInfo.getPartitionColumns();
@@ -1896,8 +1924,7 @@ public class OlapTable extends Table {
                     return false;
                 }
             }
-            List<SlotRef> partitionSlots =
-                    partitionExps.stream().map(Expr::unwrapSlotRef).collect(Collectors.toList());
+            List<SlotRef> partitionSlots = partitionExps.stream().map(Expr::unwrapSlotRef).collect(Collectors.toList());
             if (partitionSlots.contains(null)) {
                 return false;
             }
@@ -1957,5 +1984,11 @@ public class OlapTable extends Table {
 
     public Set<Long> getPartitionKeys() {
         return idToPartition.keySet();
+    }
+
+    public boolean isDupKeysOrMergeOnWrite() {
+        return getKeysType() == KeysType.DUP_KEYS
+                || (getKeysType() == KeysType.UNIQUE_KEYS
+                && getEnableUniqueKeyMergeOnWrite());
     }
 }

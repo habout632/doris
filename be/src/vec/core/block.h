@@ -63,6 +63,7 @@ private:
 
     Container data;
     IndexByName index_by_name;
+    std::vector<bool> row_same_bit;
 
     int64_t _decompress_time_ns = 0;
     int64_t _decompressed_bytes = 0;
@@ -100,6 +101,8 @@ public:
         }
         std::swap(data, new_data);
     }
+
+    void initialize_index_by_name();
 
     /// References are invalidated after calling functions above.
     ColumnWithTypeAndName& get_by_position(size_t position) { return data[position]; }
@@ -179,6 +182,8 @@ public:
 
     /// Returns number of rows from first column in block, not equal to nullptr. If no columns, returns 0.
     size_t rows() const;
+
+    std::string each_col_size();
 
     // Cut the rows in block, use in LIMIT operation
     void set_num_rows(size_t length);
@@ -354,9 +359,24 @@ public:
     int64_t get_decompressed_bytes() const { return _decompressed_bytes; }
     int64_t get_compress_time() const { return _compress_time_ns; }
 
+    void set_same_bit(std::vector<bool>::const_iterator begin,
+                      std::vector<bool>::const_iterator end) {
+        row_same_bit.insert(row_same_bit.end(), begin, end);
+
+        DCHECK_EQ(row_same_bit.size(), rows());
+    }
+
+    bool get_same_bit(size_t position) {
+        if (position >= row_same_bit.size()) {
+            return false;
+        }
+        return row_same_bit[position];
+    }
+
+    void clear_same_bit() { row_same_bit.clear(); }
+
 private:
     void erase_impl(size_t position);
-    void initialize_index_by_name();
     bool is_column_data_null(const doris::TypeDescriptor& type_desc, const StringRef& data_ref,
                              const IColumn* column_with_type_and_name, int row);
     void deep_copy_slot(void* dst, MemPool* pool, const doris::TypeDescriptor& type_desc,
@@ -449,7 +469,9 @@ public:
             DCHECK_EQ(_columns.size(), block.columns());
             for (int i = 0; i < _columns.size(); ++i) {
                 if (!_data_types[i]->equals(*block.get_by_position(i).type)) {
-                    DCHECK(_data_types[i]->is_nullable());
+                    DCHECK(_data_types[i]->is_nullable())
+                            << " target type: " << _data_types[i]->get_name()
+                            << " src type: " << block.get_by_position(i).type->get_name();
                     DCHECK(((DataTypeNullable*)_data_types[i].get())
                                    ->get_nested_type()
                                    ->equals(*block.get_by_position(i).type));

@@ -17,6 +17,7 @@
 
 package org.apache.doris.planner;
 
+import org.apache.doris.alter.SchemaChangeHandler;
 import org.apache.doris.analysis.SlotDescriptor;
 import org.apache.doris.analysis.TupleDescriptor;
 import org.apache.doris.catalog.Column;
@@ -62,7 +63,6 @@ import org.apache.doris.thrift.TPaloNodesInfo;
 import org.apache.doris.thrift.TStorageFormat;
 import org.apache.doris.thrift.TTabletLocation;
 import org.apache.doris.thrift.TUniqueId;
-import org.apache.doris.transaction.DatabaseTransactionMgr;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.HashMultimap;
@@ -209,9 +209,15 @@ public class OlapTableSink extends DataSink {
             MaterializedIndexMeta indexMeta = pair.getValue();
             List<String> columns = Lists.newArrayList();
             List<TColumn> columnsDesc = Lists.newArrayList();
-            columns.addAll(indexMeta.getSchema().stream().map(Column::getName).collect(Collectors.toList()));
+            columns.addAll(indexMeta.getSchema().stream().map(Column::getNonShadowName).collect(Collectors.toList()));
             for (Column column : indexMeta.getSchema()) {
                 TColumn tColumn = column.toThrift();
+                // When schema change is doing, some modified column has prefix in name. Columns here
+                // is for the schema in rowset meta, which should be no column with shadow prefix.
+                // So we should remove the shadow prefix here.
+                if (column.getName().startsWith(SchemaChangeHandler.SHADOW_NAME_PREFIX)) {
+                    tColumn.setColumnName(column.getNonShadowName());
+                }
                 column.setIndexFlag(tColumn, table);
                 columnsDesc.add(tColumn);
             }
@@ -347,7 +353,6 @@ public class OlapTableSink extends DataSink {
         TOlapTableLocationParam slaveLocationParam = new TOlapTableLocationParam();
         // BE id -> path hash
         Multimap<Long, Long> allBePathsMap = HashMultimap.create();
-        int replicaNum = 0;
         for (Long partitionId : partitionIds) {
             Partition partition = table.getPartition(partitionId);
             int quorum = table.getPartitionInfo().getReplicaAllocation(partition.getId()).getTotalReplicaNum() / 2 + 1;
@@ -377,7 +382,6 @@ public class OlapTableSink extends DataSink {
                                 Lists.newArrayList(bePathsMap.keySet())));
                     }
                     allBePathsMap.putAll(bePathsMap);
-                    replicaNum += bePathsMap.size();
                 }
             }
         }
@@ -387,14 +391,6 @@ public class OlapTableSink extends DataSink {
         Status st = Env.getCurrentSystemInfo().checkExceedDiskCapacityLimit(allBePathsMap, true);
         if (!st.ok()) {
             throw new DdlException(st.getErrorMsg());
-        }
-        long dbId = tDataSink.getOlapTableSink().getDbId();
-        long txnId = tDataSink.getOlapTableSink().getTxnId();
-        try {
-            DatabaseTransactionMgr mgr = Env.getCurrentGlobalTransactionMgr().getDatabaseTransactionMgr(dbId);
-            mgr.registerTxnReplicas(txnId, replicaNum);
-        } catch (Exception e) {
-            LOG.error("register txn replica failed, txnId={}, dbId={}", txnId, dbId);
         }
         return Arrays.asList(locationParam, slaveLocationParam);
     }

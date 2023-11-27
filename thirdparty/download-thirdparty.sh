@@ -368,6 +368,7 @@ echo "Finished patching ${HYPERSCAN_SOURCE}"
 cd "${TP_SOURCE_DIR}/${AWS_SDK_SOURCE}"
 if [[ ! -f "${PATCHED_MARK}" ]]; then
     if [[ "${AWS_SDK_SOURCE}" == "aws-sdk-cpp-1.9.211" ]]; then
+        patch -p1 <"${TP_PATCH_DIR}/aws-sdk-cpp-1.9.211.patch"
         if wget --no-check-certificate -q https://doris-thirdparty-repo.bj.bcebos.com/thirdparty/aws-crt-cpp-1.9.211.tar.gz -O aws-crt-cpp-1.9.211.tar.gz; then
             tar xzf aws-crt-cpp-1.9.211.tar.gz
         else
@@ -395,3 +396,14 @@ if [[ ! -f "${PATCHED_MARK}" ]]; then
 fi
 cd -
 echo "Finished patching ${BRPC_SOURCE}"
+
+# patch jemalloc, change simdjson::dom::element_type::BOOL to BOOLEAN to avoid conflict with odbc macro BOOL
+if [[ "${SIMDJSON_SOURCE}" = "simdjson-3.0.1" ]]; then
+    cd "${TP_SOURCE_DIR}/${SIMDJSON_SOURCE}"
+    if [[ ! -f "${PATCHED_MARK}" ]]; then
+        patch -p1 <"${TP_PATCH_DIR}/simdjson-3.0.1.patch"
+        touch "${PATCHED_MARK}"
+    fi
+    cd -
+fi
+echo "Finished patching ${SIMDJSON_SOURCE}"

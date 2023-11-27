@@ -66,6 +66,7 @@
 #include "vec/exec/scan/new_jdbc_scan_node.h"
 #include "vec/exec/scan/new_odbc_scan_node.h"
 #include "vec/exec/scan/new_olap_scan_node.h"
+#include "vec/exec/scan/vmeta_scan_node.h"
 #include "vec/exec/vaggregation_node.h"
 #include "vec/exec/vanalytic_eval_node.h"
 #include "vec/exec/vassert_num_rows_node.h"
@@ -151,6 +152,9 @@ ExecNode::ExecNode(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl
           _memory_used_counter(nullptr),
           _get_next_span(),
           _is_closed(false) {
+    if (_limit < -1) {
+        _limit = -1;
+    }
     if (tnode.__isset.output_tuple_id) {
         _output_row_descriptor.reset(new RowDescriptor(descs, {tnode.output_tuple_id}, {true}));
     }
@@ -196,9 +200,6 @@ Status ExecNode::init(const TPlanNode& tnode, RuntimeState* state) {
         RETURN_IF_ERROR(doris::vectorized::VExpr::create_expr_tree(_pool, tnode.vconjunct,
                                                                    _vconjunct_ctx_ptr.get()));
     }
-    if (typeid(*this) != typeid(doris::vectorized::NewOlapScanNode)) {
-        RETURN_IF_ERROR(Expr::create_expr_trees(_pool, tnode.conjuncts, &_conjunct_ctxs));
-    }
 
     // create the projections expr
     if (tnode.__isset.projections) {
@@ -219,9 +220,8 @@ Status ExecNode::prepare(RuntimeState* state) {
             std::bind<int64_t>(&RuntimeProfile::units_per_second, _rows_returned_counter,
                                runtime_profile()->total_time_counter()),
             "");
-    _mem_tracker = std::make_shared<MemTracker>("ExecNode:" + _runtime_profile->name(),
-                                                _runtime_profile.get());
-    SCOPED_CONSUME_MEM_TRACKER(_mem_tracker.get());
+    _mem_tracker = std::make_unique<MemTracker>("ExecNode:" + _runtime_profile->name(),
+                                                _runtime_profile.get(), nullptr, "PeakMemoryUsage");
 
     if (_vconjunct_ctx_ptr) {
         RETURN_IF_ERROR((*_vconjunct_ctx_ptr)->prepare(state, intermediate_row_desc()));
@@ -230,9 +230,6 @@ Status ExecNode::prepare(RuntimeState* state) {
     // For vectorized olap scan node, the conjuncts is prepared in _vconjunct_ctx_ptr.
     // And _conjunct_ctxs is useless.
     // TODO: Should be removed when non-vec engine is removed.
-    if (typeid(*this) != typeid(doris::vectorized::NewOlapScanNode)) {
-        RETURN_IF_ERROR(Expr::prepare(_conjunct_ctxs, state, _row_descriptor));
-    }
     RETURN_IF_ERROR(vectorized::VExpr::prepare(_projections, state, intermediate_row_desc()));
 
     for (int i = 0; i < _children.size(); ++i) {
@@ -243,16 +240,11 @@ Status ExecNode::prepare(RuntimeState* state) {
 }
 
 Status ExecNode::open(RuntimeState* state) {
-    SCOPED_CONSUME_MEM_TRACKER(_mem_tracker.get());
     if (_vconjunct_ctx_ptr) {
         RETURN_IF_ERROR((*_vconjunct_ctx_ptr)->open(state));
     }
     RETURN_IF_ERROR(vectorized::VExpr::open(_projections, state));
-    if (typeid(*this) != typeid(doris::vectorized::NewOlapScanNode)) {
-        return Expr::open(_conjunct_ctxs, state);
-    } else {
-        return Status::OK();
-    }
+    return Status::OK();
 }
 
 Status ExecNode::reset(RuntimeState* state) {
@@ -291,9 +283,6 @@ Status ExecNode::close(RuntimeState* state) {
 
     if (_vconjunct_ctx_ptr) {
         (*_vconjunct_ctx_ptr)->close(state);
-    }
-    if (typeid(*this) != typeid(doris::vectorized::NewOlapScanNode)) {
-        Expr::close(_conjunct_ctxs, state);
     }
     vectorized::VExpr::close(_projections, state);
 
@@ -416,6 +405,7 @@ Status ExecNode::create_node(RuntimeState* state, ObjectPool* pool, const TPlanN
         case TPlanNodeType::DATA_GEN_SCAN_NODE:
         case TPlanNodeType::FILE_SCAN_NODE:
         case TPlanNodeType::JDBC_SCAN_NODE:
+        case TPlanNodeType::META_SCAN_NODE:
             break;
         default: {
             const auto& i = _TPlanNodeType_VALUES_TO_NAMES.find(tnode.node_type);
@@ -479,6 +469,10 @@ Status ExecNode::create_node(RuntimeState* state, ObjectPool* pool, const TPlanN
         } else {
             *node = pool->add(new SchemaScanNode(pool, tnode, descs));
         }
+        return Status::OK();
+
+    case TPlanNodeType::META_SCAN_NODE:
+        *node = pool->add(new vectorized::VMetaScanNode(pool, tnode, descs));
         return Status::OK();
 
     case TPlanNodeType::OLAP_SCAN_NODE:
@@ -705,6 +699,7 @@ void ExecNode::collect_scan_nodes(vector<ExecNode*>* nodes) {
     collect_nodes(TPlanNodeType::ES_HTTP_SCAN_NODE, nodes);
     collect_nodes(TPlanNodeType::DATA_GEN_SCAN_NODE, nodes);
     collect_nodes(TPlanNodeType::FILE_SCAN_NODE, nodes);
+    collect_nodes(TPlanNodeType::META_SCAN_NODE, nodes);
 }
 
 void ExecNode::try_do_aggregate_serde_improve() {
@@ -728,7 +723,8 @@ void ExecNode::try_do_aggregate_serde_improve() {
         typeid(*child0) == typeid(vectorized::NewFileScanNode) ||
         typeid(*child0) == typeid(vectorized::NewOdbcScanNode) ||
         typeid(*child0) == typeid(vectorized::NewEsScanNode) ||
-        typeid(*child0) == typeid(vectorized::NewJdbcScanNode)) {
+        typeid(*child0) == typeid(vectorized::NewJdbcScanNode) ||
+        typeid(*child0) == typeid(vectorized::VMetaScanNode)) {
         vectorized::VScanNode* scan_node =
                 static_cast<vectorized::VScanNode*>(agg_node[0]->_children[0]);
         scan_node->set_no_agg_finalize();

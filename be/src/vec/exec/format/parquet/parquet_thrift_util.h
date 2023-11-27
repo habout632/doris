@@ -50,17 +50,17 @@ static Status parse_thrift_footer(FileReader* file, std::shared_ptr<FileMetaData
     // get metadata_size
     uint32_t metadata_size = decode_fixed32_le(footer);
     if (metadata_size > file_size - PARQUET_FOOTER_SIZE) {
-        Status::Corruption("Parquet file size is ", file_size,
-                           " bytes, smaller than the size reported by footer's (", metadata_size,
-                           "bytes)");
+        return Status::Corruption("Parquet file size is ", file_size,
+                                  " bytes, smaller than the size reported by footer's (",
+                                  metadata_size, "bytes)");
     }
     tparquet::FileMetaData t_metadata;
     // deserialize footer
-    uint8_t meta_buff[metadata_size];
+    std::unique_ptr<uint8_t[]> meta_buff(new uint8_t[metadata_size]);
     RETURN_IF_ERROR(file->readat(file_size - PARQUET_FOOTER_SIZE - metadata_size, metadata_size,
-                                 &bytes_read, meta_buff));
+                                 &bytes_read, meta_buff.get()));
     DCHECK_EQ(bytes_read, metadata_size);
-    RETURN_IF_ERROR(deserialize_thrift_msg(meta_buff, &metadata_size, true, &t_metadata));
+    RETURN_IF_ERROR(deserialize_thrift_msg(meta_buff.get(), &metadata_size, true, &t_metadata));
     file_metadata.reset(new FileMetaData(t_metadata));
     RETURN_IF_ERROR(file_metadata->init_schema());
     return Status::OK();

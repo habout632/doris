@@ -17,14 +17,20 @@
 
 package org.apache.doris.datasource;
 
+import org.apache.doris.catalog.external.ExternalTable;
+import org.apache.doris.catalog.external.HMSExternalTable;
 import org.apache.doris.cluster.ClusterNamespace;
+import org.apache.doris.common.Config;
 import org.apache.doris.common.ThreadPoolManager;
 import org.apache.doris.datasource.hive.HiveMetaStoreCache;
+import org.apache.doris.planner.external.iceberg.IcebergMetadataCache;
+import org.apache.doris.planner.external.iceberg.IcebergMetadataCacheMgr;
 
 import com.google.common.collect.Maps;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Executor;
 
@@ -41,9 +47,12 @@ public class ExternalMetaCacheMgr {
     // catalog id -> table schema cache
     private Map<Long, ExternalSchemaCache> schemaCacheMap = Maps.newHashMap();
     private Executor executor;
+    private final IcebergMetadataCacheMgr icebergMetadataCacheMgr;
 
     public ExternalMetaCacheMgr() {
-        executor = ThreadPoolManager.newDaemonCacheThreadPool(10, "ExternalMetaCacheMgr", false);
+        executor = ThreadPoolManager.newDaemonCacheThreadPool(Config.max_external_cache_loader_thread_pool_size,
+                "ExternalMetaCacheMgr", true);
+        icebergMetadataCacheMgr = new IcebergMetadataCacheMgr();
     }
 
     public HiveMetaStoreCache getMetaStoreCache(HMSExternalCatalog catalog) {
@@ -72,13 +81,18 @@ public class ExternalMetaCacheMgr {
         return cache;
     }
 
-    public void removeCache(String catalogId) {
+    public IcebergMetadataCache getIcebergMetadataCache() {
+        return icebergMetadataCacheMgr.getIcebergMetadataCache();
+    }
+
+    public void removeCache(long catalogId) {
         if (cacheMap.remove(catalogId) != null) {
             LOG.info("remove hive metastore cache for catalog {}" + catalogId);
         }
         if (schemaCacheMap.remove(catalogId) != null) {
             LOG.info("remove schema cache for catalog {}" + catalogId);
         }
+        icebergMetadataCacheMgr.removeCache(catalogId);
     }
 
     public void invalidateTableCache(long catalogId, String dbName, String tblName) {
@@ -91,6 +105,7 @@ public class ExternalMetaCacheMgr {
         if (metaCache != null) {
             metaCache.invalidateTableCache(dbName, tblName);
         }
+        icebergMetadataCacheMgr.invalidateTableCache(catalogId, dbName, tblName);
         LOG.debug("invalid table cache for {}.{} in catalog {}", dbName, tblName, catalogId);
     }
 
@@ -104,6 +119,7 @@ public class ExternalMetaCacheMgr {
         if (metaCache != null) {
             metaCache.invalidateDbCache(dbName);
         }
+        icebergMetadataCacheMgr.invalidateDbCache(catalogId, dbName);
         LOG.debug("invalid db cache for {} in catalog {}", dbName, catalogId);
     }
 
@@ -116,6 +132,47 @@ public class ExternalMetaCacheMgr {
         if (metaCache != null) {
             metaCache.invalidateAll();
         }
+        icebergMetadataCacheMgr.invalidateCatalogCache(catalogId);
         LOG.debug("invalid catalog cache for {}", catalogId);
+    }
+
+    public void addPartitionsCache(long catalogId, ExternalTable table, List<String> partitionNames) {
+        if (!(table instanceof HMSExternalTable)) {
+            LOG.warn("only support HMSTable");
+            return;
+        }
+        String dbName = ClusterNamespace.getNameFromFullName(table.getDbName());
+        HiveMetaStoreCache metaCache = cacheMap.get(catalogId);
+        if (metaCache != null) {
+            metaCache.addPartitionsCache(dbName, table.getName(), partitionNames,
+                    ((HMSExternalTable) table).getPartitionColumnTypes());
+        }
+        LOG.debug("add partition cache for {}.{} in catalog {}", dbName, table.getName(), catalogId);
+    }
+
+    public void dropPartitionsCache(long catalogId, ExternalTable table, List<String> partitionNames) {
+        if (!(table instanceof HMSExternalTable)) {
+            LOG.warn("only support HMSTable");
+            return;
+        }
+        String dbName = ClusterNamespace.getNameFromFullName(table.getDbName());
+        HiveMetaStoreCache metaCache = cacheMap.get(catalogId);
+        if (metaCache != null) {
+            metaCache.dropPartitionsCache(dbName, table.getName(), partitionNames, true);
+        }
+        LOG.debug("drop partition cache for {}.{} in catalog {}", dbName, table.getName(), catalogId);
+    }
+
+    public void invalidatePartitionsCache(long catalogId, String dbName, String tableName,
+            List<String> partitionNames) {
+        HiveMetaStoreCache metaCache = cacheMap.get(catalogId);
+        if (metaCache != null) {
+            dbName = ClusterNamespace.getNameFromFullName(dbName);
+            for (String partitionName : partitionNames) {
+                metaCache.invalidatePartitionCache(dbName, tableName, partitionName);
+            }
+
+        }
+        LOG.debug("invalidate partition cache for {}.{} in catalog {}", dbName, tableName, catalogId);
     }
 }

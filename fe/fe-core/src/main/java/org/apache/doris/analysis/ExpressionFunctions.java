@@ -67,6 +67,9 @@ public enum ExpressionFunctions {
                 || constExpr instanceof FunctionCallExpr
                 || constExpr instanceof TimestampArithmeticExpr) {
             Function fn = constExpr.getFn();
+            if (fn == null) {
+                return constExpr;
+            }
 
             Preconditions.checkNotNull(fn, "Expr's fn can't be null.");
 
@@ -98,8 +101,25 @@ public enum ExpressionFunctions {
             FEFunctionInvoker invoker = getFunction(signature);
             if (invoker != null) {
                 try {
-                    return invoker.invoke(constExpr.getChildrenWithoutCast());
+                    if (fn.getReturnType().isDateType()) {
+                        Expr dateLiteral = invoker.invoke(constExpr.getChildrenWithoutCast());
+                        Preconditions.checkArgument(dateLiteral instanceof DateLiteral);
+                        try {
+                            ((DateLiteral) dateLiteral).checkValueValid();
+                        } catch (AnalysisException e) {
+                            if (ConnectContext.get() != null) {
+                                ConnectContext.get().getState().reset();
+                            }
+                            return NullLiteral.create(dateLiteral.getType());
+                        }
+                        return dateLiteral;
+                    } else {
+                        return invoker.invoke(constExpr.getChildrenWithoutCast());
+                    }
                 } catch (AnalysisException e) {
+                    if (ConnectContext.get() != null) {
+                        ConnectContext.get().getState().reset();
+                    }
                     LOG.debug("failed to invoke", e);
                     return constExpr;
                 }
@@ -133,9 +153,7 @@ public enum ExpressionFunctions {
             }
             boolean match = true;
             for (int i = 0; i < argTypes1.length; i++) {
-                if (!(argTypes1[i].isDate() && argTypes2[i].isDateV2())
-                        && !(argTypes1[i].isDatetime() && argTypes2[i].isDatetimeV2())
-                        && !(argTypes1[i].isDecimalV2() && argTypes2[i].isDecimalV3())
+                if (!(argTypes1[i].isDecimalV2() && argTypes2[i].isDecimalV3())
                         && !(argTypes1[i].isDecimalV2() && argTypes2[i].isDecimalV2())
                         && !argTypes1[i].equals(argTypes2[i])) {
                     match = false;

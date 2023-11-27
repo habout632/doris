@@ -57,6 +57,7 @@
 using strings::Substitute;
 
 namespace doris {
+using namespace ErrorCode;
 
 DEFINE_GAUGE_METRIC_PROTOTYPE_2ARG(disks_total_capacity, MetricUnit::BYTES);
 DEFINE_GAUGE_METRIC_PROTOTYPE_2ARG(disks_avail_capacity, MetricUnit::BYTES);
@@ -118,8 +119,8 @@ Status DataDir::init() {
 }
 
 void DataDir::stop_bg_worker() {
-    std::unique_lock<std::mutex> lck(_check_path_mutex);
     _stop_bg_worker = true;
+    std::unique_lock<std::mutex> lck(_check_path_mutex);
     _check_path_cv.notify_one();
 }
 
@@ -147,7 +148,7 @@ Status DataDir::read_cluster_id(Env* env, const std::string& cluster_id_path, in
         } else {
             *cluster_id = -1;
         }
-    } else if (exist_status.is_not_found()) {
+    } else if (exist_status.is<NOT_FOUND>()) {
         *cluster_id = -1;
     } else {
         RETURN_NOT_OK_STATUS_WITH_WARN(
@@ -176,7 +177,7 @@ Status DataDir::_init_capacity() {
     auto data_path = fmt::format("{}/{}", _path, DATA_PREFIX);
     Status exist_status = Env::Default()->path_exists(data_path);
     if (!exist_status.ok() &&
-        (!exist_status.is_not_found() || !Env::Default()->create_dirs(data_path).ok())) {
+        (!exist_status.is<NOT_FOUND>() || !Env::Default()->create_dirs(data_path).ok())) {
         RETURN_NOT_OK_STATUS_WITH_WARN(
                 Status::IOError("failed to create data root path {}", data_path),
                 "create_dirs failed");
@@ -234,7 +235,8 @@ void DataDir::health_check() {
     if (_is_used) {
         Status res = _read_and_write_test_file();
         if (!res) {
-            LOG(WARNING) << "store read/write test file occur IO Error. path=" << _path;
+            LOG(WARNING) << "store read/write test file occur IO Error. path=" << _path
+                         << ", err: " << res;
             if (res.is_io_error()) {
                 _is_used = false;
             }
@@ -257,7 +259,7 @@ Status DataDir::get_shard(uint64_t* shard) {
     }
     auto shard_path = fmt::format("{}/{}/{}", _path, DATA_PREFIX, next_shard);
     RETURN_WITH_WARN_IF_ERROR(Env::Default()->create_dirs(shard_path),
-                              Status::OLAPInternalError(OLAP_ERR_CANNOT_CREATE_DIR),
+                              Status::Error<CANNOT_CREATE_DIR>(),
                               "fail to create path. path=" + shard_path);
 
     *shard = next_shard;
@@ -401,9 +403,9 @@ Status DataDir::load() {
                                     const std::string& value) -> bool {
         Status status = _tablet_manager->load_tablet_from_meta(this, tablet_id, schema_hash, value,
                                                                false, false, false, false);
-        if (!status.ok() && status.precise_code() != OLAP_ERR_TABLE_ALREADY_DELETED_ERROR &&
-            status.precise_code() != OLAP_ERR_ENGINE_INSERT_OLD_TABLET) {
-            // load_tablet_from_meta() may return Status::OLAPInternalError(OLAP_ERR_TABLE_ALREADY_DELETED_ERROR)
+        if (!status.ok() && !status.is<TABLE_ALREADY_DELETED_ERROR>() &&
+            !status.is<ENGINE_INSERT_OLD_TABLET>()) {
+            // load_tablet_from_meta() may return Status::Error<TABLE_ALREADY_DELETED_ERROR>()
             // which means the tablet status is DELETED
             // This may happen when the tablet was just deleted before the BE restarted,
             // but it has not been cleared from rocksdb. At this time, restarting the BE
@@ -411,7 +413,7 @@ Status DataDir::load() {
             // added to the garbage collection queue and will be automatically deleted afterwards.
             // Therefore, we believe that this situation is not a failure.
 
-            // Besides, load_tablet_from_meta() may return Status::OLAPInternalError(OLAP_ERR_ENGINE_INSERT_OLD_TABLET)
+            // Besides, load_tablet_from_meta() may return Status::Error<ENGINE_INSERT_OLD_TABLET>()
             // when BE is restarting and the older tablet have been added to the
             // garbage collection queue but not deleted yet.
             // In this case, since the data_dirs are parallel loaded, a later loaded tablet
@@ -488,9 +490,7 @@ Status DataDir::load() {
                     _meta, rowset_meta->partition_id(), rowset_meta->txn_id(),
                     rowset_meta->tablet_id(), rowset_meta->tablet_schema_hash(),
                     rowset_meta->tablet_uid(), rowset_meta->load_id(), rowset, true);
-            if (!commit_txn_status &&
-                commit_txn_status !=
-                        Status::OLAPInternalError(OLAP_ERR_PUSH_TRANSACTION_ALREADY_EXIST)) {
+            if (!commit_txn_status && !commit_txn_status.is<PUSH_TRANSACTION_ALREADY_EXIST>()) {
                 LOG(WARNING) << "failed to add committed rowset: " << rowset_meta->rowset_id()
                              << " to tablet: " << rowset_meta->tablet_id()
                              << " for txn: " << rowset_meta->txn_id();
@@ -508,8 +508,7 @@ Status DataDir::load() {
                                         rowset_meta->get_rowset_pb());
             }
             Status publish_status = tablet->add_rowset(rowset);
-            if (!publish_status &&
-                publish_status.precise_code() != OLAP_ERR_PUSH_VERSION_ALREADY_EXIST) {
+            if (!publish_status && !publish_status.is<PUSH_VERSION_ALREADY_EXIST>()) {
                 LOG(WARNING) << "add visible rowset to tablet failed rowset_id:"
                              << rowset->rowset_id() << " tablet id: " << rowset_meta->tablet_id()
                              << " txn id:" << rowset_meta->txn_id()
@@ -669,6 +668,10 @@ void DataDir::perform_path_scan() {
             continue;
         }
         for (const auto& tablet_id : tablet_ids) {
+            if (_stop_bg_worker) {
+                break;
+            }
+
             auto tablet_id_path = fmt::format("{}/{}", shard_path, tablet_id);
             std::set<std::string> schema_hashes;
             ret = FileUtils::list_dirs_files(tablet_id_path, &schema_hashes, nullptr,
@@ -678,7 +681,15 @@ void DataDir::perform_path_scan() {
                              << " error[" << ret.to_string() << "]";
                 continue;
             }
+
             for (const auto& schema_hash : schema_hashes) {
+                int32_t interval_ms = config::path_scan_step_interval_ms;
+                if (_stop_bg_worker) {
+                    break;
+                }
+                if (interval_ms > 0) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
+                }
                 auto tablet_schema_hash_path = fmt::format("{}/{}", tablet_id_path, schema_hash);
                 _all_tablet_schemahash_paths.insert(tablet_schema_hash_path);
 
@@ -797,7 +808,7 @@ Status DataDir::move_to_trash(const std::string& tablet_path) {
         !FileUtils::create_dir(trash_tablet_parent).ok()) {
         LOG(WARNING) << "delete file failed. due to mkdir failed. [file=" << tablet_path
                      << " new_dir=" << trash_tablet_parent << "]";
-        return Status::OLAPInternalError(OLAP_ERR_OS_ERROR);
+        return Status::Error<OS_ERROR>();
     }
 
     // 4. move tablet to trash
@@ -805,7 +816,7 @@ Status DataDir::move_to_trash(const std::string& tablet_path) {
     if (rename(tablet_path.c_str(), trash_tablet_path.c_str()) < 0) {
         LOG(WARNING) << "move file to trash failed. [file=" << tablet_path << " target='"
                      << trash_tablet_path << "' err='" << Errno::str() << "']";
-        return Status::OLAPInternalError(OLAP_ERR_OS_ERROR);
+        return Status::Error<OS_ERROR>();
     }
 
     // 5. check parent dir of source file, delete it when empty

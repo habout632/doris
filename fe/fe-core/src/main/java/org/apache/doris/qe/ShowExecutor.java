@@ -38,6 +38,7 @@ import org.apache.doris.analysis.ShowClusterStmt;
 import org.apache.doris.analysis.ShowCollationStmt;
 import org.apache.doris.analysis.ShowColumnStatsStmt;
 import org.apache.doris.analysis.ShowColumnStmt;
+import org.apache.doris.analysis.ShowCreateCatalogStmt;
 import org.apache.doris.analysis.ShowCreateDbStmt;
 import org.apache.doris.analysis.ShowCreateFunctionStmt;
 import org.apache.doris.analysis.ShowCreateMaterializedViewStmt;
@@ -142,6 +143,7 @@ import org.apache.doris.common.MarkedCountDownLatch;
 import org.apache.doris.common.MetaNotFoundException;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.PatternMatcher;
+import org.apache.doris.common.PatternMatcherWrapper;
 import org.apache.doris.common.proc.BackendsProcDir;
 import org.apache.doris.common.proc.FrontendsProcNode;
 import org.apache.doris.common.proc.LoadProcDir;
@@ -378,6 +380,8 @@ public class ShowExecutor {
             handleShowPolicy();
         } else if (stmt instanceof ShowCatalogStmt) {
             handleShowCatalogs();
+        } else if (stmt instanceof ShowCreateCatalogStmt) {
+            handleShowCreateCatalog();
         } else if (stmt instanceof ShowAnalyzeStmt) {
             handleShowAnalyze();
         } else if (stmt instanceof AdminCopyTabletStmt) {
@@ -693,7 +697,7 @@ public class ShowExecutor {
         List<String> dbNames = catalogIf.getDbNames();
         PatternMatcher matcher = null;
         if (showDbStmt.getPattern() != null) {
-            matcher = PatternMatcher.createMysqlPattern(showDbStmt.getPattern(),
+            matcher = PatternMatcherWrapper.createMysqlPattern(showDbStmt.getPattern(),
                     CaseSensibility.DATABASE.getCaseSensibility());
         }
         Set<String> dbNameSet = Sets.newTreeSet();
@@ -704,7 +708,8 @@ public class ShowExecutor {
                 continue;
             }
 
-            if (!Env.getCurrentEnv().getAuth().checkDbPriv(ConnectContext.get(), fullName, PrivPredicate.SHOW)) {
+            if (!Env.getCurrentEnv().getAuth().checkDbPriv(ConnectContext.get(), showDbStmt.getCatalogName(),
+                    fullName, PrivPredicate.SHOW)) {
                 continue;
             }
 
@@ -722,12 +727,12 @@ public class ShowExecutor {
     private void handleShowTable() throws AnalysisException {
         ShowTableStmt showTableStmt = (ShowTableStmt) stmt;
         List<List<String>> rows = Lists.newArrayList();
-        // TODO(gaoxin): Whether to support "show tables from `ctl.db`" syntax in show statement?
-        String catalogName = ctx.getDefaultCatalog();
-        DatabaseIf<TableIf> db = ctx.getCurrentCatalog().getDbOrAnalysisException(showTableStmt.getDb());
+        DatabaseIf<TableIf> db = ctx.getEnv().getCatalogMgr()
+                .getCatalogOrAnalysisException(showTableStmt.getCatalog())
+                .getDbOrAnalysisException(showTableStmt.getDb());
         PatternMatcher matcher = null;
         if (showTableStmt.getPattern() != null) {
-            matcher = PatternMatcher.createMysqlPattern(showTableStmt.getPattern(),
+            matcher = PatternMatcherWrapper.createMysqlPattern(showTableStmt.getPattern(),
                     CaseSensibility.TABLE.getCaseSensibility());
         }
         for (TableIf tbl : db.getTables()) {
@@ -736,7 +741,7 @@ public class ShowExecutor {
             }
             // check tbl privs
             if (!Env.getCurrentEnv().getAuth()
-                    .checkTblPriv(ConnectContext.get(), catalogName, db.getFullName(), tbl.getName(),
+                    .checkTblPriv(ConnectContext.get(), showTableStmt.getCatalog(), db.getFullName(), tbl.getName(),
                             PrivPredicate.SHOW)) {
                 continue;
             }
@@ -762,11 +767,13 @@ public class ShowExecutor {
     private void handleShowTableStatus() throws AnalysisException {
         ShowTableStatusStmt showStmt = (ShowTableStatusStmt) stmt;
         List<List<String>> rows = Lists.newArrayList();
-        DatabaseIf<TableIf> db = ctx.getCurrentCatalog().getDbNullable(showStmt.getDb());
+        DatabaseIf<TableIf> db = ctx.getEnv().getCatalogMgr()
+                .getCatalogOrAnalysisException(showStmt.getCatalog())
+                .getDbOrAnalysisException(showStmt.getDb());
         if (db != null) {
             PatternMatcher matcher = null;
             if (showStmt.getPattern() != null) {
-                matcher = PatternMatcher.createMysqlPattern(showStmt.getPattern(),
+                matcher = PatternMatcherWrapper.createMysqlPattern(showStmt.getPattern(),
                         CaseSensibility.TABLE.getCaseSensibility());
             }
             for (TableIf table : db.getTables()) {
@@ -839,7 +846,7 @@ public class ShowExecutor {
         ShowVariablesStmt showStmt = (ShowVariablesStmt) stmt;
         PatternMatcher matcher = null;
         if (showStmt.getPattern() != null) {
-            matcher = PatternMatcher.createMysqlPattern(showStmt.getPattern(),
+            matcher = PatternMatcherWrapper.createMysqlPattern(showStmt.getPattern(),
                     CaseSensibility.VARIABLES.getCaseSensibility());
         }
         List<List<String>> rows = VariableMgr.dump(showStmt.getType(), ctx.getSessionVariable(), matcher);
@@ -866,7 +873,7 @@ public class ShowExecutor {
     // Show create table
     private void handleShowCreateTable() throws AnalysisException {
         ShowCreateTableStmt showStmt = (ShowCreateTableStmt) stmt;
-        DatabaseIf db = ctx.getEnv().getCatalogMgr().getCatalog(showStmt.getCtl())
+        DatabaseIf db = ctx.getEnv().getCatalogMgr().getCatalogOrAnalysisException(showStmt.getCtl())
                 .getDbOrAnalysisException(showStmt.getDb());
         TableIf table = db.getTableOrAnalysisException(showStmt.getTable());
         List<List<String>> rows = Lists.newArrayList();
@@ -899,8 +906,6 @@ public class ShowExecutor {
                         ? new ShowResultSet(showStmt.getMetaData(), rows)
                         : new ShowResultSet(ShowCreateTableStmt.getMaterializedViewMetaData(), rows);
             }
-        } catch (MetaNotFoundException e) {
-            throw new AnalysisException(e.getMessage());
         } finally {
             table.readUnlock();
         }
@@ -920,7 +925,7 @@ public class ShowExecutor {
         TableIf table = db.getTableOrAnalysisException(showStmt.getTable());
         PatternMatcher matcher = null;
         if (showStmt.getPattern() != null) {
-            matcher = PatternMatcher.createMysqlPattern(showStmt.getPattern(),
+            matcher = PatternMatcherWrapper.createMysqlPattern(showStmt.getPattern(),
                     CaseSensibility.COLUMN.getCaseSensibility());
         }
         table.readLock();
@@ -1302,7 +1307,7 @@ public class ShowExecutor {
         try {
             PatternMatcher matcher = null;
             if (showRoutineLoadStmt.getPattern() != null) {
-                matcher = PatternMatcher.createMysqlPattern(showRoutineLoadStmt.getPattern(),
+                matcher = PatternMatcherWrapper.createMysqlPattern(showRoutineLoadStmt.getPattern(),
                         CaseSensibility.ROUTINE_LOAD.getCaseSensibility());
             }
             routineLoadJobList = Env.getCurrentEnv().getRoutineLoadManager()
@@ -1759,7 +1764,7 @@ public class ShowExecutor {
         Database db = Env.getCurrentInternalCatalog().getDbOrAnalysisException(showStmt.getDbName());
 
         List<AbstractJob> jobs = Env.getCurrentEnv().getBackupHandler()
-                .getJobs(db.getId(), showStmt.getLabelPredicate());
+                .getJobs(db.getId(), showStmt.getSnapshotPredicate());
 
         List<BackupJob> backupJobs = jobs.stream().filter(job -> job instanceof BackupJob)
                 .map(job -> (BackupJob) job).collect(Collectors.toList());
@@ -1858,7 +1863,7 @@ public class ShowExecutor {
 
         PatternMatcher matcher = null;
         if (showStmt.getPattern() != null) {
-            matcher = PatternMatcher.createMysqlPattern(showStmt.getPattern(),
+            matcher = PatternMatcherWrapper.createMysqlPattern(showStmt.getPattern(),
                     CaseSensibility.CONFIG.getCaseSensibility());
         }
         results = ConfigBase.getConfigInfo(matcher);
@@ -1878,10 +1883,10 @@ public class ShowExecutor {
         resultSet = new ShowResultSet(showStmt.getMetaData(), results);
     }
 
-    private void handleShowDynamicPartition() {
+    private void handleShowDynamicPartition() throws AnalysisException {
         ShowDynamicPartitionStmt showDynamicPartitionStmt = (ShowDynamicPartitionStmt) stmt;
         List<List<String>> rows = Lists.newArrayList();
-        DatabaseIf db = ctx.getEnv().getInternalCatalog().getDbNullable(showDynamicPartitionStmt.getDb());
+        DatabaseIf db = ctx.getEnv().getInternalCatalog().getDbOrAnalysisException(showDynamicPartitionStmt.getDb());
         if (db != null && (db instanceof Database)) {
             List<Table> tableList = db.getTables();
             for (Table tbl : tableList) {
@@ -1983,7 +1988,7 @@ public class ShowExecutor {
             case QUERY_IDS:
                 rows = ProfileManager.getInstance().getQueryWithType(ProfileManager.ProfileType.QUERY);
                 break;
-            case FRAGMETNS: {
+            case FRAGMENTS: {
                 ProfileTreeNode treeRoot = ProfileManager.getInstance().getFragmentProfileTree(showStmt.getQueryId(),
                         showStmt.getQueryId());
                 if (treeRoot == null) {
@@ -2035,11 +2040,21 @@ public class ShowExecutor {
         ShowLoadProfileStmt.PathType pathType = showStmt.getPathType();
         List<List<String>> rows = Lists.newArrayList();
         switch (pathType) {
-            case JOB_IDS:
+            case QUERY_IDS:
                 rows = ProfileManager.getInstance().getQueryWithType(ProfileManager.ProfileType.LOAD);
                 break;
             case TASK_IDS: {
                 rows = ProfileManager.getInstance().getLoadJobTaskList(showStmt.getJobId());
+                break;
+            }
+            case FRAGMENTS: {
+                ProfileTreeNode treeRoot = ProfileManager.getInstance().getFragmentProfileTree(showStmt.getJobId(),
+                        showStmt.getTaskId());
+                if (treeRoot == null) {
+                    throw new AnalysisException("Failed to get fragment tree for load: " + showStmt.getJobId());
+                }
+                List<String> row = Lists.newArrayList(ProfileTreePrinter.printFragmentTree(treeRoot));
+                rows.add(row);
                 break;
             }
             case INSTANCES: {
@@ -2047,7 +2062,7 @@ public class ShowExecutor {
                 // And the fragment id is 0.
                 List<Triple<String, String, Long>> instanceList
                         = ProfileManager.getInstance().getFragmentInstanceList(showStmt.getJobId(),
-                        showStmt.getTaskId(), "0");
+                        showStmt.getTaskId(), ((ShowLoadProfileStmt) stmt).getFragmentId());
                 if (instanceList == null) {
                     throw new AnalysisException("Failed to get instance list for task: " + showStmt.getTaskId());
                 }
@@ -2062,7 +2077,7 @@ public class ShowExecutor {
                 // For load profile, there should be only one fragment in each execution profile.
                 // And the fragment id is 0.
                 ProfileTreeNode treeRoot = ProfileManager.getInstance().getInstanceProfileTree(showStmt.getJobId(),
-                        showStmt.getTaskId(), "0", showStmt.getInstanceId());
+                        showStmt.getTaskId(), showStmt.getFragmentId(), showStmt.getInstanceId());
                 if (treeRoot == null) {
                     throw new AnalysisException("Failed to get instance tree for instance: "
                             + showStmt.getInstanceId());
@@ -2167,7 +2182,7 @@ public class ShowExecutor {
                 columnStatistics.add(Pair.of(column.getName(), columnStatistic));
             } else {
                 columnStatistics.addAll(StatisticsRepository.queryColumnStatisticsByPartitions(tableName,
-                        colName, showColumnStatsStmt.getPartitionNames().getPartitionNames())
+                                colName, showColumnStatsStmt.getPartitionNames().getPartitionNames())
                         .stream().map(s -> Pair.of(colName, s))
                         .collect(Collectors.toList()));
             }
@@ -2309,8 +2324,17 @@ public class ShowExecutor {
 
     public void handleShowCatalogs() throws AnalysisException {
         ShowCatalogStmt showStmt = (ShowCatalogStmt) stmt;
-        resultSet = Env.getCurrentEnv().getCatalogMgr().showCatalogs(showStmt);
+        resultSet = Env.getCurrentEnv().getCatalogMgr().showCatalogs(showStmt, ctx.getCurrentCatalog() != null
+            ? ctx.getCurrentCatalog().getName() : null);
     }
+
+    // Show create catalog
+    private void handleShowCreateCatalog() throws AnalysisException {
+        ShowCreateCatalogStmt showStmt = (ShowCreateCatalogStmt) stmt;
+
+        resultSet = Env.getCurrentEnv().getCatalogMgr().showCreateCatalog(showStmt);
+    }
+
 
     private void handleShowAnalyze() throws AnalysisException {
         ShowAnalyzeStmt showStmt = (ShowAnalyzeStmt) stmt;
@@ -2469,3 +2493,4 @@ public class ShowExecutor {
         resultSet = new ShowResultSet(showStmt.getMetaData(), results);
     }
 }
+

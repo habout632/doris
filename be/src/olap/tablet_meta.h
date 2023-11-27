@@ -207,9 +207,6 @@ public:
 
     bool enable_unique_key_merge_on_write() const { return _enable_unique_key_merge_on_write; }
 
-    void update_delete_bitmap(const std::vector<RowsetSharedPtr>& input_rowsets,
-                              const Version& version, const RowIdConversion& rowid_conversion);
-
 private:
     Status _save_meta(DataDir* data_dir);
 
@@ -364,6 +361,14 @@ public:
      */
     void subset(const BitmapKey& start, const BitmapKey& end,
                 DeleteBitmap* subset_delete_map) const;
+
+    /**
+     * Merges the given segment delete bitmap into *this
+     *
+     * @param bmk
+     * @param segment_delete_bitmap
+     */
+    void merge(const BitmapKey& bmk, const roaring::Roaring& segment_delete_bitmap);
 
     /**
      * Merges the given delete bitmap into *this

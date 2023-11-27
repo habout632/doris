@@ -21,12 +21,9 @@
 package org.apache.doris.analysis;
 
 import org.apache.doris.catalog.PrimitiveType;
-import org.apache.doris.catalog.ScalarType;
 import org.apache.doris.catalog.Type;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.DdlException;
-import org.apache.doris.common.ErrorCode;
-import org.apache.doris.common.ErrorReport;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.qe.VariableVarConverters;
 import org.apache.doris.thrift.TExprNode;
@@ -41,6 +38,7 @@ import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
 import java.io.UnsupportedEncodingException;
+import java.math.BigDecimal;
 import java.util.Objects;
 
 public class StringLiteral extends LiteralExpr {
@@ -181,17 +179,22 @@ public class StringLiteral extends LiteralExpr {
     public LiteralExpr convertToDate(Type targetType) throws AnalysisException {
         LiteralExpr newLiteral = null;
         try {
-            newLiteral = new DateLiteral(value, ScalarType.getDefaultDateType(targetType));
+            newLiteral = new DateLiteral(value, targetType);
         } catch (AnalysisException e) {
             if (targetType.isScalarType(PrimitiveType.DATETIME)) {
-                newLiteral = new DateLiteral(value, ScalarType.getDefaultDateType(Type.DATE));
-                newLiteral.setType(ScalarType.getDefaultDateType(Type.DATETIME));
+                newLiteral = new DateLiteral(value, Type.DATE);
+                newLiteral.setType(Type.DATETIME);
             } else if (targetType.isScalarType(PrimitiveType.DATETIMEV2)) {
                 newLiteral = new DateLiteral(value, Type.DATEV2);
                 newLiteral.setType(targetType);
             } else {
                 throw e;
             }
+        }
+        try {
+            newLiteral.checkValueValid();
+        } catch (AnalysisException e) {
+            return NullLiteral.create(newLiteral.getType());
         }
         return newLiteral;
     }
@@ -221,7 +224,14 @@ public class StringLiteral extends LiteralExpr {
                             throw new AnalysisException(e.getMessage());
                         }
                     }
-                    return new IntLiteral(value, targetType);
+                    // MySQL will try to parse string as bigint, if failed, will cast string as 0.
+                    long longValue;
+                    try {
+                        longValue = Long.parseLong(value);
+                    } catch (NumberFormatException e) {
+                        longValue = 0L;
+                    }
+                    return new IntLiteral(longValue, targetType);
                 case LARGEINT:
                     if (VariableVarConverters.hasConverter(beConverted)) {
                         try {
@@ -237,14 +247,21 @@ public class StringLiteral extends LiteralExpr {
                     try {
                         return new FloatLiteral(Double.valueOf(value), targetType);
                     } catch (NumberFormatException e) {
-                        ErrorReport.reportAnalysisException(ErrorCode.ERR_BAD_NUMBER, value);
+                        // consistent with CastExpr's getResultValue() method
+                        return new NullLiteral();
                     }
-                    break;
                 case DECIMALV2:
                 case DECIMAL32:
                 case DECIMAL64:
                 case DECIMAL128:
-                    return new DecimalLiteral(value);
+                    try {
+                        DecimalLiteral res = new DecimalLiteral(new BigDecimal(value));
+                        res.setType(targetType);
+                        return res;
+                    } catch (Exception e) {
+                        throw new AnalysisException(String.format(
+                                "input value can't parse to decimal, value=%s", value));
+                    }
                 default:
                     break;
             }

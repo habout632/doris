@@ -57,7 +57,7 @@ suite("load") {
             set 'columns', columns[i]
             // relate to ${DORIS_HOME}/regression-test/data/demo/streamload_input.csv.
             // also, you can stream load a http stream, e.g. http://xxx/some.csv
-            file """${context.sf1DataPath}/ssb/sf1/${tableName}.tbl.split00.gz"""
+            file """${getS3Url()}/regression/ssb/sf1/${tableName}.tbl.split00.gz"""
 
             time 10000 // limit inflight 10s
 
@@ -91,7 +91,7 @@ suite("load") {
             set 'columns', columns[i]
             // relate to ${DORIS_HOME}/regression-test/data/demo/streamload_input.csv.
             // also, you can stream load a http stream, e.g. http://xxx/some.csv
-            file """${context.sf1DataPath}/ssb/sf1/${tableName}.tbl.split01.gz"""
+            file """${getS3Url()}/regression/ssb/sf1/${tableName}.tbl.split01.gz"""
 
             time 10000 // limit inflight 10s
 
@@ -120,7 +120,7 @@ suite("load") {
     def rowCount = sql "select count(*) from ${table}"
     if (rowCount[0][0] != table_rows) {
         sql new File("""${context.file.parent}/ddl/${table}_delete.sql""").text
-        sql "set global query_timeout=3600"
+        sql "set query_timeout=3600"
         def r = sql "select @@query_timeout"
         assertEquals(3600, r[0][0])
         year_cons = [

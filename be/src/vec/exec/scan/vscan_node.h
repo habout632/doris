@@ -48,6 +48,7 @@ public:
     friend class VScanner;
     friend class NewOlapScanner;
     friend class VFileScanner;
+    friend class NewJdbcScanner;
     friend class ScannerContext;
 
     Status init(const TPlanNode& tnode, RuntimeState* state = nullptr) override;
@@ -79,9 +80,7 @@ public:
 
     int runtime_filter_num() const { return (int)_runtime_filter_ctxs.size(); }
 
-    TupleId input_tuple_id() const { return _input_tuple_id; }
     TupleId output_tuple_id() const { return _output_tuple_id; }
-    const TupleDescriptor* input_tuple_desc() const { return _input_tuple_desc; }
     const TupleDescriptor* output_tuple_desc() const { return _output_tuple_desc; }
 
     enum class PushDownType {
@@ -127,18 +126,21 @@ protected:
     //      2. in/not in predicate
     //      3. function predicate
     //  TODO: these interfaces should be change to become more common.
-    virtual PushDownType _should_push_down_binary_predicate(
+    virtual Status _should_push_down_binary_predicate(
             VectorizedFnCall* fn_call, VExprContext* expr_ctx, StringRef* constant_val,
-            int* slot_ref_child, const std::function<bool(const std::string&)>& fn_checker);
+            int* slot_ref_child, const std::function<bool(const std::string&)>& fn_checker,
+            PushDownType& pdt);
 
     virtual PushDownType _should_push_down_in_predicate(VInPredicate* in_pred,
                                                         VExprContext* expr_ctx, bool is_not_in);
 
-    virtual PushDownType _should_push_down_function_filter(VectorizedFnCall* fn_call,
-                                                           VExprContext* expr_ctx,
-                                                           StringVal* constant_str,
-                                                           doris_udf::FunctionContext** fn_ctx) {
-        return PushDownType::UNACCEPTABLE;
+    virtual Status _should_push_down_function_filter(VectorizedFnCall* fn_call,
+                                                     VExprContext* expr_ctx,
+                                                     StringVal* constant_str,
+                                                     doris_udf::FunctionContext** fn_ctx,
+                                                     PushDownType& pdt) {
+        pdt = PushDownType::UNACCEPTABLE;
+        return Status::OK();
     }
 
     virtual PushDownType _should_push_down_bloom_filter() { return PushDownType::UNACCEPTABLE; }
@@ -155,11 +157,7 @@ protected:
 
 protected:
     RuntimeState* _state;
-    // For load scan node, there should be both input and output tuple descriptor.
-    // For query scan node, there is only output_tuple_desc.
-    TupleId _input_tuple_id = -1;
     TupleId _output_tuple_id = -1;
-    const TupleDescriptor* _input_tuple_desc = nullptr;
     const TupleDescriptor* _output_tuple_desc = nullptr;
 
     // These two values are from query_options
@@ -169,6 +167,7 @@ protected:
     // For runtime filters
     struct RuntimeFilterContext {
         RuntimeFilterContext() : apply_mark(false), runtime_filter(nullptr) {}
+        RuntimeFilterContext(IRuntimeFilter* rf) : apply_mark(false), runtime_filter(rf) {}
         // set to true if this runtime filter is already applied to vconjunct_ctx_ptr
         bool apply_mark;
         IRuntimeFilter* runtime_filter;
@@ -234,6 +233,7 @@ protected:
     RuntimeProfile::Counter* _acquire_runtime_filter_timer = nullptr;
     // time of get block from scanner
     RuntimeProfile::Counter* _scan_timer = nullptr;
+    RuntimeProfile::Counter* _scan_cpu_timer = nullptr;
     // time of prefilter input block from scanner
     RuntimeProfile::Counter* _prefilter_timer = nullptr;
     // time of convert input block to output block from scanner
@@ -253,6 +253,8 @@ protected:
     // Max num of scanner thread
     RuntimeProfile::Counter* _max_scanner_thread_num = nullptr;
 
+    RuntimeProfile::HighWaterMarkCounter* _free_blocks_memory_usage;
+
 private:
     // Register and get all runtime filters at Init phase.
     Status _register_runtime_filter();
@@ -262,8 +264,8 @@ private:
     Status _append_rf_into_conjuncts(std::vector<VExpr*>& vexprs);
 
     Status _normalize_conjuncts();
-    VExpr* _normalize_predicate(VExpr* conjunct_expr_root);
-    void _eval_const_conjuncts(VExpr* vexpr, VExprContext* expr_ctx, PushDownType* pdt);
+    Status _normalize_predicate(VExpr* conjunct_expr_root, VExpr** output_expr);
+    Status _eval_const_conjuncts(VExpr* vexpr, VExprContext* expr_ctx, PushDownType* pdt);
 
     Status _normalize_bloom_filter(VExpr* expr, VExprContext* expr_ctx, SlotDescriptor* slot,
                                    PushDownType* pdt);

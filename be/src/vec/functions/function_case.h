@@ -27,10 +27,6 @@
 
 namespace doris::vectorized {
 
-struct CaseState {
-    DataTypePtr result_type = nullptr;
-};
-
 template <bool has_case, bool has_else>
 struct FunctionCaseName;
 
@@ -239,6 +235,7 @@ public:
 
         if constexpr (std::is_same_v<ColumnType, ColumnString> ||
                       std::is_same_v<ColumnType, ColumnBitmap> ||
+                      std::is_same_v<ColumnType, ColumnArray> ||
                       std::is_same_v<ColumnType, ColumnHLL>) {
             // result_column and all then_column is not nullable.
             // can't simd when type is string.
@@ -305,13 +302,13 @@ public:
         bool then_null = false;
         for (int i = 1 + has_case; i < arguments.size() - has_else; i += 2) {
             auto then_column_ptr = block.get_by_position(arguments[i]).column;
-            if (then_column_ptr->is_nullable()) {
+            if (then_column_ptr->is_nullable() || then_column_ptr->only_null()) {
                 then_null = true;
             }
         }
         if constexpr (has_else) {
             auto else_column_ptr = block.get_by_position(arguments[arguments.size() - 1]).column;
-            if (else_column_ptr->is_nullable()) {
+            if (else_column_ptr->is_nullable() || else_column_ptr->only_null()) {
                 then_null = true;
             }
         } else {
@@ -337,13 +334,13 @@ public:
         bool when_null = false;
         if constexpr (has_case) {
             auto case_column_ptr = block.get_by_position(arguments[0]).column;
-            if (case_column_ptr->is_nullable()) {
+            if (case_column_ptr->is_nullable() || case_column_ptr->only_null()) {
                 when_null = true;
             }
         }
         for (int i = has_case; i < arguments.size() - has_else; i += 2) {
             auto when_column_ptr = block.get_by_position(arguments[i]).column;
-            if (when_column_ptr->is_nullable()) {
+            if (when_column_ptr->is_nullable() || when_column_ptr->only_null()) {
                 when_null = true;
             }
         }
@@ -375,10 +372,7 @@ public:
 
     Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
                         size_t result, size_t input_rows_count) override {
-        auto* case_state = reinterpret_cast<CaseState*>(
-                context->get_function_state(FunctionContext::FRAGMENT_LOCAL));
-
-        return execute_get_type(case_state->result_type, block, arguments, result,
+        return execute_get_type(block.get_by_position(result).type, block, arguments, result,
                                 input_rows_count);
     }
 };

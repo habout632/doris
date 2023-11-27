@@ -60,10 +60,13 @@ public:
     }
 
     bool evaluate_del(const std::pair<WrapperField*, WrapperField*>& statistic) const override {
+        // evaluate_del only use for delete condition to filter page, need use delete condition origin value,
+        // when opposite==true, origin value 'is null'->'is not null' and 'is not null'->'is null',
+        // so when _is_null==true, need check 'is not null' and _is_null==false, need check 'is null'
         if (_is_null) {
-            return statistic.first->is_null() && statistic.second->is_null();
-        } else {
             return !statistic.first->is_null() && !statistic.second->is_null();
+        } else {
+            return statistic.first->is_null() && statistic.second->is_null();
         }
     }
 
@@ -81,7 +84,7 @@ public:
     void evaluate_vec(const vectorized::IColumn& column, uint16_t size, bool* flags) const override;
 
 private:
-    std::string _debug_string() override {
+    std::string _debug_string() const override {
         std::string info = "NullPredicate(" + std::string(_is_null ? "is_null" : "not_null") + ")";
         return info;
     }

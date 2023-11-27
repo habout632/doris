@@ -21,15 +21,13 @@
 
 namespace doris::vectorized {
 
-VScanner::VScanner(RuntimeState* state, VScanNode* parent, int64_t limit)
+VScanner::VScanner(RuntimeState* state, VScanNode* parent, int64_t limit, RuntimeProfile* profile)
         : _state(state),
           _parent(parent),
           _limit(limit),
-          _input_tuple_desc(parent->input_tuple_desc()),
+          _profile(profile),
           _output_tuple_desc(parent->output_tuple_desc()) {
-    _real_tuple_desc = _input_tuple_desc != nullptr ? _input_tuple_desc : _output_tuple_desc;
     _total_rf_num = _parent->runtime_filter_num();
-    _is_load = (_input_tuple_desc != nullptr);
 }
 
 Status VScanner::get_block(RuntimeState* state, Block* block, bool* eof) {
@@ -47,6 +45,9 @@ Status VScanner::get_block(RuntimeState* state, Block* block, bool* eof) {
 
     {
         do {
+            // if step 2 filter all rows of block, and block will be reused to get next rows,
+            // must clear row_same_bit of block, or will get wrong row_same_bit.size() which not equal block.rows()
+            block->clear_same_bit();
             // 1. Get input block from scanner
             {
                 SCOPED_TIMER(_parent->_scan_timer);
@@ -62,8 +63,21 @@ Status VScanner::get_block(RuntimeState* state, Block* block, bool* eof) {
             {
                 SCOPED_TIMER(_parent->_filter_timer);
                 RETURN_IF_ERROR(_filter_output_block(block));
+                // record rows return (after filter) for _limit check
+                _num_rows_return += block->rows();
             }
-        } while (block->rows() == 0 && !(*eof) && raw_rows_read() < raw_rows_threshold);
+        } while (!state->is_cancelled() && block->rows() == 0 && !(*eof) &&
+                 raw_rows_read() < raw_rows_threshold);
+    }
+
+    if (state->is_cancelled()) {
+        return Status::Cancelled("cancelled");
+    }
+
+    // set eof to true if per scanner limit is reached
+    // currently for query: ORDER BY key LIMIT n
+    if (_limit > 0 && _num_rows_return >= _limit) {
+        *eof = true;
     }
 
     return Status::OK();
@@ -120,6 +134,7 @@ Status VScanner::close(RuntimeState* state) {
 }
 
 void VScanner::_update_counters_before_close() {
+    COUNTER_UPDATE(_parent->_scan_cpu_timer, _scan_cpu_timer);
     if (!_state->enable_profile() && !_is_load) return;
     COUNTER_UPDATE(_parent->_rows_read_counter, _num_rows_read);
     // Update stats for load

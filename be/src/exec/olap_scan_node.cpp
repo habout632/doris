@@ -293,7 +293,7 @@ Status OlapScanNode::get_next(RuntimeState* state, RowBatch* row_batch, bool* eo
         Status status = start_scan(state);
 
         if (!status.ok()) {
-            LOG(ERROR) << "StartScan Failed cause " << status.get_error_msg();
+            LOG(ERROR) << "StartScan Failed cause " << status;
             *eos = true;
             return status;
         }
@@ -784,7 +784,12 @@ Status OlapScanNode::build_key_ranges_and_filters() {
 
         RETURN_IF_ERROR(std::visit(
                 [&](auto&& range) {
-                    RETURN_IF_ERROR(_scan_keys.extend_scan_key(range, _max_scan_key_num,
+                    // make a copy or range and pass to extend_scan_key, keep the range unchanged
+                    // because extend_scan_key method may change the first parameter.
+                    // but the original range may be converted to olap filters, if it's not an exact_range.
+                    // related pr https://github.com/apache/doris/pull/13530
+                    auto temp_range = range;
+                    RETURN_IF_ERROR(_scan_keys.extend_scan_key(temp_range, _max_scan_key_num,
                                                                &exact_range, &eos));
                     if (exact_range) {
                         _column_value_ranges.erase(iter->first);
@@ -1487,7 +1492,6 @@ Status OlapScanNode::normalize_bloom_filter_predicate(SlotDescriptor* slot) {
 void OlapScanNode::transfer_thread(RuntimeState* state) {
     // scanner open pushdown to scanThread
     SCOPED_ATTACH_TASK(state);
-    SCOPED_CONSUME_MEM_TRACKER(mem_tracker_shared());
     Status status = Status::OK();
     for (auto scanner : _olap_scanners) {
         status = Expr::clone_if_not_exists(_conjunct_ctxs, state, scanner->conjunct_ctxs());
@@ -1508,7 +1512,9 @@ void OlapScanNode::transfer_thread(RuntimeState* state) {
      *    The larger the nice value, the more preferentially obtained query resources
      * 4. Regularly increase the priority of the remaining tasks in the queue to avoid starvation for large queries
      *********************************/
-    ThreadPoolToken* thread_token = state->get_query_fragments_ctx()->get_token();
+    // after merge #15604, we no long support thread token to non-vec olap scan node,
+    // so keep thread_token as null
+    ThreadPoolToken* thread_token = nullptr;
     PriorityThreadPool* thread_pool = state->exec_env()->scan_thread_pool();
     PriorityThreadPool* remote_thread_pool = state->exec_env()->remote_scan_thread_pool();
     _total_assign_num = 0;
@@ -1577,8 +1583,7 @@ void OlapScanNode::transfer_thread(RuntimeState* state) {
                     COUNTER_UPDATE(_scanner_sched_counter, 1);
                     olap_scanners.erase(iter++);
                 } else {
-                    LOG(FATAL) << "Failed to assign scanner task to thread pool! "
-                               << s.get_error_msg();
+                    LOG(FATAL) << "Failed to assign scanner task to thread pool! " << s;
                 }
                 ++_total_assign_num;
             }
@@ -1664,7 +1669,6 @@ void OlapScanNode::transfer_thread(RuntimeState* state) {
 }
 
 void OlapScanNode::scanner_thread(OlapScanner* scanner) {
-    SCOPED_CONSUME_MEM_TRACKER(mem_tracker_shared());
     Thread::set_self_name("olap_scanner");
     if (UNLIKELY(_transfer_done)) {
         _scanner_done = true;
@@ -1751,7 +1755,7 @@ void OlapScanNode::scanner_thread(OlapScanner* scanner) {
         row_batch->set_scanner_id(scanner->id());
         status = scanner->get_batch(_runtime_state, row_batch, &eos);
         if (!status.ok()) {
-            LOG(WARNING) << "Scan thread read OlapScanner failed: " << status.to_string();
+            LOG(WARNING) << "Scan thread read OlapScanner failed: " << status;
             eos = true;
             break;
         }

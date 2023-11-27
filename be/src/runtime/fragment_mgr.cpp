@@ -26,7 +26,6 @@
 
 #include "agent/cgroups_mgr.h"
 #include "common/object_pool.h"
-#include "common/signal_handler.h"
 #include "gen_cpp/FrontendService.h"
 #include "gen_cpp/PaloInternalService_types.h"
 #include "gen_cpp/PlanNodes_types.h"
@@ -96,6 +95,8 @@ public:
     Status execute();
 
     Status cancel(const PPlanFragmentCancelReason& reason, const std::string& msg = "");
+    bool is_canceled() { return _cancelled; }
+
     TUniqueId fragment_instance_id() const { return _fragment_instance_id; }
 
     TUniqueId query_id() const { return _query_id; }
@@ -114,6 +115,9 @@ public:
         std::lock_guard<std::mutex> l(_status_lock);
         if (!status.ok() && _exec_status.ok()) {
             _exec_status = status;
+            LOG(WARNING) << "query_id=" << print_id(_query_id)
+                         << ", instance_id=" << print_id(_fragment_instance_id)
+                         << " meet error status " << status;
         }
         return _exec_status;
     }
@@ -146,6 +150,14 @@ public:
 private:
     void coordinator_callback(const Status& status, RuntimeProfile* profile, bool done);
 
+    // This context is shared by all fragments of this host in a query
+    //
+    // NOTE: _fragments_ctx should be declared at the beginning of members so that
+    // it's destructed last.
+    // Because Objects create in _fragments_ctx.obj_pool maybe used during
+    // destruction, if _fragments_ctx is destructed too early, it will coredump.
+    std::shared_ptr<QueryFragmentsCtx> _fragments_ctx;
+
     // Id of this query
     TUniqueId _query_id;
     // Id of this instance
@@ -166,10 +178,7 @@ private:
     std::string _group;
 
     int _timeout_second;
-    bool _cancelled = false;
-
-    // This context is shared by all fragments of this host in a query
-    std::shared_ptr<QueryFragmentsCtx> _fragments_ctx;
+    std::atomic<bool> _cancelled {false};
 
     std::shared_ptr<RuntimeFilterMergeControllerEntity> _merge_controller_handler;
     // The pipe for data transfering, such as insert.
@@ -183,7 +192,8 @@ FragmentExecState::FragmentExecState(const TUniqueId& query_id,
                                      const TUniqueId& fragment_instance_id, int backend_num,
                                      ExecEnv* exec_env,
                                      std::shared_ptr<QueryFragmentsCtx> fragments_ctx)
-        : _query_id(query_id),
+        : _fragments_ctx(std::move(fragments_ctx)),
+          _query_id(query_id),
           _fragment_instance_id(fragment_instance_id),
           _backend_num(backend_num),
           _exec_env(exec_env),
@@ -191,8 +201,7 @@ FragmentExecState::FragmentExecState(const TUniqueId& query_id,
                                               this, std::placeholders::_1, std::placeholders::_2,
                                               std::placeholders::_3)),
           _set_rsc_info(false),
-          _timeout_second(-1),
-          _fragments_ctx(std::move(fragments_ctx)) {
+          _timeout_second(-1) {
     _start_time = DateTimeValue::local_time();
     _coord_addr = _fragments_ctx->coord_addr;
 }
@@ -248,9 +257,13 @@ Status FragmentExecState::execute() {
         SCOPED_RAW_TIMER(&duration_ns);
         CgroupsMgr::apply_system_cgroup();
         opentelemetry::trace::Tracer::GetCurrentSpan()->AddEvent("start executing Fragment");
-        WARN_IF_ERROR(_executor.open(),
+        Status st = _executor.open();
+        WARN_IF_ERROR(st,
                       strings::Substitute("Got error while opening fragment $0, query id: $1",
                                           print_id(_fragment_instance_id), print_id(_query_id)));
+        if (!st.ok()) {
+            cancel(PPlanFragmentCancelReason::INTERNAL_ERROR, "PlanFragmentExecutor open failed");
+        }
 
         _executor.close();
     }
@@ -314,6 +327,7 @@ void FragmentExecState::coordinator_callback(const Status& status, RuntimeProfil
 
     RuntimeState* runtime_state = _executor.runtime_state();
     DCHECK(runtime_state != nullptr);
+    params.__set_query_type(runtime_state->query_type());
     if (runtime_state->query_type() == TQueryType::LOAD && !done && status.ok()) {
         // this is a load plan, and load is not finished, just make a brief report
         params.__set_loaded_rows(runtime_state->num_rows_load_total());
@@ -486,16 +500,15 @@ void FragmentMgr::_exec_actual(std::shared_ptr<FragmentExecState> exec_state, Fi
     span->SetAttribute("query_id", print_id(exec_state->query_id()));
     span->SetAttribute("instance_id", print_id(exec_state->fragment_instance_id()));
 
-    // these two are used to output query_id when be cored dump.
-    doris::signal::query_id_hi = exec_state->query_id().hi;
-    doris::signal::query_id_lo = exec_state->query_id().lo;
-
     LOG_INFO(func_name)
             .tag("query_id", exec_state->query_id())
             .tag("instance_id", exec_state->fragment_instance_id())
             .tag("pthread_id", (uintptr_t)pthread_self());
 
-    exec_state->execute();
+    Status st = exec_state->execute();
+    if (!st.ok()) {
+        exec_state->cancel(PPlanFragmentCancelReason::INTERNAL_ERROR, "exec_state execute failed");
+    }
 
     std::shared_ptr<QueryFragmentsCtx> fragments_ctx = exec_state->get_fragments_ctx();
     bool all_done = false;
@@ -685,6 +698,7 @@ Status FragmentMgr::exec_plan_fragment(const TExecPlanFragmentParams& params, Fi
             }
         }
     }
+    fragments_ctx->fragment_ids.push_back(fragment_instance_id);
 
     exec_state.reset(new FragmentExecState(fragments_ctx->query_id,
                                            params.params.fragment_instance_id, params.backend_num,
@@ -726,9 +740,9 @@ Status FragmentMgr::exec_plan_fragment(const TExecPlanFragmentParams& params, Fi
         exec_state->cancel(PPlanFragmentCancelReason::INTERNAL_ERROR,
                            "push plan fragment to thread pool failed");
         return Status::InternalError(
-                strings::Substitute("push plan fragment $0 to thread pool failed. err = $1, BE: $2",
-                                    print_id(params.params.fragment_instance_id),
-                                    st.get_error_msg(), BackendOptions::get_localhost()));
+                "push plan fragment {} to thread pool failed. err = {}, BE: {}",
+                print_id(params.params.fragment_instance_id), st.to_string(),
+                BackendOptions::get_localhost());
     }
 
     return Status::OK();
@@ -741,11 +755,15 @@ void FragmentMgr::_set_scan_concurrency(const TExecPlanFragmentParams& params,
     // the thread token will be set if
     // 1. the cpu_limit is set, or
     // 2. the limit is very small ( < 1024)
+    // If the token is set, the scan task will use limited_scan_pool in scanner scheduler.
+    // Otherwise, the scan task will use local/remote scan pool in scanner scheduler
     int concurrency = 1;
     bool is_serial = false;
+    bool need_token = false;
     if (params.query_options.__isset.resource_limit &&
         params.query_options.resource_limit.__isset.cpu_limit) {
         concurrency = params.query_options.resource_limit.cpu_limit;
+        need_token = true;
     } else {
         concurrency = config::doris_scanner_thread_pool_thread_num;
     }
@@ -763,11 +781,14 @@ void FragmentMgr::_set_scan_concurrency(const TExecPlanFragmentParams& params,
             if (node.limit > 0 && node.limit < 1024) {
                 concurrency = 1;
                 is_serial = true;
+                need_token = true;
                 break;
             }
         }
     }
-    fragments_ctx->set_thread_token(concurrency, is_serial);
+    if (need_token) {
+        fragments_ctx->set_thread_token(concurrency, is_serial);
+    }
 #endif
 }
 
@@ -795,6 +816,35 @@ Status FragmentMgr::cancel(const TUniqueId& fragment_id, const PPlanFragmentCanc
     exec_state->cancel(reason, msg);
 
     return Status::OK();
+}
+
+void FragmentMgr::cancel_query(const TUniqueId& query_id, const PPlanFragmentCancelReason& reason,
+                               const std::string& msg) {
+    std::vector<TUniqueId> cancel_fragment_ids;
+    {
+        std::lock_guard<std::mutex> lock(_lock);
+        auto ctx = _fragments_ctx_map.find(query_id);
+        if (ctx != _fragments_ctx_map.end()) {
+            cancel_fragment_ids = ctx->second->fragment_ids;
+        }
+    }
+    for (auto it : cancel_fragment_ids) {
+        cancel(it, reason, msg);
+    }
+}
+
+bool FragmentMgr::query_is_canceled(const TUniqueId& query_id) {
+    std::lock_guard<std::mutex> lock(_lock);
+    auto ctx = _fragments_ctx_map.find(query_id);
+    if (ctx != _fragments_ctx_map.end()) {
+        for (auto it : ctx->second->fragment_ids) {
+            auto exec_state_iter = _fragment_map.find(it);
+            if (exec_state_iter != _fragment_map.end() && exec_state_iter->second) {
+                return exec_state_iter->second->is_canceled();
+            }
+        }
+    }
+    return true;
 }
 
 void FragmentMgr::cancel_worker() {

@@ -41,14 +41,14 @@ set(EXEC_TEST_FILES
     exec/olap_common_test.cpp
     exec/json_scanner_test.cpp
     exec/json_scanner_with_jsonpath_test.cpp
-    exec/parquet_scanner_test.cpp
-    exec/orc_scanner_test.cpp
+    #exec/parquet_scanner_test.cpp
+    #exec/orc_scanner_test.cpp
     exec/plain_text_line_reader_uncompressed_test.cpp
     exec/plain_text_line_reader_gzip_test.cpp
     exec/plain_text_line_reader_bzip_test.cpp
     exec/plain_text_line_reader_lz4frame_test.cpp
-    exec/broker_scanner_test.cpp
-    exec/broker_scan_node_test.cpp
+    #exec/broker_scanner_test.cpp
+    #exec/broker_scan_node_test.cpp
     exec/tablet_info_test.cpp
     exec/tablet_sink_test.cpp
     exec/buffered_reader_test.cpp
@@ -204,6 +204,7 @@ set(OLAP_TEST_FILES
     olap/rowid_conversion_test.cpp
     olap/remote_rowset_gc_test.cpp
     olap/segcompaction_test.cpp
+    olap/ordered_data_compaction_test.cpp
 )
 
 set(RUNTIME_TEST_FILES
@@ -332,15 +333,19 @@ set(VEC_TEST_FILES
     vec/aggregate_functions/agg_collect_test.cpp
     vec/aggregate_functions/agg_test.cpp
     vec/aggregate_functions/agg_min_max_test.cpp
+    vec/aggregate_functions/agg_replace_test.cpp
     vec/aggregate_functions/vec_window_funnel_test.cpp
     vec/aggregate_functions/vec_retention_test.cpp
     vec/aggregate_functions/vec_sequence_match_test.cpp
     vec/aggregate_functions/agg_min_max_by_test.cpp
     vec/columns/column_decimal_test.cpp
+    vec/columns/column_fixed_length_object_test.cpp
     vec/core/block_test.cpp
     vec/core/column_array_test.cpp
     vec/core/column_complex_test.cpp
     vec/core/column_nullable_test.cpp
+    vec/core/column_string_test.cpp
+    vec/core/column_vector_test.cpp
     vec/exec/vgeneric_iterators_test.cpp
     vec/exec/vbroker_scan_node_test.cpp
     vec/exec/vbroker_scanner_test.cpp
@@ -375,6 +380,7 @@ set(VEC_TEST_FILES
     vec/runtime/vdatetime_value_test.cpp
     vec/utils/arrow_column_to_doris_column_test.cpp
     vec/olap/char_type_padding_test.cpp
+    vec/olap/vertical_compaction_test.cpp
 )
 add_executable(doris_be_test
     ${AGENT_TEST_FILES}
@@ -395,7 +401,16 @@ add_executable(doris_be_test
 )
 
 target_link_libraries(doris_be_test ${TEST_LINK_LIBS})
-set_target_properties(doris_be_test PROPERTIES COMPILE_FLAGS "-fno-access-control" ENABLE_EXPORTS 1)
+set_target_properties(doris_be_test PROPERTIES COMPILE_FLAGS "-fno-access-control")
+
+if (OS_MACOSX AND ARCH_ARM)
+    find_program(DSYMUTIL NAMES dsymutil)
+    message(STATUS "dsymutil found: ${DSYMUTIL}")
+    add_custom_command(TARGET doris_be_test POST_BUILD
+        COMMAND ${DSYMUTIL} $<TARGET_FILE:doris_be_test>
+        COMMAND ${CMAKE_STRIP} -S $<TARGET_FILE:doris_be_test>
+    )
+endif()
 
 if (BUILD_BENCHMARK_TOOL AND BUILD_BENCHMARK_TOOL STREQUAL "ON")
     add_executable(benchmark_tool

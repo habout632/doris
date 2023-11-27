@@ -61,10 +61,10 @@ LIBEVENT_SOURCE=libevent-release-2.1.12-stable
 LIBEVENT_MD5SUM="0d5a27436bf7ff8253420c8cf09f47ca"
 
 # openssl
-OPENSSL_DOWNLOAD="https://github.com/openssl/openssl/archive/OpenSSL_1_1_1m.tar.gz"
-OPENSSL_NAME=openssl-OpenSSL_1_1_1m.tar.gz
-OPENSSL_SOURCE=openssl-OpenSSL_1_1_1m
-OPENSSL_MD5SUM="710c2368d28f1a25ab92e25b5b9b11ec"
+OPENSSL_DOWNLOAD="https://github.com/openssl/openssl/archive/OpenSSL_1_1_1s.tar.gz"
+OPENSSL_NAME=openssl-OpenSSL_1_1_1s.tar.gz
+OPENSSL_SOURCE=openssl-OpenSSL_1_1_1s
+OPENSSL_MD5SUM="7e79a7560dee77c0758baa33c61af4b4"
 
 # thrift
 THRIFT_DOWNLOAD="http://archive.apache.org/dist/thrift/0.13.0/thrift-0.13.0.tar.gz"
@@ -198,10 +198,10 @@ LEVELDB_SOURCE=leveldb-1.23
 LEVELDB_MD5SUM="afbde776fb8760312009963f09a586c7"
 
 # brpc
-BRPC_DOWNLOAD="https://github.com/apache/incubator-brpc/archive/refs/tags/1.2.0.tar.gz"
-BRPC_NAME="incubator-brpc-1.2.0.tar.gz"
-BRPC_SOURCE="incubator-brpc-1.2.0"
-BRPC_MD5SUM="556c024d5f770dbd2336ca4541ae8c96"
+BRPC_DOWNLOAD="https://github.com/apache/brpc/archive/refs/tags/1.2.0.tar.gz"
+BRPC_NAME="brpc-1.2.0.tar.gz"
+BRPC_SOURCE="brpc-1.2.0"
+BRPC_MD5SUM="c3c148e672dc660ad48d8bd973f95dcf"
 
 # rocksdb
 ROCKSDB_DOWNLOAD="https://github.com/facebook/rocksdb/archive/v5.14.2.tar.gz"
@@ -240,7 +240,7 @@ FLATBUFFERS_SOURCE=flatbuffers-2.0.0
 FLATBUFFERS_MD5SUM="a27992324c3cbf86dd888268a23d17bd"
 
 # arrow
-ARROW_DOWNLOAD="https://dlcdn.apache.org/arrow/arrow-7.0.0/apache-arrow-7.0.0.tar.gz"
+ARROW_DOWNLOAD="https://archive.apache.org/dist/arrow/arrow-7.0.0/apache-arrow-7.0.0.tar.gz"
 ARROW_NAME="apache-arrow-7.0.0.tar.gz"
 ARROW_SOURCE="apache-arrow-7.0.0"
 ARROW_MD5SUM="316ade159901646849b3b4760fa52816"
@@ -270,10 +270,10 @@ FMT_SOURCE="fmt-7.1.3"
 FMT_MD5SUM="2522ec65070c0bda0ca288677ded2831"
 
 # parallel-hashmap
-PARALLEL_HASHMAP_DOWNLOAD="https://github.com/greg7mdp/parallel-hashmap/archive/1.33.tar.gz"
-PARALLEL_HASHMAP_NAME="parallel-hashmap-1.33.tar.gz"
-PARALLEL_HASHMAP_SOURCE="parallel-hashmap-1.33"
-PARALLEL_HASHMAP_MD5SUM="7626b5215f745c4ce59b5a4e41d16235"
+PARALLEL_HASHMAP_DOWNLOAD="https://github.com/greg7mdp/parallel-hashmap/archive/refs/tags/v1.3.8.tar.gz"
+PARALLEL_HASHMAP_NAME="parallel-hashmap-1.3.8.tar.gz"
+PARALLEL_HASHMAP_SOURCE="parallel-hashmap-1.3.8"
+PARALLEL_HASHMAP_MD5SUM="1b8130d0b4f656257ef654699bfbf941"
 
 # orc
 ORC_DOWNLOAD="https://archive.apache.org/dist/orc/orc-1.7.2/orc-1.7.2.tar.gz"
@@ -357,10 +357,10 @@ KRB5_SOURCE="krb5-1.19"
 KRB5_MD5SUM="aaf18447a5a014aa3b7e81814923f4c9"
 
 # hdfs3
-HDFS3_DOWNLOAD="https://github.com/apache/doris-thirdparty/archive/refs/tags/libhdfs3-v2.3.2.tar.gz"
-HDFS3_NAME="doris-thirdparty-libhdfs3-v2.3.2.tar.gz"
-HDFS3_SOURCE="doris-thirdparty-libhdfs3-v2.3.2"
-HDFS3_MD5SUM="5087ffec0fda4fbcd60a53ed92eb4d2d"
+HDFS3_DOWNLOAD="https://github.com/apache/doris-thirdparty/archive/refs/tags/libhdfs3-v2.3.8.tar.gz"
+HDFS3_NAME="doris-thirdparty-libhdfs3-v2.3.8.tar.gz"
+HDFS3_SOURCE="doris-thirdparty-libhdfs3-v2.3.8"
+HDFS3_MD5SUM="3a9890bb43d0caee183ea7a49df2e4f3"
 
 #libdivide
 LIBDIVIDE_DOWNLOAD="https://github.com/ridiculousfish/libdivide/archive/5.0.tar.gz"
@@ -388,10 +388,10 @@ XSIMD_SOURCE=xsimd-aeec9c872c8b475dedd7781336710f2dd2666cb2
 XSIMD_MD5SUM="d024855f71c0a2837a6918c0f8f66245"
 
 # simdjson
-SIMDJSON_DOWNLOAD="https://github.com/simdjson/simdjson/archive/refs/tags/v1.0.2.tar.gz"
-SIMDJSON_NAME=simdjson-1.0.2.tar.gz
-SIMDJSON_SOURCE=simdjson-1.0.2
-SIMDJSON_MD5SUM="5bb34cca7087a99c450dbdfe406bdc7d"
+SIMDJSON_DOWNLOAD="https://github.com/simdjson/simdjson/archive/refs/tags/v3.0.1.tar.gz"
+SIMDJSON_NAME=simdjson-3.0.1.tar.gz
+SIMDJSON_SOURCE=simdjson-3.0.1
+SIMDJSON_MD5SUM="993576b47249f2bade2bfb2552b2896a"
 
 # nlohmann_json
 NLOHMANN_JSON_DOWNLOAD="https://github.com/nlohmann/json/archive/refs/tags/v3.10.1.tar.gz"
@@ -434,6 +434,18 @@ CONCURRENTQUEUE_DOWNLOAD="https://github.com/cameron314/concurrentqueue/archive/
 CONCURRENTQUEUE_NAME=concurrentqueue-1.0.3.tar.gz
 CONCURRENTQUEUE_SOURCE=concurrentqueue-1.0.3
 CONCURRENTQUEUE_MD5SUM="118e5bb661b567634647312991e10222"
+
+# fast_float
+FAST_FLOAT_DOWNLOAD="https://github.com/fastfloat/fast_float/archive/refs/tags/v3.9.0.tar.gz"
+FAST_FLOAT_NAME=fast_float-3.9.0.tar.gz
+FAST_FLOAT_SOURCE=fast_float-3.9.0
+FAST_FLOAT_MD5SUM="5656b0d8b150a3b157cfb092d214f6ea"
+
+# libhdfs
+HADOOP_LIBS_DOWNLOAD="https://github.com/apache/doris-thirdparty/archive/refs/tags/hadoop-3.3.4.4-for-doris.tar.gz"
+HADOOP_LIBS_NAME="hadoop-3.3.4.4-for-doris.tar.gz"
+HADOOP_LIBS_SOURCE="doris-thirdparty-hadoop-3.3.4.4-for-doris"
+HADOOP_LIBS_MD5SUM="00f0042dd3900ba016f079ee9c550efb"
 
 # all thirdparties which need to be downloaded is set in array TP_ARCHIVES
 export TP_ARCHIVES=(
@@ -498,6 +510,8 @@ export TP_ARCHIVES=(
     'SSE2NEON'
     'XXHASH'
     'CONCURRENTQUEUE'
+    'FAST_FLOAT'
+    'HADOOP_LIBS'
 )
 
 if [[ "$(uname -s)" == 'Darwin' ]]; then

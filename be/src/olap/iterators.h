@@ -36,6 +36,9 @@ class ColumnPredicate;
 struct IOContext {
     ReaderType reader_type;
 };
+namespace vectorized {
+struct IteratorRowRef;
+};
 
 class StorageReadOptions {
 public:
@@ -80,7 +83,7 @@ public:
     // used to fiter rows in row block
     std::vector<ColumnPredicate*> column_predicates;
     std::unordered_map<int32_t, std::shared_ptr<AndBlockColumnPredicate>> col_id_to_predicates;
-    std::unordered_map<int32_t, std::vector<const ColumnPredicate*>> col_id_to_del_predicates;
+    std::unordered_map<int32_t, std::vector<const ColumnPredicate*>> del_predicates_for_zone_map;
     TPushAggOp::type push_down_agg_type_opt = TPushAggOp::NONE;
 
     // REQUIRED (null is not allowed)
@@ -96,6 +99,7 @@ public:
     std::vector<uint32_t>* read_orderby_key_columns = nullptr;
 
     IOContext io_ctx;
+    Version version;
 };
 
 // Used to read data in RowBlockV2 one by one
@@ -127,6 +131,13 @@ public:
         return Status::NotSupported("to be implemented");
     }
 
+    virtual Status next_row(vectorized::IteratorRowRef* ref) {
+        return Status::NotSupported("to be implemented");
+    }
+    virtual Status unique_key_next_row(vectorized::IteratorRowRef* ref) {
+        return Status::NotSupported("to be implemented");
+    }
+
     virtual bool support_return_data_by_ref() { return false; }
 
     virtual Status current_block_row_locations(std::vector<RowLocation>* block_row_locations) {
@@ -144,6 +155,8 @@ public:
     virtual uint64_t data_id() const { return 0; }
 
     virtual bool update_profile(RuntimeProfile* profile) { return false; }
+    // return rows merged count by iterator
+    virtual uint64_t merged_rows() const { return 0; }
 };
 
 } // namespace doris

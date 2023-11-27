@@ -211,6 +211,8 @@ struct TBrokerScanRangeParams {
     12: optional i32 line_delimiter_length = 1;
     13: optional string column_separator_str;
     14: optional string line_delimiter_str;
+    // trim double quotes for csv
+    15: optional bool trim_double_quotes;
 
 }
 
@@ -255,6 +257,8 @@ struct TFileAttributes {
     8: optional bool read_by_column_def;
     // csv with header type
     9: optional string header_type;
+    // trim double quotes for csv
+    10: optional bool trim_double_quotes;
 }
 
 struct TIcebergDeleteFileDesc {
@@ -268,7 +272,12 @@ struct TIcebergFileDesc {
     1: optional i32 format_version;
     // Iceberg file type, 0: data, 1: position delete, 2: equality delete.
     2: optional i32 content;
+    // When open a delete file, filter the data file path with the 'file_path' property
     3: optional list<TIcebergDeleteFileDesc> delete_files;
+    // Deprecated
+    4: optional Types.TTupleId delete_table_tuple_id;
+    // Deprecated
+    5: optional Exprs.TExpr file_select_conjunct;
 }
 
 struct TTableFormatFileDesc {
@@ -308,10 +317,12 @@ struct TFileScanRangeParams {
     14: optional list<Types.TNetworkAddress> broker_addresses
     15: optional TFileAttributes file_attributes
     16: optional Exprs.TExpr pre_filter_exprs
-    // For data lake table format
+    // Deprecated, For data lake table format
     17: optional TTableFormatFileDesc table_format_params
     // For csv query task, same the column index in file, order by dest_tuple
     18: optional list<i32> column_idxs
+    // Map of slot to its position in table schema. Only for Hive external table.
+    19: optional map<string, i32> slot_name_to_schema_pos
 }
 
 struct TFileRangeDesc {
@@ -329,6 +340,8 @@ struct TFileRangeDesc {
     6: optional list<string> columns_from_path;
     // column names from file path, in the same order with columns_from_path
     7: optional list<string> columns_from_path_keys;
+    // For data lake table format
+    8: optional TTableFormatFileDesc table_format_params
 }
 
 // TFileScanRange represents a set of descriptions of a file and the rules for reading and converting it.
@@ -359,6 +372,18 @@ struct TDataGenScanRange {
   1: optional TTVFNumbersScanRange numbers_params
 }
 
+enum TIcebergMetadataType {
+  SNAPSHOTS = 0,
+}
+
+struct TIcebergMetadataParams {
+  1: optional TIcebergMetadataType metadata_type
+}
+
+struct TMetaScanRange {
+  1: optional TIcebergMetadataParams iceberg_params
+}
+
 // Specification of an individual data range which is held in its entirety
 // by a storage server
 struct TScanRange {
@@ -369,6 +394,7 @@ struct TScanRange {
   7: optional TEsScanRange es_scan_range
   8: optional TExternalScanRange ext_scan_range
   9: optional TDataGenScanRange data_gen_scan_range
+  10: optional TMetaScanRange meta_scan_range
 }
 
 struct TMySQLScanNode {
@@ -397,6 +423,7 @@ struct TJdbcScanNode {
   1: optional Types.TTupleId tuple_id
   2: optional string table_name
   3: optional string query_string
+  4: optional Types.TOdbcTableType table_type
 }
 
 
@@ -496,14 +523,14 @@ struct TSchemaScanNode {
   11: optional Types.TUserIdentity current_user_ident   // to replace the user and user_ip
   12: optional bool show_hidden_cloumns = false
   13: optional list<TSchemaTableStructure> table_structure
+  14: optional string catalog
 }
 
 struct TMetaScanNode {
   1: required Types.TTupleId tuple_id
-  2: required string table_name
-  3: optional string db
+  2: optional string catalog
+  3: optional string database
   4: optional string table
-  5: optional string user
 }
 
 struct TSortInfo {
@@ -601,7 +628,9 @@ struct THashJoinNode {
 
   9: optional list<Types.TTupleId> vintermediate_tuple_id_list
 
-  10: optional bool is_broadcast_join;
+  10: optional bool is_broadcast_join
+
+  11: optional bool is_mark
 }
 
 struct TNestedLoopJoinNode {
@@ -615,6 +644,10 @@ struct TNestedLoopJoinNode {
 
   // for bitmap filer, don't need to join, but output left child tuple
   5: optional bool is_output_left_side_only
+
+  6: optional Exprs.TExpr vjoin_conjunct
+
+  7: optional bool is_mark
 }
 
 struct TMergeJoinNode {

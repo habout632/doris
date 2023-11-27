@@ -102,6 +102,7 @@ public class HMSExternalDatabase extends ExternalDatabase<HMSExternalTable> impl
                     tblId = tableNameToId.get(tableName);
                     tmpTableNameToId.put(tableName, tblId);
                     HMSExternalTable table = idToTbl.get(tblId);
+                    table.unsetObjectCreated();
                     tmpIdToTbl.put(tblId, table);
                     initDatabaseLog.addRefreshTable(tblId);
                 } else {
@@ -169,5 +170,25 @@ public class HMSExternalDatabase extends ExternalDatabase<HMSExternalTable> impl
     public void addTableForTest(HMSExternalTable tbl) {
         idToTbl.put(tbl.getId(), tbl);
         tableNameToId.put(tbl.getName(), tbl.getId());
+    }
+
+    @Override
+    public void dropTable(String tableName) {
+        LOG.debug("drop table [{}]", tableName);
+        makeSureInitialized();
+        Long tableId = tableNameToId.remove(tableName);
+        if (tableId == null) {
+            LOG.warn("drop table [{}] failed", tableName);
+        }
+        idToTbl.remove(tableId);
+    }
+
+    @Override
+    public void replayCreateTableFromEvent(String tableName, long tableId) {
+        LOG.debug("create table [{}]", tableName);
+        tableNameToId.put(tableName, tableId);
+        HMSExternalTable table = new HMSExternalTable(tableId, tableName, name,
+                (HMSExternalCatalog) extCatalog);
+        idToTbl.put(tableId, table);
     }
 }

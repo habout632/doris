@@ -22,6 +22,7 @@
 
 #include "http/http_status.h"
 #include "vec/aggregate_functions/aggregate_function.h"
+#include "vec/columns/column_array.h"
 #include "vec/columns/column_complex.h"
 #include "vec/columns/columns_number.h"
 #include "vec/data_types/data_type.h"
@@ -43,7 +44,9 @@
     M(Decimal128, ColumnDecimal<Decimal128>) \
     M(Decimal128I, ColumnDecimal<Decimal128I>)
 
-#define STRING_TYPE_TO_COLUMN_TYPE(M) M(String, ColumnString)
+#define STRING_TYPE_TO_COLUMN_TYPE(M) \
+    M(String, ColumnString)           \
+    M(JSONB, ColumnString)
 
 #define TIME_TYPE_TO_COLUMN_TYPE(M) \
     M(Date, ColumnInt64)            \
@@ -52,6 +55,7 @@
     M(DateTimeV2, ColumnUInt64)
 
 #define COMPLEX_TYPE_TO_COLUMN_TYPE(M) \
+    M(Array, ColumnArray)              \
     M(BitMap, ColumnBitmap)            \
     M(HLL, ColumnHLL)
 

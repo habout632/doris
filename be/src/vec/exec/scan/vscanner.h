@@ -38,7 +38,7 @@ struct ScannerCounter {
 
 class VScanner {
 public:
-    VScanner(RuntimeState* state, VScanNode* parent, int64_t limit);
+    VScanner(RuntimeState* state, VScanNode* parent, int64_t limit, RuntimeProfile* profile);
 
     virtual ~VScanner() {}
 
@@ -73,7 +73,14 @@ public:
         _watch.start();
     }
 
+    void start_scan_cpu_timer() {
+        _cpu_watch.reset();
+        _cpu_watch.start();
+    }
+
     void update_wait_worker_timer() { _scanner_wait_worker_timer += _watch.elapsed_time(); }
+
+    void update_scan_cpu_timer() { _scan_cpu_timer += _cpu_watch.elapsed_time(); }
 
     RuntimeState* runtime_state() { return _state; }
 
@@ -82,8 +89,8 @@ public:
 
     int queue_id() { return _state->exec_env()->store_path_to_index("xxx"); }
 
-    doris::TabletStorageType get_storage_type() {
-        return doris::TabletStorageType::STORAGE_TYPE_LOCAL;
+    virtual doris::TabletStorageType get_storage_type() {
+        return doris::TabletStorageType::STORAGE_TYPE_REMOTE;
     }
 
     bool need_to_close() { return _need_to_close; }
@@ -126,9 +133,9 @@ protected:
     // Set if scan node has sort limit info
     int64_t _limit = -1;
 
-    const TupleDescriptor* _input_tuple_desc = nullptr;
+    RuntimeProfile* _profile;
+
     const TupleDescriptor* _output_tuple_desc = nullptr;
-    const TupleDescriptor* _real_tuple_desc = nullptr;
 
     // If _input_tuple_desc is set, the scanner will read data into
     // this _input_block first, then convert to the output block.
@@ -157,12 +164,18 @@ protected:
     // num of rows read from scanner
     int64_t _num_rows_read = 0;
 
+    // num of rows return from scanner, after filter block
+    int64_t _num_rows_return = 0;
+
     // Set true after counter is updated finally
     bool _has_updated_counter = false;
 
     // watch to count the time wait for scanner thread
     MonotonicStopWatch _watch;
+    // Do not use ScopedTimer. There is no guarantee that, the counter
+    ThreadCpuStopWatch _cpu_watch;
     int64_t _scanner_wait_worker_timer = 0;
+    int64_t _scan_cpu_timer = 0;
 
     // File formats based push down predicate
     std::vector<ExprContext*> _conjunct_ctxs;

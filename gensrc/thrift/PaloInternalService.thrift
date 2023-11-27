@@ -183,6 +183,16 @@ struct TQueryOptions {
   53: optional i32 partitioned_hash_join_rows_threshold = 0
 
   54: optional bool enable_share_hash_table_for_broadcast_join
+
+  55: optional bool check_overflow_for_decimal = false
+
+  // For debug purpose, skip delete bitmap when reading data
+  56: optional bool skip_delete_bitmap = false
+
+  57: optional i64 scan_queue_mem_limit
+
+  // For emergency use, skip missing version when reading rowsets
+  58: optional bool skip_missing_version = false;
 }
     
 

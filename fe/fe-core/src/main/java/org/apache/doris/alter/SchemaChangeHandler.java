@@ -111,7 +111,7 @@ public class SchemaChangeHandler extends AlterHandler {
     private static final Logger LOG = LogManager.getLogger(SchemaChangeHandler.class);
 
     // all shadow indexes should have this prefix in name
-    public static final String SHADOW_NAME_PRFIX = "__doris_shadow_";
+    public static final String SHADOW_NAME_PREFIX = "__doris_shadow_";
 
     public static final int MAX_ACTIVE_SCHEMA_CHANGE_JOB_V2_SIZE = 10;
 
@@ -492,9 +492,8 @@ public class SchemaChangeHandler extends AlterHandler {
         if (KeysType.AGG_KEYS == olapTable.getKeysType()) {
             if (modColumn.isKey() && null != modColumn.getAggregationType()) {
                 throw new DdlException("Can not assign aggregation method on key column: " + modColumn.getName());
-            } else if (null == modColumn.getAggregationType()) {
-                // in aggregate key table, no aggregation method indicate key column
-                modColumn.setIsKey(true);
+            } else if (!modColumn.isKey() && null == modColumn.getAggregationType()) {
+                throw new DdlException("Aggregate method must be specified for value column: " + modColumn.getName());
             }
         } else if (KeysType.UNIQUE_KEYS == olapTable.getKeysType()) {
             if (null != modColumn.getAggregationType()) {
@@ -682,7 +681,7 @@ public class SchemaChangeHandler extends AlterHandler {
              * And if the column type is not changed, the same column name is still to the same column type,
              * so no need to add prefix.
              */
-            modColumn.setName(SHADOW_NAME_PRFIX + modColumn.getName());
+            modColumn.setName(SHADOW_NAME_PREFIX + modColumn.getName());
         }
     }
 
@@ -927,6 +926,8 @@ public class SchemaChangeHandler extends AlterHandler {
                 throw new DdlException("Can not enable batch delete support, already supported batch delete.");
             } else if (newColName.equalsIgnoreCase(Column.SEQUENCE_COL)) {
                 throw new DdlException("Can not enable sequence column support, already supported sequence column.");
+            } else if (newColName.equalsIgnoreCase(Column.VERSION_COL)) {
+                throw new DdlException("Can not enable version column support, already supported version column.");
             } else {
                 if (ignoreSameColumn && newColumn.equals(foundColumn)) {
                     //for add columns rpc, allow add same type column.
@@ -1107,18 +1108,20 @@ public class SchemaChangeHandler extends AlterHandler {
             hasPos = true;
         }
 
-        newColumn.setUniqueId(newColumnUniqueId);
+        // newColumn may add to baseIndex or rollups, so we need copy before change UniqueId
+        Column toAddColumn = new Column(newColumn);
+        toAddColumn.setUniqueId(newColumnUniqueId);
         if (hasPos) {
-            modIndexSchema.add(posIndex + 1, newColumn);
-        } else if (newColumn.isKey()) {
+            modIndexSchema.add(posIndex + 1, toAddColumn);
+        } else if (toAddColumn.isKey()) {
             // key
-            modIndexSchema.add(posIndex + 1, newColumn);
+            modIndexSchema.add(posIndex + 1, toAddColumn);
         } else if (lastVisibleIdx != -1 && lastVisibleIdx < modIndexSchema.size() - 1) {
             // has hidden columns
-            modIndexSchema.add(lastVisibleIdx + 1, newColumn);
+            modIndexSchema.add(lastVisibleIdx + 1, toAddColumn);
         } else {
             // value
-            modIndexSchema.add(newColumn);
+            modIndexSchema.add(toAddColumn);
         }
         LOG.debug("newColumn setUniqueId({}), modIndexSchema:{}", newColumnUniqueId, modIndexSchema);
     }
@@ -1471,7 +1474,7 @@ public class SchemaChangeHandler extends AlterHandler {
             while (currentSchemaHash == newSchemaHash) {
                 newSchemaHash = Util.generateSchemaHash();
             }
-            String newIndexName = SHADOW_NAME_PRFIX + olapTable.getIndexNameById(originIndexId);
+            String newIndexName = SHADOW_NAME_PREFIX + olapTable.getIndexNameById(originIndexId);
             short newShortKeyColumnCount = indexIdToShortKeyColumnCount.get(originIndexId);
             long shadowIndexId = idGeneratorBuffer.getNextId();
 
@@ -1692,7 +1695,7 @@ public class SchemaChangeHandler extends AlterHandler {
                         if (!olapTable.dynamicPartitionExists()) {
                             try {
                                 DynamicPartitionUtil.checkInputDynamicPartitionProperties(properties,
-                                        olapTable.getPartitionInfo());
+                                        olapTable);
                             } catch (DdlException e) {
                                 // This table is not a dynamic partition table
                                 // and didn't supply all dynamic partition properties
@@ -1712,9 +1715,8 @@ public class SchemaChangeHandler extends AlterHandler {
                     } else if (properties.containsKey(PropertyAnalyzer.PROPERTIES_REPLICATION_ALLOCATION)) {
                         Env.getCurrentEnv().modifyTableReplicaAllocation(db, olapTable, properties);
                         return;
-                    } else if (properties.containsKey(PropertyAnalyzer.PROPERTIES_REMOTE_STORAGE_POLICY)) {
-                        olapTable.setRemoteStoragePolicy(
-                                properties.get(PropertyAnalyzer.PROPERTIES_REMOTE_STORAGE_POLICY));
+                    } else if (properties.containsKey(PropertyAnalyzer.PROPERTIES_STORAGE_POLICY)) {
+                        olapTable.setStoragePolicy(properties.get(PropertyAnalyzer.PROPERTIES_STORAGE_POLICY));
                         return;
                     }
                 }
@@ -2254,7 +2256,7 @@ public class SchemaChangeHandler extends AlterHandler {
 
         for (Map.Entry<Long, List<Column>> entry : changedIndexIdToSchema.entrySet()) {
             long originIndexId = entry.getKey();
-            String newIndexName = SHADOW_NAME_PRFIX + olapTable.getIndexNameById(originIndexId);
+            String newIndexName = SHADOW_NAME_PREFIX + olapTable.getIndexNameById(originIndexId);
             MaterializedIndexMeta currentIndexMeta = olapTable.getIndexMetaByIndexId(originIndexId);
             // 1. get new schema version/schema version hash, short key column count
             int currentSchemaVersion = currentIndexMeta.getSchemaVersion();

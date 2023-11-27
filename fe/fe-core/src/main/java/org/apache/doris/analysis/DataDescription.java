@@ -145,6 +145,7 @@ public class DataDescription {
     private LoadTask.MergeType mergeType = LoadTask.MergeType.APPEND;
     private final Expr deleteCondition;
     private final Map<String, String> properties;
+    private boolean trimDoubleQuotes = false;
 
     public DataDescription(String tableName,
                            PartitionNames partitionNames,
@@ -189,6 +190,8 @@ public class DataDescription {
         this.deleteCondition = deleteCondition;
         this.sequenceCol = sequenceColName;
         this.properties = properties;
+        columnsNameToLowerCase(fileFieldNames);
+        columnsNameToLowerCase(columnsFromPath);
     }
 
     // data from table external_hive_table
@@ -222,9 +225,14 @@ public class DataDescription {
     public DataDescription(String tableName, LoadTaskInfo taskInfo) {
         this.tableName = tableName;
         this.partitionNames = taskInfo.getPartitions();
-        // Add a dummy path to just make analyze() happy.
-        // Stream load does not need this field.
-        this.filePaths = Lists.newArrayList("dummy");
+
+        if (!Strings.isNullOrEmpty(taskInfo.getPath())) {
+            this.filePaths = Lists.newArrayList(taskInfo.getPath());
+        } else {
+            // Add a dummy path to just make analyze() happy.
+            this.filePaths = Lists.newArrayList("dummy");
+        }
+
         this.fileFieldNames = taskInfo.getColumnExprDescs().getFileColNames();
         this.columnSeparator = taskInfo.getColumnSeparator();
         this.lineDelimiter = taskInfo.getLineDelimiter();
@@ -245,6 +253,8 @@ public class DataDescription {
         this.readJsonByLine = taskInfo.isReadJsonByLine();
         this.numAsString = taskInfo.isNumAsString();
         this.properties = Maps.newHashMap();
+        this.trimDoubleQuotes = taskInfo.getTrimDoubleQuotes();
+        columnsNameToLowerCase(fileFieldNames);
     }
 
     private void getFileFormatAndCompressType(LoadTaskInfo taskInfo) {
@@ -259,7 +269,20 @@ public class DataDescription {
                 // the compress type is saved in "compressType"
                 this.fileFormat = "csv";
             } else {
-                this.fileFormat = "json";
+                switch (type) {
+                    case FORMAT_ORC:
+                        this.fileFormat = "orc";
+                        break;
+                    case FORMAT_PARQUET:
+                        this.fileFormat = "parquet";
+                        break;
+                    case FORMAT_JSON:
+                        this.fileFormat = "json";
+                        break;
+                    default:
+                        this.fileFormat = "unknown";
+                        break;
+                }
             }
         }
         // get compress type
@@ -426,7 +449,7 @@ public class DataDescription {
     private static void validateHllHash(List<String> args, Map<String, String> columnNameMap) throws AnalysisException {
         for (int i = 0; i < args.size(); ++i) {
             String argColumn = args.get(i);
-            if (!columnNameMap.containsKey(argColumn)) {
+            if (argColumn == null || !columnNameMap.containsKey(argColumn)) {
                 throw new AnalysisException("Column is not in sources, column: " + argColumn);
             }
             args.set(i, columnNameMap.get(argColumn));
@@ -623,6 +646,10 @@ public class DataDescription {
         return readJsonByLine;
     }
 
+    public boolean getTrimDoubleQuotes() {
+        return trimDoubleQuotes;
+    }
+
     /*
      * Analyze parsedExprMap and columnToHadoopFunction from columns, columns from path and columnMappingList
      * Example:
@@ -702,13 +729,16 @@ public class DataDescription {
             // hadoop load only supports the FunctionCallExpr
             Expr child1 = predicate.getChild(1);
             if (isHadoopLoad && !(child1 instanceof FunctionCallExpr)) {
-                throw new AnalysisException("Hadoop load only supports the designated function. "
-                        + "The error mapping function is:" + child1.toSql());
+                throw new AnalysisException(
+                        "Hadoop load only supports the designated function. " + "The error mapping function is:"
+                                + child1.toSql());
             }
-            ImportColumnDesc importColumnDesc = new ImportColumnDesc(column, child1);
+            // Must clone the expr, because in routine load, the expr will be analyzed for each task.
+            Expr cloned = child1.clone();
+            ImportColumnDesc importColumnDesc = new ImportColumnDesc(column, cloned);
             parsedColumnExprList.add(importColumnDesc);
-            if (child1 instanceof FunctionCallExpr) {
-                analyzeColumnToHadoopFunction(column, child1);
+            if (cloned instanceof FunctionCallExpr) {
+                analyzeColumnToHadoopFunction(column, cloned);
             }
         }
     }
@@ -872,6 +902,17 @@ public class DataDescription {
         }
     }
 
+    // Change all the columns name to lower case, because Doris column is case-insensitive.
+    private void columnsNameToLowerCase(List<String> columns) {
+        if (columns == null || columns.isEmpty() || "json".equals(this.fileFormat)) {
+            return;
+        }
+        for (int i = 0; i < columns.size(); i++) {
+            String column = columns.remove(i);
+            columns.add(i, column.toLowerCase());
+        }
+    }
+
     public void analyze(String fullDbName) throws AnalysisException {
         if (mergeType != LoadTask.MergeType.MERGE && deleteCondition != null) {
             throw new AnalysisException("not support DELETE ON clause when merge type is not MERGE.");
@@ -953,7 +994,11 @@ public class DataDescription {
             if (!mappingColNames.contains(column.getName())) {
                 parsedColumnExprList.add(new ImportColumnDesc(column.getName(), null));
             }
-            fileFieldNames.add(column.getName());
+            if ("json".equals(this.fileFormat)) {
+                fileFieldNames.add(column.getName());
+            } else {
+                fileFieldNames.add(column.getName().toLowerCase());
+            }
         }
 
         LOG.debug("after fill column info. columns: {}, parsed column exprs: {}", fileFieldNames, parsedColumnExprList);
@@ -1019,3 +1064,4 @@ public class DataDescription {
         return toSql();
     }
 }
+

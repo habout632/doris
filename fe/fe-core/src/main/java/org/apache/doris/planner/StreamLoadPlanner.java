@@ -52,6 +52,7 @@ import org.apache.doris.task.LoadTaskInfo;
 import org.apache.doris.thrift.PaloInternalServiceVersion;
 import org.apache.doris.thrift.TBrokerFileStatus;
 import org.apache.doris.thrift.TExecPlanFragmentParams;
+import org.apache.doris.thrift.TFileType;
 import org.apache.doris.thrift.TLoadErrorHubInfo;
 import org.apache.doris.thrift.TNetworkAddress;
 import org.apache.doris.thrift.TPlanFragmentExecParams;
@@ -180,11 +181,18 @@ public class StreamLoadPlanner {
             fileGroup.parse(db, dataDescription);
             // 2. create dummy file status
             TBrokerFileStatus fileStatus = new TBrokerFileStatus();
-            fileStatus.setPath("");
-            fileStatus.setIsDir(false);
-            fileStatus.setSize(-1); // must set to -1, means stream.
+            if (taskInfo.getFileType() == TFileType.FILE_LOCAL) {
+                fileStatus.setPath(taskInfo.getPath());
+                fileStatus.setIsDir(false);
+                fileStatus.setSize(taskInfo.getFileSize()); // must set to -1, means stream.
+            } else {
+                fileStatus.setPath("");
+                fileStatus.setIsDir(false);
+                fileStatus.setSize(-1); // must set to -1, means stream.
+            }
             fileScanNode.setLoadInfo(loadId, taskInfo.getTxnId(), destTable, BrokerDesc.createForStreamLoad(),
-                    fileGroup, fileStatus, taskInfo.isStrictMode(), taskInfo.getFileType());
+                    fileGroup, fileStatus, taskInfo.isStrictMode(), taskInfo.getFileType(),
+                    taskInfo.getHiddenColumns());
             scanNode = fileScanNode;
         } else {
             scanNode = new StreamLoadScanNode(loadId, new PlanNodeId(0), scanTupleDesc, destTable, taskInfo);
@@ -208,7 +216,7 @@ public class StreamLoadPlanner {
         List<Long> partitionIds = getAllPartitionIds();
         OlapTableSink olapTableSink = new OlapTableSink(destTable, tupleDesc, partitionIds,
                 Config.enable_single_replica_load);
-        olapTableSink.init(loadId, taskInfo.getTxnId(), db.getId(), taskInfo.getTimeout(),
+        olapTableSink.init(loadId, taskInfo.getTxnId(), db.getId(), timeout,
                 taskInfo.getSendBatchParallelism(), taskInfo.isLoadToSingleTablet());
         olapTableSink.complete();
 
@@ -251,6 +259,7 @@ public class StreamLoadPlanner {
         queryOptions.setLoadMemLimit(taskInfo.getMemLimit());
         queryOptions.setEnableVectorizedEngine(Config.enable_vectorized_load);
         queryOptions.setBeExecVersion(Config.be_exec_version);
+        queryOptions.setIsReportSuccess(taskInfo.getEnableProfile());
 
         params.setQueryOptions(queryOptions);
         TQueryGlobals queryGlobals = new TQueryGlobals();
@@ -323,3 +332,4 @@ public class StreamLoadPlanner {
         return null;
     }
 }
+

@@ -25,6 +25,8 @@
 #include "util/time.h"
 #include "vec/columns/column_array.h"
 #include "vec/core/block.h"
+#include "vec/core/types.h"
+#include "vec/data_types/data_type_decimal.h"
 #include "vec/exprs/vexpr.h"
 #include "vec/exprs/vexpr_context.h"
 
@@ -37,6 +39,12 @@ VNodeChannel::VNodeChannel(OlapTableSink* parent, IndexChannel* index_channel, i
 }
 
 VNodeChannel::~VNodeChannel() {
+    if (_open_closure != nullptr) {
+        if (_open_closure->unref()) {
+            delete _open_closure;
+        }
+        _open_closure = nullptr;
+    }
     if (_add_block_closure != nullptr) {
         delete _add_block_closure;
         _add_block_closure = nullptr;
@@ -101,7 +109,7 @@ Status VNodeChannel::open_wait() {
                                        -1);
         Status st = _index_channel->check_intolerable_failure();
         if (!st.ok()) {
-            _cancel_with_msg(fmt::format("{}, err: {}", channel_info(), st.get_error_msg()));
+            _cancel_with_msg(fmt::format("{}, err: {}", channel_info(), st.to_string()));
         } else if (is_last_rpc) {
             // if this is last rpc, will must set _add_batches_finished. otherwise, node channel's close_wait
             // will be blocked.
@@ -128,13 +136,17 @@ Status VNodeChannel::open_wait() {
 
             Status st = _index_channel->check_intolerable_failure();
             if (!st.ok()) {
-                _cancel_with_msg(st.get_error_msg());
+                _cancel_with_msg(st.to_string());
             } else if (is_last_rpc) {
                 for (auto& tablet : result.tablet_vec()) {
                     TTabletCommitInfo commit_info;
                     commit_info.tabletId = tablet.tablet_id();
                     commit_info.backendId = _node_id;
                     _tablet_commit_infos.emplace_back(std::move(commit_info));
+                    if (tablet.has_received_rows()) {
+                        _tablets_received_rows.emplace_back(tablet.tablet_id(),
+                                                            tablet.received_rows());
+                    }
                     VLOG_CRITICAL << "master replica commit info: tabletId=" << tablet.tablet_id()
                                   << ", backendId=" << _node_id
                                   << ", master node id: " << this->node_id()
@@ -160,7 +172,7 @@ Status VNodeChannel::open_wait() {
             }
         } else {
             _cancel_with_msg(fmt::format("{}, add batch req success but status isn't ok, err: {}",
-                                         channel_info(), status.get_error_msg()));
+                                         channel_info(), status.to_string()));
         }
 
         if (result.has_execution_time_us()) {
@@ -274,6 +286,8 @@ void VNodeChannel::try_send_block(RuntimeState* state) {
     // tablet_ids has already set when add row
     request.set_packet_seq(_next_packet_seq);
     auto block = mutable_block->to_block();
+    CHECK(block.rows() == request.tablet_ids_size())
+            << "block rows: " << block.rows() << ", tablet_ids_size: " << request.tablet_ids_size();
     if (block.rows() > 0) {
         SCOPED_ATOMIC_TIMER(&_serialize_batch_ns);
         size_t uncompressed_bytes = 0, compressed_bytes = 0;
@@ -282,9 +296,13 @@ void VNodeChannel::try_send_block(RuntimeState* state) {
                                     state->fragement_transmission_compression_type(),
                                     _parent->_transfer_large_data_by_brpc);
         if (!st.ok()) {
-            cancel(fmt::format("{}, err: {}", channel_info(), st.get_error_msg()));
+            cancel(fmt::format("{}, err: {}", channel_info(), st.to_string()));
             _add_block_closure->clear_in_flight();
             return;
+        }
+        {
+            vectorized::Block tmp_block(*request.mutable_block());
+            CHECK(block.rows() == tmp_block.rows());
         }
         if (compressed_bytes >= double(config::brpc_max_body_size) * 0.95f) {
             LOG(WARNING) << "send block too large, this rpc may failed. send size: "
@@ -349,7 +367,7 @@ void VNodeChannel::try_send_block(RuntimeState* state) {
                 PTabletWriterAddBlockRequest, ReusableClosure<PTabletWriterAddBlockResult>>(
                 &request, _add_block_closure);
         if (!st.ok()) {
-            cancel(fmt::format("{}, err: {}", channel_info(), st.get_error_msg()));
+            cancel(fmt::format("{}, err: {}", channel_info(), st.to_string()));
             _add_block_closure->clear_in_flight();
             return;
         }
@@ -594,7 +612,7 @@ Status VOlapTableSink::send(RuntimeState* state, vectorized::Block* input_block)
                 auto st = entry.first->add_block(&block, entry.second);
                 if (!st.ok()) {
                     _channels[i]->mark_as_failed(entry.first->node_id(), entry.first->host(),
-                                                 st.get_error_msg());
+                                                 st.to_string());
                 }
             }
         }
@@ -639,6 +657,33 @@ Status VOlapTableSink::close(RuntimeState* state, Status exec_status) {
     START_AND_SCOPE_SPAN(state->get_tracer(), span, "VOlapTableSink::close");
     vectorized::VExpr::close(_output_vexpr_ctxs, state);
     return OlapTableSink::close(state, exec_status);
+}
+
+template <typename DecimalType, bool IsMin>
+DecimalType VOlapTableSink::_get_decimalv3_min_or_max(const TypeDescriptor& type) {
+    std::map<int, typename DecimalType::NativeType>* pmap = nullptr;
+    if constexpr (std::is_same_v<DecimalType, vectorized::Decimal32>) {
+        pmap = IsMin ? &_min_decimal32_val : &_max_decimal32_val;
+    } else if constexpr (std::is_same_v<DecimalType, vectorized::Decimal64>) {
+        pmap = IsMin ? &_min_decimal64_val : &_max_decimal64_val;
+    } else {
+        pmap = IsMin ? &_min_decimal128_val : &_max_decimal128_val;
+    }
+
+    // found
+    auto iter = pmap->find(type.precision);
+    if (iter != pmap->end()) {
+        return iter->second;
+    }
+
+    typename DecimalType::NativeType value;
+    if constexpr (IsMin) {
+        value = vectorized::min_decimal_value<DecimalType>(type.precision);
+    } else {
+        value = vectorized::max_decimal_value<DecimalType>(type.precision);
+    }
+    pmap->emplace(type.precision, value);
+    return value;
 }
 
 Status VOlapTableSink::_validate_column(RuntimeState* state, const TypeDescriptor& type,
@@ -771,6 +816,47 @@ Status VOlapTableSink::_validate_column(RuntimeState* state, const TypeDescripto
                 }
             }
         }
+        break;
+    }
+    case TYPE_DECIMAL32: {
+#define CHECK_VALIDATION_FOR_DECIMALV3(ColumnDecimalType, DecimalType)                             \
+    auto column_decimal = const_cast<vectorized::ColumnDecimal<vectorized::ColumnDecimalType>*>(   \
+            assert_cast<const vectorized::ColumnDecimal<vectorized::ColumnDecimalType>*>(          \
+                    real_column_ptr.get()));                                                       \
+    for (size_t j = 0; j < column->size(); ++j) {                                                  \
+        auto row = rows ? (*rows)[j] : j;                                                          \
+        if (row == last_invalid_row) {                                                             \
+            continue;                                                                              \
+        }                                                                                          \
+        if (need_to_validate(j, row)) {                                                            \
+            auto dec_val = column_decimal->get_data()[j];                                          \
+            bool invalid = false;                                                                  \
+            const auto& max_decimal =                                                              \
+                    _get_decimalv3_min_or_max<vectorized::DecimalType, false>(type);               \
+            const auto& min_decimal =                                                              \
+                    _get_decimalv3_min_or_max<vectorized::DecimalType, true>(type);                \
+            if (dec_val > max_decimal || dec_val < min_decimal) {                                  \
+                fmt::format_to(error_msg, "{}", "decimal value is not valid for definition");      \
+                fmt::format_to(error_msg, ", value={}", dec_val);                                  \
+                fmt::format_to(error_msg, ", precision={}, scale={}", type.precision, type.scale); \
+                fmt::format_to(error_msg, ", min={}, max={}; ", min_decimal, max_decimal);         \
+                invalid = true;                                                                    \
+            }                                                                                      \
+            if (invalid) {                                                                         \
+                last_invalid_row = row;                                                            \
+                RETURN_IF_ERROR(set_invalid_and_append_error_msg(row));                            \
+            }                                                                                      \
+        }                                                                                          \
+    }
+        CHECK_VALIDATION_FOR_DECIMALV3(Decimal32, Decimal32);
+        break;
+    }
+    case TYPE_DECIMAL64: {
+        CHECK_VALIDATION_FOR_DECIMALV3(Decimal64, Decimal64);
+        break;
+    }
+    case TYPE_DECIMAL128I: {
+        CHECK_VALIDATION_FOR_DECIMALV3(Decimal128I, Decimal128);
         break;
     }
     case TYPE_ARRAY: {

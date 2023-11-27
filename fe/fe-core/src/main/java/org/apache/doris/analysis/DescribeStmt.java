@@ -61,6 +61,7 @@ public class DescribeStmt extends ShowStmt {
                     .addColumn(new Column("IndexKeysType", ScalarType.createVarchar(20)))
                     .addColumn(new Column("Field", ScalarType.createVarchar(20)))
                     .addColumn(new Column("Type", ScalarType.createVarchar(20)))
+                    .addColumn(new Column("InternalType", ScalarType.createVarchar(20)))
                     .addColumn(new Column("Null", ScalarType.createVarchar(10)))
                     .addColumn(new Column("Key", ScalarType.createVarchar(10)))
                     .addColumn(new Column("Default", ScalarType.createVarchar(30)))
@@ -110,7 +111,8 @@ public class DescribeStmt extends ShowStmt {
     @Override
     public void analyze(Analyzer analyzer) throws UserException {
         if (!isAllTables && isTableValuedFunction) {
-            List<Column> columns = tableValuedFunctionRef.getTableFunction().getTable().getBaseSchema();
+            tableValuedFunctionRef.analyze(analyzer);
+            List<Column> columns = tableValuedFunctionRef.getTable().getBaseSchema();
             for (Column column : columns) {
                 List<String> row = Arrays.asList(
                         column.getDisplayName(),
@@ -121,6 +123,11 @@ public class DescribeStmt extends ShowStmt {
                                 ? FeConstants.null_string : column.getDefaultValue(),
                         "NONE"
                 );
+                if (column.getOriginType().isDatetimeV2()) {
+                    row.set(1, "DATETIME");
+                } else if (column.getOriginType().isDateV2()) {
+                    row.set(1, "DATE");
+                }
                 totalRows.add(row);
             }
             return;
@@ -134,7 +141,7 @@ public class DescribeStmt extends ShowStmt {
                     dbTableName.toString());
         }
 
-        CatalogIf catalog = Env.getCurrentEnv().getCatalogMgr().getCatalog(dbTableName.getCtl());
+        CatalogIf catalog = Env.getCurrentEnv().getCatalogMgr().getCatalogOrAnalysisException(dbTableName.getCtl());
         DatabaseIf db = catalog.getDbOrAnalysisException(dbTableName.getDb());
         TableIf table = db.getTableOrAnalysisException(dbTableName.getTbl());
 
@@ -195,6 +202,7 @@ public class DescribeStmt extends ShowStmt {
                                     "",
                                     column.getDisplayName(),
                                     column.getOriginType().toString(),
+                                    column.getOriginType().toString(),
                                     column.isAllowNull() ? "Yes" : "No",
                                     ((Boolean) column.isKey()).toString(),
                                     column.getDefaultValue() == null
@@ -202,6 +210,12 @@ public class DescribeStmt extends ShowStmt {
                                     extraStr,
                                     ((Boolean) column.isVisible()).toString()
                             );
+
+                            if (column.getOriginType().isDatetimeV2()) {
+                                row.set(3, "DATETIME");
+                            } else if (column.getOriginType().isDateV2()) {
+                                row.set(3, "DATE");
+                            }
 
                             if (j == 0) {
                                 row.set(0, indexName);

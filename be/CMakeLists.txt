@@ -65,8 +65,22 @@ else()
     add_definitions(-DBOOST_STACKTRACE_USE_NOOP)
 endif()
 
-option(GLIBC_COMPATIBILITY "Enable compatibility with older glibc libraries." ON)
+# Options
+if (NOT OS_MACOSX)
+    option(GLIBC_COMPATIBILITY "Enable compatibility with older glibc libraries." ON)
+    option(USE_LIBCPP "Use libc++" OFF)
+    option(USE_MEM_TRACKER, "Use memory tracker" ON)
+else()
+    option(GLIBC_COMPATIBILITY "Enable compatibility with older glibc libraries." OFF)
+    option(USE_LIBCPP "Use libc++" ON)
+    option(USE_MEM_TRACKER, "Use memory tracker" OFF)
+endif()
+option(USE_JEMALLOC "Use jemalloc" ON)
+
 message(STATUS "GLIBC_COMPATIBILITY is ${GLIBC_COMPATIBILITY}")
+message(STATUS "USE_LIBCPP is ${USE_LIBCPP}")
+message(STATUS "USE_MEM_TRACKER is ${USE_MEM_TRACKER}")
+message(STATUS "USE_JEMALLOC is ${USE_JEMALLOC}")
 
 # set CMAKE_BUILD_TYPE
 if (NOT CMAKE_BUILD_TYPE)
@@ -86,13 +100,17 @@ message(STATUS "Build target arch is ${CMAKE_BUILD_TARGET_ARCH}")
 
 # Set dirs
 set(BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
-set(ENV{DORIS_HOME} "${BASE_DIR}/../")
+set(ENV{DORIS_HOME} "${BASE_DIR}/..")
 set(BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}")
-set(THIRDPARTY_DIR "$ENV{DORIS_THIRDPARTY}/installed/")
 set(GENSRC_DIR "${BASE_DIR}/../gensrc/build/")
 set(SRC_DIR "${BASE_DIR}/src/")
 set(TEST_DIR "${CMAKE_SOURCE_DIR}/test/")
 set(OUTPUT_DIR "${BASE_DIR}/output")
+if (NOT DEFINED ENV{DORIS_THIRDPARTY})
+    set(ENV{DORIS_THIRDPARTY} "$ENV{DORIS_HOME}/thirdparty")
+endif()
+set(THIRDPARTY_DIR "$ENV{DORIS_THIRDPARTY}/installed")
+message(STATUS "THIRDPARTY_DIR is ${THIRDPARTY_DIR}")
 
 option(MAKE_TEST "ON for make unit test or OFF for not" OFF)
 message(STATUS "make test: ${MAKE_TEST}")
@@ -398,9 +416,6 @@ set_target_properties(k5crypto PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/li
 add_library(gssapi_krb5 STATIC IMPORTED)
 set_target_properties(gssapi_krb5 PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib/libgssapi_krb5.a)
 
-add_library(hdfs3 STATIC IMPORTED)
-set_target_properties(hdfs3 PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib/libhdfs3.a)
-
 find_program(THRIFT_COMPILER thrift ${CMAKE_SOURCE_DIR}/bin)
 
 if (OS_MACOSX)
@@ -423,12 +438,13 @@ check_function_exists(sched_getcpu HAVE_SCHED_GETCPU)
 
 # compiler flags that are common across debug/release builds
 #  -Wall: Enable all warnings.
-#  -Wno-sign-compare: suppress warnings for comparison between signed and unsigned
 #    integers
 #  -pthread: enable multithreaded malloc
 #  -DBOOST_DATE_TIME_POSIX_TIME_STD_CONFIG: enable nanosecond precision for boost
 #  -fno-omit-frame-pointers: Keep frame pointer for functions in register
-set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -Wall -Wno-sign-compare -pthread -Werror")
+set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -g -Wall -Wextra -pthread -Werror")
+# TODO: resolve and remove those wno
+set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -Wno-unused-parameter -Wno-ignored-qualifiers -Wno-implicit-fallthrough -Wno-sign-compare")
 set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -fstrict-aliasing -fno-omit-frame-pointer")
 set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -std=gnu++17 -D__STDC_FORMAT_MACROS")
 set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -DBOOST_DATE_TIME_POSIX_TIME_STD_CONFIG")
@@ -452,9 +468,7 @@ endfunction()
 
 # In terms of performance, mold> lld> gold> ld
 set(CUSTUM_LINKER_COMMAND "ld")
-# TODO: mold will link fail on thirdparty brpc now, waiting for investigation.
-# TRY_TO_CHANGE_LINKER("mold" "mold")
-
+TRY_TO_CHANGE_LINKER("mold" "mold")
 TRY_TO_CHANGE_LINKER("lld" "LLD")
 TRY_TO_CHANGE_LINKER("gold" "GNU gold")
 if (NOT CUSTUM_LINKER_COMMAND STREQUAL "ld")
@@ -493,7 +507,7 @@ if ("${CMAKE_BUILD_TARGET_ARCH}" STREQUAL "x86" OR "${CMAKE_BUILD_TARGET_ARCH}" 
         set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -mavx2")
     endif()
 endif()
-set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -Wno-attributes -DS2_USE_GFLAGS -DS2_USE_GLOG")
+set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -DS2_USE_GFLAGS -DS2_USE_GLOG")
 
 if (WITH_MYSQL)
     set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -DDORIS_WITH_MYSQL")
@@ -517,6 +531,10 @@ if (USE_JEMALLOC)
     set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -DUSE_JEMALLOC")
 endif()
 
+if (ENABLE_STACKTRACE)
+    add_compile_options(-DENABLE_STACKTRACE)
+endif()
+
 # STRICT_MEMORY_USE=ON` expects BE to use less memory, and gives priority to ensuring stability
 # when the cluster memory is limited.
 # TODO In the future, expect a dynamic soft memory limit, combined with real-time memory usage of the cluster,
@@ -529,11 +547,6 @@ endif()
 if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER 7.0)
     set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -faligned-new")
 endif()
-
-# For any gcc builds:
-#   -g: Enable symbols for profiler tools. Produce debugging information in the operating system’s native formt
-#   -Wno-unused-local-typedefs: Do not warn for local typedefs that are unused.
-set(CXX_GCC_FLAGS "${CXX_GCC_FLAGS} -g -Wno-unused-local-typedefs")
 
 if (USE_DWARF)
     set(CXX_GCC_FLAGS "${CXX_GCC_FLAGS} -gdwarf-5")
@@ -725,11 +738,31 @@ set(COMMON_THIRDPARTY
     # put this after lz4 to avoid using lz4 lib in librdkafka
     librdkafka_cpp
     librdkafka
-    hdfs3
     xml2
     lzma
     simdjson
 )
+
+if ((ARCH_AMD64 OR ARCH_AARCH64) AND OS_LINUX)
+    add_library(hadoop_hdfs STATIC IMPORTED)
+    set_target_properties(hadoop_hdfs PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib/hadoop_hdfs/native/libhdfs.a)
+
+    set(COMMON_THIRDPARTY
+        ${COMMON_THIRDPARTY}
+        hadoop_hdfs
+    )
+    add_definitions(-DUSE_HADOOP_HDFS)
+else()
+    add_library(hdfs3 STATIC IMPORTED)
+    set_target_properties(hdfs3 PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib/libhdfs3.a)
+
+    # TODO: use arm hadoop hdfs to replace this
+    set(COMMON_THIRDPARTY
+        ${COMMON_THIRDPARTY}
+        hdfs3
+    )
+    add_definitions(-DUSE_LIBHDFS3)
+endif()
 
 if (OS_MACOSX)
     set(COMMON_THIRDPARTY
@@ -862,6 +895,11 @@ endif()
 # Only build static libs
 set(BUILD_SHARED_LIBS OFF)
 
+option(ENABLE_CLANG_COVERAGE "coverage option" OFF)
+if (ENABLE_CLANG_COVERAGE AND ENABLE_CLANG_COVERAGE STREQUAL ON AND COMPILER_CLANG)
+    SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fprofile-instr-generate -fcoverage-mapping")
+endif ()
+
 if (${MAKE_TEST} STREQUAL "ON")
     SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fprofile-arcs -ftest-coverage -DGTEST_USE_OWN_TR1_TUPLE=0")
     SET(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fprofile-arcs -ftest-coverage")
@@ -869,6 +907,9 @@ if (${MAKE_TEST} STREQUAL "ON")
         SET(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -lgcov")
     endif()
     add_definitions(-DBE_TEST)
+    if (ARCH_ARM)
+        add_compile_options(-ffp-contract=off)
+    endif()
 endif ()
 
 add_subdirectory(${SRC_DIR}/agent)
@@ -914,7 +955,6 @@ install(FILES
     ${BASE_DIR}/../conf/be.conf
     ${BASE_DIR}/../conf/odbcinst.ini
     ${BASE_DIR}/../conf/asan_suppr.conf
-    ${BASE_DIR}/../conf/hdfs-site.xml
     DESTINATION ${OUTPUT_DIR}/conf)
 
 get_property(dirs DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY INCLUDE_DIRECTORIES)

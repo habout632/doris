@@ -55,7 +55,8 @@ Overload(Callables&&... callables) -> Overload<Callables...>;
 template <class HashTableContext>
 struct ProcessHashTableBuild {
     ProcessHashTableBuild(int rows, Block& acquired_block, ColumnRawPtrs& build_raw_ptrs,
-                          HashJoinNode* join_node, int batch_size, uint8_t offset)
+                          HashJoinNode* join_node, int batch_size, uint8_t offset,
+                          RuntimeState* state)
             : _rows(rows),
               _skip_rows(0),
               _acquired_block(acquired_block),
@@ -63,6 +64,7 @@ struct ProcessHashTableBuild {
               _join_node(join_node),
               _batch_size(batch_size),
               _offset(offset),
+              _state(state),
               _build_side_compute_hash_timer(join_node->_build_side_compute_hash_timer) {}
 
     template <bool ignore_null, bool short_circuit_for_null>
@@ -121,6 +123,9 @@ struct ProcessHashTableBuild {
             }
 
             for (size_t k = 0; k < _rows; ++k) {
+                if (k % 65536 == 0) {
+                    RETURN_IF_CANCELLED(_state);
+                }
                 if constexpr (ignore_null) {
                     if ((*null_map)[k]) {
                         continue;
@@ -148,6 +153,9 @@ struct ProcessHashTableBuild {
         bool build_unique = _join_node->_build_unique;
 #define EMPLACE_IMPL(stmt)                                                                  \
     for (size_t k = 0; k < _rows; ++k) {                                                    \
+        if (k % 65536 == 0) {                                                               \
+            RETURN_IF_CANCELLED(_state);                                                    \
+        }                                                                                   \
         if constexpr (ignore_null) {                                                        \
             if ((*null_map)[k]) {                                                           \
                 continue;                                                                   \
@@ -208,6 +216,7 @@ private:
     HashJoinNode* _join_node;
     int _batch_size;
     uint8_t _offset;
+    RuntimeState* _state;
 
     ProfileCounter* _build_side_compute_hash_timer;
     std::vector<size_t> _build_side_hash_values;
@@ -343,17 +352,11 @@ Status HashJoinNode::init(const TPlanNode& tnode, RuntimeState* state) {
     init_output_slots_flags(child(0)->row_desc().tuple_descriptors(), _left_output_slot_flags);
     init_output_slots_flags(child(1)->row_desc().tuple_descriptors(), _right_output_slot_flags);
 
-    // only use in outer join as the bool column to mark for function of `tuple_is_null`
-    if (_is_outer_join) {
-        _tuple_is_null_left_flag_column = ColumnUInt8::create();
-        _tuple_is_null_right_flag_column = ColumnUInt8::create();
-    }
     return Status::OK();
 }
 
 Status HashJoinNode::prepare(RuntimeState* state) {
     RETURN_IF_ERROR(VJoinNodeBase::prepare(state));
-    SCOPED_CONSUME_MEM_TRACKER(mem_tracker());
     // Build phase
     _build_phase_profile = runtime_profile()->create_child("BuildPhase", true, true);
     runtime_profile()->add_child(_build_phase_profile, false, nullptr);
@@ -521,14 +524,15 @@ Status HashJoinNode::get_next(RuntimeState* state, Block* output_block, bool* eo
                                                      need_null_map_for_probe
                                                              ? &_null_map_column->get_data()
                                                              : nullptr,
-                                                     mutable_join_block, &temp_block, probe_rows);
+                                                     mutable_join_block, &temp_block, probe_rows,
+                                                     _is_mark_join);
                             } else {
                                 st = process_hashtable_ctx.template do_process<
                                         need_null_map_for_probe, ignore_null>(
                                         arg,
                                         need_null_map_for_probe ? &_null_map_column->get_data()
                                                                 : nullptr,
-                                        mutable_join_block, &temp_block, probe_rows);
+                                        mutable_join_block, &temp_block, probe_rows, _is_mark_join);
                             }
                         } else {
                             LOG(FATAL) << "FATAL: uninited hash table";
@@ -564,8 +568,14 @@ Status HashJoinNode::get_next(RuntimeState* state, Block* output_block, bool* eo
     } else {
         return Status::OK();
     }
-
-    _add_tuple_is_null_column(&temp_block);
+    if (!st) {
+        return st;
+    }
+    if (_is_outer_join) {
+        _add_tuple_is_null_column(&temp_block);
+    }
+    auto output_rows = temp_block.rows();
+    DCHECK(output_rows <= state->batch_size());
     {
         SCOPED_TIMER(_join_filter_timer);
         RETURN_IF_ERROR(
@@ -576,6 +586,30 @@ Status HashJoinNode::get_next(RuntimeState* state, Block* output_block, bool* eo
     reached_limit(output_block, eos);
 
     return st;
+}
+
+void HashJoinNode::_add_tuple_is_null_column(Block* block) {
+    DCHECK(_is_outer_join);
+    auto p0 = _tuple_is_null_left_flag_column->assume_mutable();
+    auto p1 = _tuple_is_null_right_flag_column->assume_mutable();
+    auto& left_null_map = reinterpret_cast<ColumnUInt8&>(*p0);
+    auto& right_null_map = reinterpret_cast<ColumnUInt8&>(*p1);
+    auto left_size = left_null_map.size();
+    auto right_size = right_null_map.size();
+
+    if (left_size == 0) {
+        DCHECK_EQ(right_size, block->rows());
+        left_null_map.get_data().resize_fill(right_size, 0);
+    }
+    if (right_size == 0) {
+        DCHECK_EQ(left_size, block->rows());
+        right_null_map.get_data().resize_fill(left_size, 0);
+    }
+
+    block->insert(
+            {std::move(p0), std::make_shared<vectorized::DataTypeUInt8>(), "left_tuples_is_null"});
+    block->insert(
+            {std::move(p1), std::make_shared<vectorized::DataTypeUInt8>(), "right_tuples_is_null"});
 }
 
 void HashJoinNode::_prepare_probe_block() {
@@ -614,7 +648,6 @@ Status HashJoinNode::open(RuntimeState* state) {
         RETURN_IF_ERROR((*_vother_join_conjunct_ptr)->open(state));
     }
     RETURN_IF_ERROR(VJoinNodeBase::open(state));
-    SCOPED_CONSUME_MEM_TRACKER(mem_tracker());
     RETURN_IF_CANCELLED(state);
     return Status::OK();
 }
@@ -744,15 +777,24 @@ Status HashJoinNode::_materialize_build_side(RuntimeState* state) {
 
                                   RETURN_IF_ERROR(_runtime_filter_slots->init(
                                           state, arg.hash_table.get_size()));
-                                  return _runtime_filter_slots->copy_from_shared_context(
-                                          _shared_hash_table_context);
+                                  RETURN_IF_ERROR(_runtime_filter_slots->copy_from_shared_context(
+                                          _shared_hash_table_context));
+                                  _runtime_filter_slots->publish();
+                                  return Status::OK();
                               }},
                     *_hash_table_variants);
             RETURN_IF_ERROR(ret);
         }
     }
 
-    _process_hashtable_ctx_variants_init(state);
+    if (eos || !_should_build_hash_table) {
+        _process_hashtable_ctx_variants_init(state);
+    }
+    // Since the comparison of null values is meaningless, null aware left anti join should not output null
+    // when the build side is not empty.
+    if (!_build_blocks->empty() && _join_op == TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN) {
+        _probe_ignore_null = true;
+    }
     return Status::OK();
 }
 
@@ -878,7 +920,7 @@ Status HashJoinNode::_process_build_block(RuntimeState* state, Block& block, uin
                         auto short_circuit_for_null_in_build_side) -> Status {
                         using HashTableCtxType = std::decay_t<decltype(arg)>;
                         ProcessHashTableBuild<HashTableCtxType> hash_table_build_process(
-                                rows, block, raw_ptrs, this, state->batch_size(), offset);
+                                rows, block, raw_ptrs, this, state->batch_size(), offset, state);
                         return hash_table_build_process
                                 .template run<has_null_value, short_circuit_for_null_in_build_side>(
                                         arg,
@@ -904,6 +946,9 @@ void HashJoinNode::_hash_table_init(RuntimeState* state) {
                                                    JoinOpType::value == TJoinOp::RIGHT_OUTER_JOIN ||
                                                    JoinOpType::value == TJoinOp::FULL_OUTER_JOIN,
                                            RowRefListWithFlag, RowRefList>>;
+                _probe_row_match_iter.emplace<ForwardIterator<RowRefListType>>();
+                _outer_join_pull_visited_iter.emplace<ForwardIterator<RowRefListType>>();
+
                 if (_build_expr_ctxs.size() == 1 && !_store_null_in_hash_table[0]) {
                     // Single column optimization
                     switch (_build_expr_ctxs[0]->root()->result_type()) {
@@ -1051,41 +1096,10 @@ std::vector<uint16_t> HashJoinNode::_convert_block_to_null(Block& block) {
     return results;
 }
 
-void HashJoinNode::_add_tuple_is_null_column(Block* block) {
-    if (_is_outer_join) {
-        auto p0 = _tuple_is_null_left_flag_column->assume_mutable();
-        auto p1 = _tuple_is_null_right_flag_column->assume_mutable();
-        auto& left_null_map = reinterpret_cast<ColumnUInt8&>(*p0);
-        auto& right_null_map = reinterpret_cast<ColumnUInt8&>(*p1);
-        auto left_size = left_null_map.size();
-        auto right_size = right_null_map.size();
-
-        if (left_size == 0) {
-            DCHECK_EQ(right_size, block->rows());
-            left_null_map.get_data().resize_fill(right_size, 0);
-        }
-        if (right_size == 0) {
-            DCHECK_EQ(left_size, block->rows());
-            right_null_map.get_data().resize_fill(left_size, 0);
-        }
-
-        block->insert({std::move(p0), std::make_shared<vectorized::DataTypeUInt8>(),
-                       "left_tuples_is_null"});
-        block->insert({std::move(p1), std::make_shared<vectorized::DataTypeUInt8>(),
-                       "right_tuples_is_null"});
-    }
-}
-
-void HashJoinNode::_reset_tuple_is_null_column() {
-    if (_is_outer_join) {
-        reinterpret_cast<ColumnUInt8&>(*_tuple_is_null_left_flag_column).clear();
-        reinterpret_cast<ColumnUInt8&>(*_tuple_is_null_right_flag_column).clear();
-    }
-}
-
 HashJoinNode::~HashJoinNode() {
     if (_shared_hashtable_controller && _should_build_hash_table) {
-        _shared_hashtable_controller->signal(id());
+        // signal at here is abnormal
+        _shared_hashtable_controller->signal(id(), Status::Cancelled("signaled in destructor"));
     }
 }
 

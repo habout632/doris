@@ -32,14 +32,14 @@ under the License.
 
 ## 重要提示
 
-* 当前元数据的设计是无法向后兼容的。即如果新版本有新增的元数据结构变动（可以查看 FE 代码中的 `FeMetaVersion.java` 文件中是否有新增的 VERSION），那么在升级到新版本后，通常是无法再回滚到旧版本的。所以，在升级 FE 之前，请务必按照 [升级文档](../../admin-manual/cluster-management/upgrade) 中的操作，测试元数据兼容性。
+* 当前元数据的设计是无法向后兼容的。即如果新版本有新增的元数据结构变动（可以查看 FE 代码中的 `FeMetaVersion.java` 文件中是否有新增的 VERSION），那么在升级到新版本后，通常是无法再回滚到旧版本的。所以，在升级 FE 之前，请务必按照 [升级文档](../../admin-manual/cluster-management/upgrade.md) 中的操作，测试元数据兼容性。
 
 ## 元数据目录结构
 
-我们假设在 fe.conf 中指定的 `meta_dir` 的路径为 `/path/to/palo-meta`。那么一个正常运行中的 Doris 集群，元数据的目录结构应该如下：
+我们假设在 fe.conf 中指定的 `meta_dir` 的路径为 `/path/to/doris-meta`。那么一个正常运行中的 Doris 集群，元数据的目录结构应该如下：
 
 ```
-/path/to/palo-meta/
+/path/to/doris-meta/
             |-- bdb/
             |   |-- 00000000.jdb
             |   |-- je.config.csv
@@ -83,13 +83,13 @@ under the License.
 
 1. 第一次启动
 
-    1. 假设在 fe.conf 中指定的 `meta_dir` 的路径为 `/path/to/palo-meta`。
-    2. 确保 `/path/to/palo-meta` 已存在，权限正确，且目录为空。
+    1. 假设在 fe.conf 中指定的 `meta_dir` 的路径为 `/path/to/doris-meta`。
+    2. 确保 `/path/to/doris-meta` 已存在，权限正确，且目录为空。
     3. 直接通过 `sh bin/start_fe.sh` 即可启动。
     4. 启动后，你应该可以在 fe.log 中看到如下日志：
     
         * Palo FE starting...
-        * image does not exist: /path/to/palo-meta/image/image.0
+        * image does not exist: /path/to/doris-meta/image/image.0
         * transfer from INIT to UNKNOWN
         * transfer from UNKNOWN to MASTER
         * the very first time to open bdb, dbname is 1
@@ -110,10 +110,10 @@ under the License.
         * Palo FE starting...
         * finished to get cluster id: xxxx, role: FOLLOWER and node name: xxxx
         * 如果重启前还没有 image 产生，则会看到：
-            * image does not exist: /path/to/palo-meta/image/image.0
+            * image does not exist: /path/to/doris-meta/image/image.0
             
         * 如果重启前有 image 产生，则会看到：
-            * start load image from /path/to/palo-meta/image/image.xxx. is ckpt: false
+            * start load image from /path/to/doris-meta/image/image.xxx. is ckpt: false
             * finished load image in xxx ms
 
         * transfer from INIT to UNKNOWN
@@ -122,8 +122,8 @@ under the License.
         * finish replay in xxx msec
         * master finish replay journal, can write now.
         * begin to generate new image: image.xxxx
-        *  start save image to /path/to/palo-meta/image/image.ckpt. is ckpt: true
-        *  finished save image /path/to/palo-meta/image/image.ckpt in xxx ms. checksum is xxxx
+        *  start save image to /path/to/doris-meta/image/image.ckpt. is ckpt: true
+        *  finished save image /path/to/doris-meta/image/image.ckpt in xxx ms. checksum is xxxx
         *  push image.xxx to other nodes. totally xx nodes, push successed xx nodes
         * QE service start
         * thrift server started
@@ -141,7 +141,7 @@ under the License.
 1. 注意事项
 
     * 在添加新的 FE 之前，一定先确保当前的 Master FE 运行正常（连接是否正常，JVM 是否正常，image 生成是否正常，bdbje 数据目录是否过大等等）
-    * 第一次启动新的 FE，一定确保添加了 `--helper` 参数指向 Master FE。再次启动时可不用添加 `--helper`。（如果指定了 `--helper`，FE 会直接询问 helper 节点自己的角色，如果没有指定，FE会尝试从 `palo-meta/image/` 目录下的 `ROLE` 和 `VERSION` 文件中获取信息）。
+    * 第一次启动新的 FE，一定确保添加了 `--helper` 参数指向 Master FE。再次启动时可不用添加 `--helper`。（如果指定了 `--helper`，FE 会直接询问 helper 节点自己的角色，如果没有指定，FE会尝试从 `doris-meta/image/` 目录下的 `ROLE` 和 `VERSION` 文件中获取信息）。
     * 第一次启动新的 FE，一定确保这个 FE 的 `meta_dir` 已经创建、权限正确且为空。
     * 启动新的 FE，和执行 `ALTER SYSTEM ADD FOLLOWER/OBSERVER` 语句在元数据添加 FE，这两个操作的顺序没有先后要求。如果先启动了新的 FE，而没有执行语句，则新的 FE 日志中会一直滚动 `current node is not added to the group. please add it first.` 字样。当执行语句后，则会进入正常流程。
     * 请确保前一个 FE 添加成功后，再添加下一个 FE。
@@ -151,7 +151,7 @@ under the License.
 
     1. this node is DETACHED
     
-        当第一次启动一个待添加的 FE 时，如果 Master FE 上的 palo-meta/bdb 中的数据很大，则可能在待添加的 FE 日志中看到 `this node is DETACHED.` 字样。这时，bdbje 正在复制数据，你可以看到待添加的 FE 的 `bdb/` 目录正在变大。这个过程通常会在数分钟不等（取决于 bdbje 中的数据量）。之后，fe.log 中可能会有一些 bdbje 相关的错误堆栈信息。如果最终日志中显示 `QE service start` 和 `thrift server started`，则通常表示启动成功。可以通过 mysql-client 连接这个 FE 尝试操作。如果没有出现这些字样，则可能是 bdbje 复制日志超时等问题。这时，直接再次重启这个 FE，通常即可解决问题。
+        当第一次启动一个待添加的 FE 时，如果 Master FE 上的 doris-meta/bdb 中的数据很大，则可能在待添加的 FE 日志中看到 `this node is DETACHED.` 字样。这时，bdbje 正在复制数据，你可以看到待添加的 FE 的 `bdb/` 目录正在变大。这个过程通常会在数分钟不等（取决于 bdbje 中的数据量）。之后，fe.log 中可能会有一些 bdbje 相关的错误堆栈信息。如果最终日志中显示 `QE service start` 和 `thrift server started`，则通常表示启动成功。可以通过 mysql-client 连接这个 FE 尝试操作。如果没有出现这些字样，则可能是 bdbje 复制日志超时等问题。这时，直接再次重启这个 FE，通常即可解决问题。
         
     2. 各种原因导致添加失败
 
@@ -227,7 +227,7 @@ FE 有可能因为某些原因出现无法启动 bdbje、FE 之间无法同步�
     
 2. 单节点 MASTER 迁移
 
-    当只有一个 FE 时，参考 `故障恢复` 一节。将 FE 的 palo-meta 目录拷贝到新节点上，按照 `故障恢复` 一节中，步骤3的方式启动新的 MASTER
+    当只有一个 FE 时，参考 `故障恢复` 一节。将 FE 的 doris-meta 目录拷贝到新节点上，按照 `故障恢复` 一节中，步骤3的方式启动新的 MASTER
     
 3. 一组 FOLLOWER 从一组节点迁移到另一组新的节点
 
@@ -349,7 +349,7 @@ mysql> show proc "/bdbje/110589/114861";
 
 ## 最佳实践
 
-FE 的部署推荐，在 [安装与部署文档](../../install/install-deploy.md) 中有介绍，这里再做一些补充。
+FE 的部署推荐，在 [安装与部署文档](../../install/standard-deployment.md) 中有介绍，这里再做一些补充。
 
 * **如果你并不十分了解 FE 元数据的运行逻辑，或者没有足够 FE 元数据的运维经验，我们强烈建议在实际使用中，只部署一个 FOLLOWER 类型的 FE 作为 MASTER，其余 FE 都是 OBSERVER，这样可以减少很多复杂的运维问题！** 不用过于担心 MASTER 单点故障导致无法进行元数据写操作。首先，如果你配置合理，FE 作为 java 进程很难挂掉。其次，如果 MASTER 磁盘损坏（概率非常低），我们也可以用 OBSERVER 上的元数据，通过 `故障恢复` 的方式手动恢复。
 

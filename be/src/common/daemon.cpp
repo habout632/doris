@@ -49,8 +49,11 @@
 #include "exprs/utility_functions.h"
 #include "geo/geo_functions.h"
 #include "olap/options.h"
+#include "olap/storage_engine.h"
 #include "runtime/bufferpool/buffer_pool.h"
 #include "runtime/exec_env.h"
+#include "runtime/fragment_mgr.h"
+#include "runtime/load_channel_mgr.h"
 #include "runtime/memory/chunk_allocator.h"
 #include "runtime/user_function_cache.h"
 #include "util/cpu_info.h"
@@ -78,7 +81,9 @@ void Daemon::tcmalloc_gc_thread() {
     double release_rates[10] = {1.0, 1.0, 1.0, 5.0, 5.0, 20.0, 50.0, 100.0, 500.0, 2000.0};
     int64_t pressure_limit = 90;
     bool is_performance_mode = false;
-    size_t physical_limit_bytes = std::min(MemInfo::hard_mem_limit(), MemInfo::mem_limit());
+    int64_t physical_limit_bytes =
+            std::min(MemInfo::physical_mem() - MemInfo::sys_mem_available_low_water_mark(),
+                     MemInfo::mem_limit());
 
     if (config::memory_mode == std::string("performance")) {
         max_cache_percent = 100;
@@ -111,13 +116,16 @@ void Daemon::tcmalloc_gc_thread() {
                                                         &tc_alloc_bytes);
         MallocExtension::instance()->GetNumericProperty("generic.current_allocated_bytes",
                                                         &tc_used_bytes);
-        int64_t tc_cached_bytes = tc_alloc_bytes - tc_used_bytes;
+        int64_t tc_cached_bytes = (int64_t)tc_alloc_bytes - (int64_t)tc_used_bytes;
         int64_t to_free_bytes =
-                (int64_t)tc_cached_bytes - (tc_used_bytes * max_cache_percent / 100);
+                (int64_t)tc_cached_bytes - ((int64_t)tc_used_bytes * max_cache_percent / 100);
+        to_free_bytes = std::max(to_free_bytes, (int64_t)0);
 
         int64_t memory_pressure = 0;
+        int64_t rss_pressure = 0;
         int64_t alloc_bytes = std::max(rss, tc_alloc_bytes);
         memory_pressure = alloc_bytes * 100 / physical_limit_bytes;
+        rss_pressure = rss * 100 / physical_limit_bytes;
 
         expected_aggressive_decommit = init_aggressive_decommit;
         if (memory_pressure > pressure_limit) {
@@ -125,28 +133,27 @@ void Daemon::tcmalloc_gc_thread() {
             // Ideally, we should reuse cache and not allocate from system any more,
             // however, it is hard to set limit on cache of tcmalloc and doris
             // use mmap in vectorized mode.
-            if (last_memory_pressure <= pressure_limit) {
+            // Limit cache capactiy is enough.
+            if (rss_pressure > pressure_limit) {
                 int64_t min_free_bytes = alloc_bytes - physical_limit_bytes * 9 / 10;
                 to_free_bytes = std::max(to_free_bytes, min_free_bytes);
                 to_free_bytes = std::max(to_free_bytes, tc_cached_bytes * 30 / 100);
-                to_free_bytes = std::min(to_free_bytes, tc_cached_bytes);
+                // We assure that we have at least 500M bytes in cache.
+                to_free_bytes = std::min(to_free_bytes, tc_cached_bytes - 500 * 1024 * 1024);
                 expected_aggressive_decommit = 1;
-            } else {
-                // release rate is enough.
-                to_free_bytes = 0;
             }
             last_ms = kMaxLastMs;
         } else if (memory_pressure > (pressure_limit - 10)) {
+            // In most cases, adjusting release rate is enough, if memory are consumed quickly
+            // we should release manually.
             if (last_memory_pressure <= (pressure_limit - 10)) {
                 to_free_bytes = std::max(to_free_bytes, tc_cached_bytes * 10 / 100);
-            } else {
-                to_free_bytes = 0;
             }
         }
 
         int release_rate_index = memory_pressure / 10;
         double release_rate = 1.0;
-        if (release_rate_index >= sizeof(release_rates)) {
+        if (release_rate_index >= sizeof(release_rates) / sizeof(release_rates[0])) {
             release_rate = 2000.0;
         } else {
             release_rate = release_rates[release_rate_index];
@@ -160,7 +167,8 @@ void Daemon::tcmalloc_gc_thread() {
         }
 
         last_memory_pressure = memory_pressure;
-        if (to_free_bytes > 0) {
+        // We release at least 2% bytes once, frequent releasing hurts performance.
+        if (to_free_bytes > (physical_limit_bytes * 2 / 100)) {
             last_ms += kIntervalMs;
             if (last_ms >= kMaxLastMs) {
                 LOG(INFO) << "generic.current_allocated_bytes " << tc_used_bytes
@@ -180,9 +188,8 @@ void Daemon::tcmalloc_gc_thread() {
 #endif
 }
 
-void Daemon::memory_maintenance_thread() {
-    while (!_stop_background_threads_latch.wait_for(
-            std::chrono::seconds(config::memory_maintenance_sleep_time_s))) {
+void Daemon::buffer_pool_gc_thread() {
+    while (!_stop_background_threads_latch.wait_for(std::chrono::seconds(10))) {
         ExecEnv* env = ExecEnv::GetInstance();
         // ExecEnv may not have been created yet or this may be the catalogd or statestored,
         // which don't have ExecEnvs.
@@ -192,6 +199,105 @@ void Daemon::memory_maintenance_thread() {
                 buffer_pool->Maintenance();
             }
         }
+    }
+}
+
+void Daemon::memory_maintenance_thread() {
+    int32_t interval_milliseconds = config::memory_maintenance_sleep_time_ms;
+    int64_t last_print_proc_mem = PerfCounters::get_vm_rss();
+    while (!_stop_background_threads_latch.wait_for(
+            std::chrono::milliseconds(interval_milliseconds))) {
+        if (!MemInfo::initialized() || !ExecEnv::GetInstance()->initialized()) {
+            continue;
+        }
+        // Refresh process memory metrics.
+        doris::PerfCounters::refresh_proc_status();
+        doris::MemInfo::refresh_proc_meminfo();
+        doris::MemInfo::refresh_proc_mem_no_allocator_cache();
+
+        // Update and print memory stat when the memory changes by 100M.
+        if (abs(last_print_proc_mem - PerfCounters::get_vm_rss()) > 104857600) {
+            last_print_proc_mem = PerfCounters::get_vm_rss();
+            doris::MemTrackerLimiter::enable_print_log_process_usage();
+
+            // Refresh mem tracker each type counter.
+            doris::MemTrackerLimiter::refresh_global_counter();
+
+            // Refresh allocator memory metrics.
+#if !defined(ADDRESS_SANITIZER) && !defined(LEAK_SANITIZER) && !defined(THREAD_SANITIZER)
+            doris::MemInfo::refresh_allocator_mem();
+            if (config::enable_system_metrics) {
+                DorisMetrics::instance()->system_metrics()->update_allocator_metrics();
+            }
+#endif
+            LOG(INFO) << MemTrackerLimiter::
+                            process_mem_log_str(); // print mem log when memory state by 100M
+            if (doris::config::memory_debug) {
+                LOG_EVERY_N(INFO, 10)
+                        << doris::MemTrackerLimiter::log_process_usage_str("memory debug", false);
+            }
+        }
+    }
+}
+
+void Daemon::memory_gc_thread() {
+    int32_t interval_milliseconds = config::memory_maintenance_sleep_time_ms;
+    int32_t memory_minor_gc_sleep_time_ms = 0;
+    int32_t memory_full_gc_sleep_time_ms = 0;
+    while (!_stop_background_threads_latch.wait_for(
+            std::chrono::milliseconds(interval_milliseconds))) {
+        if (!MemInfo::initialized() || !ExecEnv::GetInstance()->initialized()) {
+            continue;
+        }
+        if (memory_full_gc_sleep_time_ms <= 0 &&
+            (doris::MemInfo::sys_mem_available() <
+                     doris::MemInfo::sys_mem_available_low_water_mark() ||
+             doris::MemInfo::proc_mem_no_allocator_cache() >= doris::MemInfo::mem_limit())) {
+            // No longer full gc and minor gc during sleep.
+            memory_full_gc_sleep_time_ms = config::memory_gc_sleep_time_s * 1000;
+            memory_minor_gc_sleep_time_ms = config::memory_gc_sleep_time_s * 1000;
+            doris::MemTrackerLimiter::print_log_process_usage("Start Full GC", false);
+            if (doris::MemInfo::process_full_gc()) {
+                // If there is not enough memory to be gc, the process memory usage will not be printed in the next continuous gc.
+                doris::MemTrackerLimiter::enable_print_log_process_usage();
+            }
+        } else if (memory_minor_gc_sleep_time_ms <= 0 &&
+                   (doris::MemInfo::sys_mem_available() <
+                            doris::MemInfo::sys_mem_available_warning_water_mark() ||
+                    doris::MemInfo::proc_mem_no_allocator_cache() >=
+                            doris::MemInfo::soft_mem_limit())) {
+            // No minor gc during sleep, but full gc is possible.
+            memory_minor_gc_sleep_time_ms = config::memory_gc_sleep_time_s * 1000;
+            doris::MemTrackerLimiter::print_log_process_usage("Start Minor GC", false);
+            if (doris::MemInfo::process_minor_gc()) {
+                doris::MemTrackerLimiter::enable_print_log_process_usage();
+            }
+        } else {
+            if (memory_full_gc_sleep_time_ms > 0) {
+                memory_full_gc_sleep_time_ms -= interval_milliseconds;
+            }
+            if (memory_minor_gc_sleep_time_ms > 0) {
+                memory_minor_gc_sleep_time_ms -= interval_milliseconds;
+            }
+        }
+    }
+}
+
+void Daemon::load_channel_tracker_refresh_thread() {
+    // Refresh the memory statistics of the load channel tracker more frequently,
+    // which helps to accurately control the memory of LoadChannelMgr.
+    while (!_stop_background_threads_latch.wait_for(
+            std::chrono::milliseconds(config::load_channel_memory_refresh_sleep_time_ms))) {
+        if (ExecEnv::GetInstance()->initialized()) {
+            doris::ExecEnv::GetInstance()->load_channel_mgr()->refresh_mem_tracker();
+        }
+    }
+}
+
+void Daemon::memory_tracker_profile_refresh_thread() {
+    while (!_stop_background_threads_latch.wait_for(std::chrono::milliseconds(50))) {
+        MemTracker::refresh_all_tracker_profile();
+        MemTrackerLimiter::refresh_all_tracker_profile();
     }
 }
 
@@ -215,13 +321,15 @@ void Daemon::calculate_metrics_thread() {
         DorisMetrics::instance()->metric_registry()->trigger_all_hooks(true);
 
         if (last_ts == -1L) {
-            last_ts = GetCurrentTimeMicros() / 1000;
+            last_ts = GetMonoTimeMicros() / 1000;
             lst_query_bytes = DorisMetrics::instance()->query_scan_bytes->value();
-            DorisMetrics::instance()->system_metrics()->get_disks_io_time(&lst_disks_io_time);
-            DorisMetrics::instance()->system_metrics()->get_network_traffic(&lst_net_send_bytes,
-                                                                            &lst_net_receive_bytes);
+            if (config::enable_system_metrics) {
+                DorisMetrics::instance()->system_metrics()->get_disks_io_time(&lst_disks_io_time);
+                DorisMetrics::instance()->system_metrics()->get_network_traffic(
+                        &lst_net_send_bytes, &lst_net_receive_bytes);
+            }
         } else {
-            int64_t current_ts = GetCurrentTimeMicros() / 1000;
+            int64_t current_ts = GetMonoTimeMicros() / 1000;
             long interval = (current_ts - last_ts) / 1000;
             last_ts = current_ts;
 
@@ -231,23 +339,32 @@ void Daemon::calculate_metrics_thread() {
             DorisMetrics::instance()->query_scan_bytes_per_second->set_value(qps < 0 ? 0 : qps);
             lst_query_bytes = current_query_bytes;
 
-            // 2. max disk io util
-            DorisMetrics::instance()->max_disk_io_util_percent->set_value(
-                    DorisMetrics::instance()->system_metrics()->get_max_io_util(lst_disks_io_time,
-                                                                                15));
-            // update lst map
-            DorisMetrics::instance()->system_metrics()->get_disks_io_time(&lst_disks_io_time);
+            if (config::enable_system_metrics) {
+                // 2. max disk io util
+                DorisMetrics::instance()->system_metrics()->update_max_disk_io_util_percent(
+                        lst_disks_io_time, 15);
 
-            // 3. max network traffic
-            int64_t max_send = 0;
-            int64_t max_receive = 0;
-            DorisMetrics::instance()->system_metrics()->get_max_net_traffic(
-                    lst_net_send_bytes, lst_net_receive_bytes, 15, &max_send, &max_receive);
-            DorisMetrics::instance()->max_network_send_bytes_rate->set_value(max_send);
-            DorisMetrics::instance()->max_network_receive_bytes_rate->set_value(max_receive);
-            // update lst map
-            DorisMetrics::instance()->system_metrics()->get_network_traffic(&lst_net_send_bytes,
-                                                                            &lst_net_receive_bytes);
+                // update lst map
+                DorisMetrics::instance()->system_metrics()->get_disks_io_time(&lst_disks_io_time);
+
+                // 3. max network traffic
+                int64_t max_send = 0;
+                int64_t max_receive = 0;
+                DorisMetrics::instance()->system_metrics()->get_max_net_traffic(
+                        lst_net_send_bytes, lst_net_receive_bytes, 15, &max_send, &max_receive);
+                DorisMetrics::instance()->system_metrics()->update_max_network_send_bytes_rate(
+                        max_send);
+                DorisMetrics::instance()->system_metrics()->update_max_network_receive_bytes_rate(
+                        max_receive);
+                // update lst map
+                DorisMetrics::instance()->system_metrics()->get_network_traffic(
+                        &lst_net_send_bytes, &lst_net_receive_bytes);
+            }
+
+            DorisMetrics::instance()->all_rowsets_num->set_value(
+                    StorageEngine::instance()->tablet_manager()->get_rowset_nums());
+            DorisMetrics::instance()->all_segments_num->set_value(
+                    StorageEngine::instance()->tablet_manager()->get_segment_nums());
         }
     } while (!_stop_background_threads_latch.wait_for(std::chrono::seconds(15)));
 }
@@ -263,12 +380,12 @@ static void init_doris_metrics(const std::vector<StorePath>& store_paths) {
     if (init_system_metrics) {
         auto st = DiskInfo::get_disk_devices(paths, &disk_devices);
         if (!st.ok()) {
-            LOG(WARNING) << "get disk devices failed, status=" << st.get_error_msg();
+            LOG(WARNING) << "get disk devices failed, status=" << st;
             return;
         }
         st = get_inet_interfaces(&network_interfaces);
         if (!st.ok()) {
-            LOG(WARNING) << "get inet interfaces failed, status=" << st.get_error_msg();
+            LOG(WARNING) << "get inet interfaces failed, status=" << st;
             return;
         }
     }
@@ -358,23 +475,35 @@ void Daemon::start() {
     st = Thread::create(
             "Daemon", "tcmalloc_gc_thread", [this]() { this->tcmalloc_gc_thread(); },
             &_tcmalloc_gc_thread);
-    CHECK(st.ok()) << st.to_string();
+    CHECK(st.ok()) << st;
+    st = Thread::create(
+            "Daemon", "buffer_pool_gc_thread", [this]() { this->buffer_pool_gc_thread(); },
+            &_buffer_pool_gc_thread);
+    CHECK(st.ok()) << st;
     st = Thread::create(
             "Daemon", "memory_maintenance_thread", [this]() { this->memory_maintenance_thread(); },
             &_memory_maintenance_thread);
-    CHECK(st.ok()) << st.to_string();
+    CHECK(st.ok()) << st;
+    st = Thread::create(
+            "Daemon", "memory_gc_thread", [this]() { this->memory_gc_thread(); },
+            &_memory_gc_thread);
+    CHECK(st.ok()) << st;
+    st = Thread::create(
+            "Daemon", "load_channel_tracker_refresh_thread",
+            [this]() { this->load_channel_tracker_refresh_thread(); },
+            &_load_channel_tracker_refresh_thread);
+    CHECK(st.ok()) << st;
+    st = Thread::create(
+            "Daemon", "memory_tracker_profile_refresh_thread",
+            [this]() { this->memory_tracker_profile_refresh_thread(); },
+            &_memory_tracker_profile_refresh_thread);
+    CHECK(st.ok()) << st;
 
     if (config::enable_metric_calculator) {
-        CHECK(DorisMetrics::instance()->is_inited())
-                << "enable metric calculator failed, maybe you set enable_system_metrics to false "
-                << " or there may be some hardware error which causes metric init failed, please "
-                   "check log first;"
-                << " you can set enable_metric_calculator = false to quickly recover ";
-
         st = Thread::create(
                 "Daemon", "calculate_metrics_thread",
                 [this]() { this->calculate_metrics_thread(); }, &_calculate_metrics_thread);
-        CHECK(st.ok()) << st.to_string();
+        CHECK(st.ok()) << st;
     }
 }
 
@@ -384,8 +513,20 @@ void Daemon::stop() {
     if (_tcmalloc_gc_thread) {
         _tcmalloc_gc_thread->join();
     }
+    if (_buffer_pool_gc_thread) {
+        _buffer_pool_gc_thread->join();
+    }
     if (_memory_maintenance_thread) {
         _memory_maintenance_thread->join();
+    }
+    if (_memory_gc_thread) {
+        _memory_gc_thread->join();
+    }
+    if (_load_channel_tracker_refresh_thread) {
+        _load_channel_tracker_refresh_thread->join();
+    }
+    if (_memory_tracker_profile_refresh_thread) {
+        _memory_tracker_profile_refresh_thread->join();
     }
     if (_calculate_metrics_thread) {
         _calculate_metrics_thread->join();

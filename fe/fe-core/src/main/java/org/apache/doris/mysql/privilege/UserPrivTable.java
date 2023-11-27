@@ -31,7 +31,6 @@ import org.apache.logging.log4j.Logger;
 
 import java.io.DataOutput;
 import java.io.IOException;
-import java.util.LinkedList;
 import java.util.List;
 
 /*
@@ -200,33 +199,28 @@ public class UserPrivTable extends PrivTable {
      */
     public CatalogPrivTable degradeToInternalCatalogPriv() throws IOException {
         CatalogPrivTable catalogPrivTable = new CatalogPrivTable();
-        List<PrivEntry> degradedEntries = new LinkedList<>();
         for (PrivEntry privEntry : entries) {
             GlobalPrivEntry globalPrivEntry = (GlobalPrivEntry) privEntry;
             if (!globalPrivEntry.match(UserIdentity.ROOT, true)
                     && !globalPrivEntry.match(UserIdentity.ADMIN, true)
                     && !globalPrivEntry.privSet.isEmpty()) {
                 try {
-                    // USAGE_PRIV is no need to degrade.
-                    PrivBitSet removeUsagePriv = globalPrivEntry.privSet.copy();
-                    removeUsagePriv.unset(PaloPrivilege.USAGE_PRIV.getIdx());
+                    // USAGE_PRIV, NODE_PRIV and ADMIN_PRIV are no need to degrade.
+                    PrivBitSet privsAfterRemoved = globalPrivEntry.privSet.copy();
+                    privsAfterRemoved.unset(PaloPrivilege.USAGE_PRIV.getIdx());
+                    privsAfterRemoved.unset(PaloPrivilege.NODE_PRIV.getIdx());
+                    privsAfterRemoved.unset(PaloPrivilege.ADMIN_PRIV.getIdx());
                     CatalogPrivEntry entry = CatalogPrivEntry.create(globalPrivEntry.origUser, globalPrivEntry.origHost,
-                            InternalCatalog.INTERNAL_CATALOG_NAME, globalPrivEntry.isDomain, removeUsagePriv);
+                            InternalCatalog.INTERNAL_CATALOG_NAME, globalPrivEntry.isDomain, privsAfterRemoved);
                     entry.setSetByDomainResolver(false);
                     catalogPrivTable.addEntry(entry, false, false);
-                    if (globalPrivEntry.privSet.containsResourcePriv()) {
-                        // Should keep the USAGE_PRIV in userPrivTable, and remove other privs and entries.
-                        globalPrivEntry.privSet.and(PrivBitSet.of(PaloPrivilege.USAGE_PRIV));
-                    } else {
-                        degradedEntries.add(globalPrivEntry);
-                    }
+                    // in global entry, only keey USAGE_PRIV, NODE_PRIV and ADMIN_PRIV, if they exist before.
+                    globalPrivEntry.privSet.and(PrivBitSet.of(PaloPrivilege.USAGE_PRIV, PaloPrivilege.NODE_PRIV,
+                            PaloPrivilege.ADMIN_PRIV));
                 } catch (Exception e) {
                     throw new IOException(e.getMessage());
                 }
             }
-        }
-        for (PrivEntry degraded : degradedEntries) {
-            dropEntry(degraded);
         }
         return catalogPrivTable;
     }

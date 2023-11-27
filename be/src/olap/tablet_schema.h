@@ -31,7 +31,7 @@ namespace vectorized {
 class Block;
 }
 
-class POlapTableIndexSchema;
+struct OlapTableIndexSchema;
 
 class TabletColumn {
 public:
@@ -181,6 +181,8 @@ public:
     void set_delete_sign_idx(int32_t delete_sign_idx) { _delete_sign_idx = delete_sign_idx; }
     bool has_sequence_col() const { return _sequence_col_idx != -1; }
     int32_t sequence_col_idx() const { return _sequence_col_idx; }
+    void set_version_col_idx(int32_t version_col_idx) { _version_col_idx = version_col_idx; }
+    int32_t version_col_idx() const { return _version_col_idx; }
     segment_v2::CompressionTypePB compression_type() const { return _compression_type; }
 
     const std::vector<TabletIndex>& indexes() const { return _indexes; }
@@ -197,7 +199,7 @@ public:
     vectorized::Block create_block(bool ignore_dropped_col = true) const;
 
     void build_current_tablet_schema(int64_t index_id, int32_t version,
-                                     const POlapTableIndexSchema& index,
+                                     const OlapTableIndexSchema* index,
                                      const TabletSchema& out_tablet_schema);
 
     // Merge columns that not exit in current schema, these column is dropped in current schema
@@ -241,6 +243,7 @@ private:
     bool _is_in_memory = false;
     int32_t _delete_sign_idx = -1;
     int32_t _sequence_col_idx = -1;
+    int32_t _version_col_idx = -1;
     int32_t _schema_version = -1;
     bool _disable_auto_compaction = false;
 };

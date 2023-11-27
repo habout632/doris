@@ -52,7 +52,7 @@ public class TableFunctionNode extends PlanNode {
 
     protected TableFunctionNode(PlanNodeId id, PlanNode inputNode, List<LateralViewRef> lateralViewRefs) {
         super(id, "TABLE FUNCTION NODE", StatisticalType.TABLE_FUNCTION_NODE);
-        tupleIds.addAll(inputNode.getTupleIds());
+        tupleIds.addAll(inputNode.getOutputTupleIds());
         tblRefIds.addAll(inputNode.getTupleIds());
         tblRefIds.addAll(inputNode.getTblRefIds());
         lateralViewTupleIds = lateralViewRefs.stream().map(e -> e.getDesc().getId())
@@ -96,7 +96,8 @@ public class TableFunctionNode extends PlanNode {
         }
         Set<SlotRef> outputSlotRef = Sets.newHashSet();
         // case1
-        List<Expr> baseTblResultExprs = selectStmt.getBaseTblResultExprs();
+        List<Expr> baseTblResultExprs = Expr.substituteList(selectStmt.getResultExprs(),
+                outputSmap, analyzer, false);
         for (Expr resultExpr : baseTblResultExprs) {
             // find all slotRef bound by tupleIds in resultExpr
             resultExpr.getSlotRefsBoundByTupleIds(tupleIds, outputSlotRef);
@@ -128,6 +129,17 @@ public class TableFunctionNode extends PlanNode {
     public void init(Analyzer analyzer) throws UserException {
         super.init(analyzer);
         fnCallExprList = new ArrayList<>(lateralViewRefs.stream().map(e -> e.getFnExpr()).collect(Collectors.toList()));
+        Set<SlotRef> outputSlotRef = Sets.newHashSet();
+        for (Expr expr : conjuncts) {
+            expr.getSlotRefsBoundByTupleIds(tupleIds, outputSlotRef);
+            Expr dst = outputSmap.get(expr);
+            if (dst != null) {
+                dst.getSlotRefsBoundByTupleIds(tupleIds, outputSlotRef);
+            }
+        }
+        for (SlotRef slotRef : outputSlotRef) {
+            outputSlotIds.add(slotRef.getSlotId());
+        }
         /*
         When the expression of the lateral view involves the column of the subquery,
         the column needs to be rewritten as the real column in the subquery through childrenSmap.

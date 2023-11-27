@@ -80,7 +80,7 @@ public class BaseController {
             value.password = authInfo.password;
             addSession(request, response, value);
 
-            ConnectContext ctx = new ConnectContext(null);
+            ConnectContext ctx = new ConnectContext();
             ctx.setQualifiedUser(authInfo.fullUserName);
             ctx.setRemoteIP(authInfo.remoteIp);
             ctx.setCurrentUserIdentity(currentUser);
@@ -133,7 +133,7 @@ public class BaseController {
 
         updateCookieAge(request, PALO_SESSION_ID, PALO_SESSION_EXPIRED_TIME, response);
 
-        ConnectContext ctx = new ConnectContext(null);
+        ConnectContext ctx = new ConnectContext();
         ctx.setQualifiedUser(sessionValue.currentUser.getQualifiedUser());
         ctx.setRemoteIP(request.getRemoteHost());
         ctx.setCurrentUserIdentity(sessionValue.currentUser);
@@ -185,7 +185,7 @@ public class BaseController {
         public String toString() {
             StringBuilder sb = new StringBuilder();
             sb.append("user: ").append(fullUserName).append(", remote ip: ").append(remoteIp);
-            sb.append(", password: ").append(password).append(", cluster: ").append(cluster);
+            sb.append(", password: ").append("********").append(", cluster: ").append(cluster);
             return sb.toString();
         }
     }
@@ -244,7 +244,7 @@ public class BaseController {
         if (Strings.isNullOrEmpty(encodedAuthString)) {
             return false;
         }
-        String[] parts = encodedAuthString.split(" ");
+        String[] parts = encodedAuthString.split("\\s+");
         if (parts.length != 2) {
             return false;
         }

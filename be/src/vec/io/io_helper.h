@@ -71,7 +71,9 @@ template <typename T>
 void write_text(Decimal<T> value, UInt32 scale, std::ostream& ostr) {
     if (value < Decimal<T>(0)) {
         value *= Decimal<T>(-1);
-        ostr << '-';
+        if (value > Decimal<T>(0)) {
+            ostr << '-';
+        }
     }
 
     using Type = std::conditional_t<std::is_same_v<T, Int128I>, int128_t, T>;
@@ -88,7 +90,16 @@ void write_text(Decimal<T> value, UInt32 scale, std::ostream& ostr) {
     if (scale) {
         ostr << '.';
         String str_fractional(scale, '0');
-        for (Int32 pos = scale - 1; pos >= 0; --pos, value /= 10) {
+        Int32 pos = scale - 1;
+        if (value < Decimal<T>(0) && pos >= 0) {
+            // Reach here iff this value is a min value of a signed numeric type. It means min<int>()
+            // which is -2147483648 multiply -1 is still -2147483648.
+            str_fractional[pos] += (value / 10 * 10) - value;
+            pos--;
+            value /= 10;
+            value *= Decimal<T>(-1);
+        }
+        for (; pos >= 0; --pos, value /= 10) {
             str_fractional[pos] += value % 10;
         }
         ostr.write(str_fractional.data(), scale);
@@ -328,16 +339,18 @@ bool read_decimal_text_impl(T& x, ReadBuffer& buf, UInt32 precision, UInt32 scal
                 (const char*)buf.position(), buf.count(), precision, scale, &result);
         // only to match the is_all_read() check to prevent return null
         buf.position() = buf.end();
-        return result != StringParser::PARSE_FAILURE;
+        return result == StringParser::PARSE_SUCCESS || result == StringParser::PARSE_UNDERFLOW;
     } else {
-        auto dv = binary_cast<Int128, DecimalV2Value>(x.value);
-        auto ans = dv.parse_from_str((const char*)buf.position(), buf.count()) == 0;
+        StringParser::ParseResult result = StringParser::PARSE_SUCCESS;
+
+        x.value = StringParser::string_to_decimal<__int128>(buf.position(), buf.count(),
+                                                            DecimalV2Value::PRECISION,
+                                                            DecimalV2Value::SCALE, &result);
 
         // only to match the is_all_read() check to prevent return null
         buf.position() = buf.end();
 
-        x.value = dv.value();
-        return ans;
+        return result == StringParser::PARSE_SUCCESS || result == StringParser::PARSE_UNDERFLOW;
     }
 }
 

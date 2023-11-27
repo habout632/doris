@@ -41,11 +41,19 @@ namespace doris::vectorized {
 using level_t = int16_t;
 
 struct RowRange {
-    RowRange() {}
+    RowRange() = default;
     RowRange(int64_t first, int64_t last) : first_row(first), last_row(last) {}
 
     int64_t first_row;
     int64_t last_row;
+
+    bool operator<(const RowRange& range) const { return first_row < range.first_row; }
+
+    std::string debug_string() const {
+        std::stringstream ss;
+        ss << "[" << first_row << "," << last_row << ")";
+        return ss.str();
+    }
 };
 
 struct ParquetReadColumn {
@@ -60,7 +68,9 @@ struct ParquetInt96 {
     uint64_t lo; // time of nanoseconds in a day
     uint32_t hi; // days from julian epoch
 
-    inline uint64_t to_timestamp_micros() const;
+    inline uint64_t to_timestamp_micros() const {
+        return (hi - JULIAN_EPOCH_OFFSET_DAYS) * MICROS_IN_DAY + lo / NANOS_PER_MICROSECOND;
+    }
 
     static const uint32_t JULIAN_EPOCH_OFFSET_DAYS;
     static const uint64_t MICROS_IN_DAY;
@@ -170,11 +180,23 @@ public:
     }
 
 protected:
+    /**
+     * Decode dictionary-coded values into doris_column, ensure that doris_column is ColumnDictI32 type,
+     * and the coded values must be read into _indexes previously.
+     */
+    Status _decode_dict_values(MutableColumnPtr& doris_column, ColumnSelectVector& select_vector);
+
     int32_t _type_length;
     Slice* _data = nullptr;
     uint32_t _offset = 0;
     FieldSchema* _field_schema = nullptr;
     std::unique_ptr<DecodeParams> _decode_params = nullptr;
+
+    // For dictionary encoding
+    bool _has_dict = false;
+    std::unique_ptr<uint8_t[]> _dict = nullptr;
+    std::unique_ptr<RleBatchDecoder<uint32_t>> _index_batch_decoder = nullptr;
+    std::vector<uint32_t> _indexes;
 };
 
 template <typename DecimalPrimitiveType>
@@ -245,12 +267,9 @@ protected:
     if (!_has_dict) _offset += _type_length
 
     tparquet::Type::type _physical_type;
+
     // For dictionary encoding
-    bool _has_dict = false;
-    std::unique_ptr<uint8_t[]> _dict = nullptr;
     std::vector<char*> _dict_items;
-    std::unique_ptr<RleBatchDecoder<uint32_t>> _index_batch_decoder = nullptr;
-    std::vector<uint32_t> _indexes;
 };
 
 template <typename Numeric>
@@ -344,7 +363,6 @@ Status FixLengthDecoder::_decode_datetime64(MutableColumnPtr& doris_column,
     size_t data_index = column_data.size();
     column_data.resize(data_index + select_vector.num_values() - select_vector.num_filtered());
     size_t dict_index = 0;
-    int64_t scale_to_micro = _decode_params->scale_to_nano_factor / 1000;
     ColumnSelectVector::DataReadType read_type;
     while (size_t run_length = select_vector.get_next_run(&read_type)) {
         switch (read_type) {
@@ -356,7 +374,8 @@ Status FixLengthDecoder::_decode_datetime64(MutableColumnPtr& doris_column,
                 v.from_unixtime(date_value / _decode_params->second_mask, *_decode_params->ctz);
                 if constexpr (std::is_same_v<CppType, DateV2Value<DateTimeV2ValueType>>) {
                     // nanoseconds will be ignored.
-                    v.set_microsecond((date_value % _decode_params->second_mask) * scale_to_micro);
+                    v.set_microsecond((date_value % _decode_params->second_mask) *
+                                      _decode_params->scale_to_nano_factor / 1000);
                     // TODO: the precision of datetime v1
                 }
                 _FIXED_SHIFT_DATA_OFFSET();
@@ -559,11 +578,7 @@ protected:
                                   ColumnSelectVector& select_vector);
 
     // For dictionary encoding
-    bool _has_dict = false;
-    std::unique_ptr<uint8_t[]> _dict = nullptr;
     std::vector<StringRef> _dict_items;
-    std::unique_ptr<RleBatchDecoder<uint32_t>> _index_batch_decoder = nullptr;
-    std::vector<uint32_t> _indexes;
 };
 
 template <typename DecimalPrimitiveType>

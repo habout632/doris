@@ -24,13 +24,13 @@ import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.DatabaseIf;
 import org.apache.doris.catalog.Env;
+import org.apache.doris.catalog.HMSResource;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.S3Resource;
 import org.apache.doris.catalog.Table;
 import org.apache.doris.catalog.TableIf;
 import org.apache.doris.catalog.TableIf.TableType;
 import org.apache.doris.catalog.external.ExternalDatabase;
-import org.apache.doris.catalog.external.ExternalTable;
 import org.apache.doris.cluster.Cluster;
 import org.apache.doris.cluster.ClusterNamespace;
 import org.apache.doris.common.AnalysisException;
@@ -41,6 +41,7 @@ import org.apache.doris.common.DuplicatedRequestException;
 import org.apache.doris.common.LabelAlreadyUsedException;
 import org.apache.doris.common.MetaNotFoundException;
 import org.apache.doris.common.PatternMatcher;
+import org.apache.doris.common.PatternMatcherException;
 import org.apache.doris.common.ThriftServerContext;
 import org.apache.doris.common.ThriftServerEventProcessor;
 import org.apache.doris.common.UserException;
@@ -48,6 +49,7 @@ import org.apache.doris.common.Version;
 import org.apache.doris.common.util.TimeUtils;
 import org.apache.doris.datasource.CatalogIf;
 import org.apache.doris.datasource.ExternalCatalog;
+import org.apache.doris.datasource.HMSExternalCatalog;
 import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.master.MasterImpl;
 import org.apache.doris.mysql.privilege.PrivPredicate;
@@ -86,6 +88,7 @@ import org.apache.doris.thrift.TGetStoragePolicy;
 import org.apache.doris.thrift.TGetStoragePolicyResult;
 import org.apache.doris.thrift.TGetTablesParams;
 import org.apache.doris.thrift.TGetTablesResult;
+import org.apache.doris.thrift.TIcebergMetadataType;
 import org.apache.doris.thrift.TInitExternalCtlMetaRequest;
 import org.apache.doris.thrift.TInitExternalCtlMetaResult;
 import org.apache.doris.thrift.TListPrivilegesResult;
@@ -101,6 +104,7 @@ import org.apache.doris.thrift.TLoadTxnRollbackResult;
 import org.apache.doris.thrift.TMasterOpRequest;
 import org.apache.doris.thrift.TMasterOpResult;
 import org.apache.doris.thrift.TMasterResult;
+import org.apache.doris.thrift.TMetadataTableRequestParams;
 import org.apache.doris.thrift.TNetworkAddress;
 import org.apache.doris.thrift.TPrivilegeStatus;
 import org.apache.doris.thrift.TReportExecStatusParams;
@@ -132,14 +136,23 @@ import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.gson.Gson;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hdfs.HdfsConfiguration;
+import org.apache.iceberg.Snapshot;
+import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.thrift.TException;
+import org.jetbrains.annotations.NotNull;
 
+import java.time.Instant;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
@@ -167,15 +180,29 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             try {
                 matcher = PatternMatcher.createMysqlPattern(params.getPattern(),
                         CaseSensibility.DATABASE.getCaseSensibility());
-            } catch (AnalysisException e) {
+            } catch (PatternMatcherException e) {
                 throw new TException("Pattern is in bad format: " + params.getPattern());
             }
         }
 
         Env env = Env.getCurrentEnv();
-        List<CatalogIf> catalogIfs = env.getCatalogMgr().listCatalogs();
+        List<CatalogIf> catalogIfs = Lists.newArrayList();
+        if (Strings.isNullOrEmpty(params.catalog)) {
+            catalogIfs = env.getCatalogMgr().listCatalogs();
+        } else {
+            catalogIfs.add(env.getCatalogMgr()
+                    .getCatalogOrException(params.catalog, catalog -> new TException("Unknown catalog " + catalog)));
+        }
         for (CatalogIf catalog : catalogIfs) {
-            List<String> dbNames = catalog.getDbNames();
+            List<String> dbNames;
+            try {
+                dbNames = catalog.getDbNamesOrEmpty();
+            } catch (Exception e) {
+                LOG.warn("failed to get database names for catalog {}", catalog.getName(), e);
+                // Some external catalog may fail to get databases due to wrong connection info.
+                // So continue here to get databases of other catalogs.
+                continue;
+            }
             LOG.debug("get db names: {}, in catalog: {}", dbNames, catalog.getName());
 
             UserIdentity currentUser = null;
@@ -215,7 +242,7 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             try {
                 matcher = PatternMatcher.createMysqlPattern(params.getPattern(),
                         CaseSensibility.TABLE.getCaseSensibility());
-            } catch (AnalysisException e) {
+            } catch (PatternMatcherException e) {
                 throw new TException("Pattern is in bad format: " + params.getPattern());
             }
         }
@@ -229,21 +256,28 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         }
         String catalogName = Strings.isNullOrEmpty(params.catalog) ? InternalCatalog.INTERNAL_CATALOG_NAME
                 : params.catalog;
+
         DatabaseIf<TableIf> db = Env.getCurrentEnv().getCatalogMgr()
                 .getCatalogOrException(catalogName, catalog -> new TException("Unknown catalog " + catalog))
                 .getDbNullable(params.db);
-        if (db != null) {
-            for (String tableName : db.getTableNamesWithLock()) {
-                LOG.debug("get table: {}, wait to check", tableName);
-                if (!Env.getCurrentEnv().getAuth()
-                        .checkTblPriv(currentUser, params.db, tableName, PrivPredicate.SHOW)) {
-                    continue;
-                }
 
-                if (matcher != null && !matcher.match(tableName)) {
-                    continue;
+        if (db != null) {
+            Set<String> tableNames;
+            try {
+                tableNames = db.getTableNamesOrEmptyWithLock();
+                for (String tableName : tableNames) {
+                    LOG.debug("get table: {}, wait to check", tableName);
+                    if (!Env.getCurrentEnv().getAuth()
+                            .checkTblPriv(currentUser, params.db, tableName, PrivPredicate.SHOW)) {
+                        continue;
+                    }
+                    if (matcher != null && !matcher.match(tableName)) {
+                        continue;
+                    }
+                    tablesResult.add(tableName);
                 }
-                tablesResult.add(tableName);
+            } catch (Exception e) {
+                LOG.warn("failed to get table names for db {} in catalog {}", params.db, catalogName, e);
             }
         }
         return result;
@@ -260,7 +294,7 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             try {
                 matcher = PatternMatcher.createMysqlPattern(params.getPattern(),
                         CaseSensibility.TABLE.getCaseSensibility());
-            } catch (AnalysisException e) {
+            } catch (PatternMatcherException e) {
                 throw new TException("Pattern is in bad format " + params.getPattern());
             }
         }
@@ -281,56 +315,50 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         if (catalog != null) {
             DatabaseIf db = catalog.getDbNullable(params.db);
             if (db != null) {
-                List<TableIf> tables = null;
-                if (!params.isSetType() || params.getType() == null || params.getType().isEmpty()) {
-                    tables = db.getTables();
-                } else {
-                    switch (params.getType()) {
-                        case "VIEW":
-                            tables = db.getViews();
-                            break;
-                        default:
-                            tables = db.getTables();
+                try {
+                    List<TableIf> tables;
+                    if (!params.isSetType() || params.getType() == null || params.getType().isEmpty()) {
+                        tables = db.getTablesOrEmpty();
+                    } else {
+                        switch (params.getType()) {
+                            case "VIEW":
+                                tables = db.getViewsOrEmpty();
+                                break;
+                            default:
+                                tables = db.getTablesOrEmpty();
+                        }
                     }
-                }
-                for (TableIf table : tables) {
-                    if (!Env.getCurrentEnv().getAuth().checkTblPriv(currentUser, params.db,
-                            table.getName(), PrivPredicate.SHOW)) {
-                        continue;
-                    }
-                    table.readLock();
-                    try {
+                    for (TableIf table : tables) {
                         if (!Env.getCurrentEnv().getAuth().checkTblPriv(currentUser, params.db,
                                 table.getName(), PrivPredicate.SHOW)) {
                             continue;
                         }
-
-                        if (matcher != null && !matcher.match(table.getName())) {
-                            continue;
+                        table.readLock();
+                        try {
+                            if (matcher != null && !matcher.match(table.getName())) {
+                                continue;
+                            }
+                            long lastCheckTime = table.getLastCheckTime() <= 0 ? 0 : table.getLastCheckTime();
+                            TTableStatus status = new TTableStatus();
+                            status.setName(table.getName());
+                            status.setType(table.getMysqlType());
+                            status.setEngine(table.getEngine());
+                            status.setComment(table.getComment());
+                            status.setCreateTime(table.getCreateTime());
+                            status.setLastCheckTime(lastCheckTime / 1000);
+                            status.setUpdateTime(table.getUpdateTime() / 1000);
+                            status.setCheckTime(lastCheckTime / 1000);
+                            status.setCollation("utf-8");
+                            status.setRows(table.getRowCount());
+                            status.setDataLength(table.getDataLength());
+                            status.setAvgRowLength(table.getAvgRowLength());
+                            tablesResult.add(status);
+                        } finally {
+                            table.readUnlock();
                         }
-                        long lastCheckTime = 0;
-                        if (table instanceof Table) {
-                            lastCheckTime = ((Table) table).getLastCheckTime();
-                        } else {
-                            lastCheckTime = ((ExternalTable) table).getLastCheckTime();
-                        }
-                        TTableStatus status = new TTableStatus();
-                        status.setName(table.getName());
-                        status.setType(table.getMysqlType());
-                        status.setEngine(table.getEngine());
-                        status.setComment(table.getComment());
-                        status.setCreateTime(table.getCreateTime());
-                        status.setLastCheckTime(lastCheckTime);
-                        status.setUpdateTime(table.getUpdateTime() / 1000);
-                        status.setCheckTime(lastCheckTime);
-                        status.setCollation("utf-8");
-                        status.setRows(table.getRowCount());
-                        status.setDataLength(table.getDataLength());
-                        status.setAvgRowLength(table.getAvgRowLength());
-                        tablesResult.add(status);
-                    } finally {
-                        table.readUnlock();
                     }
+                } catch (Exception e) {
+                    LOG.warn("failed to get tables for db {} in catalog {}", db.getFullName(), catalogName, e);
                 }
             }
         }
@@ -392,7 +420,6 @@ public class FrontendServiceImpl implements FrontendService.Iface {
     public TFeResult updateExportTaskStatus(TUpdateExportTaskStatusRequest request) throws TException {
         TStatus status = new TStatus(TStatusCode.OK);
         TFeResult result = new TFeResult(FrontendServiceVersion.V1, status);
-
         return result;
     }
 
@@ -421,11 +448,12 @@ public class FrontendServiceImpl implements FrontendService.Iface {
                 .getCatalogOrException(catalogName, catalog -> new TException("Unknown catalog " + catalog))
                 .getDbNullable(params.db);
         if (db != null) {
-            TableIf table = db.getTableNullable(params.getTableName());
+            TableIf table = db.getTableNullableIfException(params.getTableName());
             if (table != null) {
                 table.readLock();
                 try {
-                    for (Column column : table.getBaseSchema()) {
+                    List<Column> baseSchema = table.getBaseSchemaOrEmpty();
+                    for (Column column : baseSchema) {
                         final TColumnDesc desc = new TColumnDesc(column.getName(), column.getDataType().toThrift());
                         final Integer precision = column.getOriginType().getPrecision();
                         if (precision != null) {
@@ -508,10 +536,17 @@ public class FrontendServiceImpl implements FrontendService.Iface {
                 throw new TException("request from invalid host was rejected.");
             }
         }
+        if (params.isSyncJournalOnly()) {
+            final TMasterOpResult result = new TMasterOpResult();
+            result.setMaxJournalId(Env.getCurrentEnv().getMaxJournalId());
+            // just make the protocol happy
+            result.setPacket("".getBytes());
+            return result;
+        }
 
         // add this log so that we can track this stmt
         LOG.debug("receive forwarded stmt {} from FE: {}", params.getStmtId(), clientAddr.getHostname());
-        ConnectContext context = new ConnectContext(null);
+        ConnectContext context = new ConnectContext();
         // Set current connected FE to the client address, so that we can know where this request come from.
         context.setCurrentConnectedFEIp(clientAddr.getHostname());
         ConnectProcessor processor = new ConnectProcessor(context);
@@ -743,19 +778,26 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             throw new UserException("transaction [" + request.getTxnId() + "] not found");
         }
         List<Long> tableIdList = transactionState.getTableIdList();
-        List<Table> tableList = database.getTablesOnIdOrderOrThrowException(tableIdList);
+        String txnOperation = request.getOperation().trim();
+        List<Table> tableList = new ArrayList<>();
+        // if table was dropped, stream load must can abort.
+        if (txnOperation.equalsIgnoreCase("abort")) {
+            tableList = database.getTablesOnIdOrderIfExist(tableIdList);
+        } else {
+            tableList = database.getTablesOnIdOrderOrThrowException(tableIdList);
+        }
         for (Table table : tableList) {
             // check auth
             checkPasswordAndPrivs(cluster, request.getUser(), request.getPasswd(), request.getDb(), table.getName(),
                     request.getUserIp(), PrivPredicate.LOAD);
         }
 
-        String txnOperation = request.getOperation().trim();
         if (txnOperation.equalsIgnoreCase("commit")) {
+            long timeoutMs = request.isSetThriftRpcTimeoutMs() ? request.getThriftRpcTimeoutMs() / 2 : 5000;
             Env.getCurrentGlobalTransactionMgr()
-                    .commitTransaction2PC(database, tableList, request.getTxnId(), 5000);
+                    .commitTransaction2PC(database, tableList, request.getTxnId(), timeoutMs);
         } else if (txnOperation.equalsIgnoreCase("abort")) {
-            Env.getCurrentGlobalTransactionMgr().abortTransaction2PC(database.getId(), request.getTxnId());
+            Env.getCurrentGlobalTransactionMgr().abortTransaction2PC(database.getId(), request.getTxnId(), tableList);
         } else {
             throw new UserException("transaction operation should be \'commit\' or \'abort\'");
         }
@@ -877,9 +919,15 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             throw new MetaNotFoundException("db " + request.getDb() + " does not exist");
         }
         long dbId = db.getId();
+        DatabaseTransactionMgr dbTransactionMgr = Env.getCurrentGlobalTransactionMgr().getDatabaseTransactionMgr(dbId);
+        TransactionState transactionState = dbTransactionMgr.getTransactionState(request.getTxnId());
+        if (transactionState == null) {
+            throw new UserException("transaction [" + request.getTxnId() + "] not found");
+        }
+        List<Table> tableList = db.getTablesOnIdOrderIfExist(transactionState.getTableIdList());
         Env.getCurrentGlobalTransactionMgr().abortTransaction(dbId, request.getTxnId(),
                 request.isSetReason() ? request.getReason() : "system cancel",
-                TxnCommitAttachment.fromThrift(request.getTxnCommitAttachment()));
+                TxnCommitAttachment.fromThrift(request.getTxnCommitAttachment()), tableList);
     }
 
     @Override
@@ -899,7 +947,7 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         } catch (Throwable e) {
             LOG.warn("catch unknown result.", e);
             status.setStatusCode(TStatusCode.INTERNAL_ERROR);
-            status.addToErrorMsgs(Strings.nullToEmpty(e.getMessage()));
+            status.addToErrorMsgs(e.getClass().getSimpleName() + ": " + Strings.nullToEmpty(e.getMessage()));
             return result;
         }
         return result;
@@ -992,12 +1040,93 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         switch (request.getSchemaTableName()) {
             case BACKENDS:
                 return getBackendsSchemaTable(request);
+            case ICEBERG_TABLE_META:
+                return getIcebergMetadataTable(request);
             default:
                 break;
         }
         TFetchSchemaTableDataResult result = new TFetchSchemaTableDataResult();
         result.setStatus(new TStatus(TStatusCode.INTERNAL_ERROR));
         return result;
+    }
+
+    private TFetchSchemaTableDataResult getIcebergMetadataTable(TFetchSchemaTableDataRequest request) {
+        if (!request.isSetMetadaTableParams()) {
+            return errorResult("Metadata table params is not set. ");
+        }
+        TMetadataTableRequestParams params = request.getMetadaTableParams();
+        if (!params.isSetIcebergMetadataParams()) {
+            return errorResult("Iceberg metadata params is not set. ");
+        }
+
+        HMSExternalCatalog catalog = (HMSExternalCatalog) Env.getCurrentEnv().getCatalogMgr()
+                .getCatalog(params.getCatalog());
+        org.apache.iceberg.Table table;
+        try {
+            table = getIcebergTable(catalog, params.getDatabase(), params.getTable());
+        } catch (MetaNotFoundException e) {
+            return errorResult(e.getMessage());
+        }
+        TFetchSchemaTableDataResult result = new TFetchSchemaTableDataResult();
+        List<TRow> dataBatch = Lists.newArrayList();
+        TIcebergMetadataType metadataType = params.getIcebergMetadataParams().getMetadataType();
+        switch (metadataType) {
+            case SNAPSHOTS:
+                for (Snapshot snapshot : table.snapshots()) {
+                    TRow trow = new TRow();
+                    LocalDateTime committedAt = LocalDateTime.ofInstant(Instant.ofEpochMilli(
+                            snapshot.timestampMillis()), TimeUtils.getTimeZone().toZoneId());
+                    long encodedDatetime = convertToDateTimeV2(committedAt.getYear(), committedAt.getMonthValue(),
+                            committedAt.getDayOfMonth(), committedAt.getHour(),
+                            committedAt.getMinute(), committedAt.getSecond());
+
+                    trow.addToColumnValue(new TCell().setLongVal(encodedDatetime));
+                    trow.addToColumnValue(new TCell().setLongVal(snapshot.snapshotId()));
+                    if (snapshot.parentId() == null) {
+                        trow.addToColumnValue(new TCell().setLongVal(-1L));
+                    } else {
+                        trow.addToColumnValue(new TCell().setLongVal(snapshot.parentId()));
+                    }
+                    trow.addToColumnValue(new TCell().setStringVal(snapshot.operation()));
+                    trow.addToColumnValue(new TCell().setStringVal(snapshot.manifestListLocation()));
+                    dataBatch.add(trow);
+                }
+                break;
+            default:
+                return errorResult("Unsupported metadata inspect type: " + metadataType);
+        }
+        result.setDataBatch(dataBatch);
+        result.setStatus(new TStatus(TStatusCode.OK));
+        return result;
+    }
+
+    public static long convertToDateTimeV2(int year, int month, int day, int hour, int minute, int second) {
+        return (long) second << 20 | (long) minute << 26 | (long) hour << 32
+            | (long) day << 37 | (long) month << 42 | (long) year << 46;
+    }
+
+    @NotNull
+    private TFetchSchemaTableDataResult errorResult(String msg) {
+        TFetchSchemaTableDataResult result = new TFetchSchemaTableDataResult();
+        result.setStatus(new TStatus(TStatusCode.INTERNAL_ERROR));
+        result.status.addToErrorMsgs(msg);
+        return result;
+    }
+
+    private org.apache.iceberg.Table getIcebergTable(HMSExternalCatalog catalog, String db, String tbl)
+                throws MetaNotFoundException {
+        org.apache.iceberg.hive.HiveCatalog hiveCatalog = new org.apache.iceberg.hive.HiveCatalog();
+        Configuration conf = new HdfsConfiguration();
+        Map<String, String> properties = catalog.getCatalogProperty().getHadoopProperties();
+        for (Map.Entry<String, String> entry : properties.entrySet()) {
+            conf.set(entry.getKey(), entry.getValue());
+        }
+        hiveCatalog.setConf(conf);
+        Map<String, String> catalogProperties = new HashMap<>();
+        catalogProperties.put(HMSResource.HIVE_METASTORE_URIS, catalog.getHiveMetastoreUris());
+        catalogProperties.put("uri", catalog.getHiveMetastoreUris());
+        hiveCatalog.initialize("hive", catalogProperties);
+        return hiveCatalog.loadTable(TableIdentifier.of(db, tbl));
     }
 
     private TFetchSchemaTableDataResult getBackendsSchemaTable(TFetchSchemaTableDataRequest request) {
@@ -1170,10 +1299,10 @@ public class FrontendServiceImpl implements FrontendService.Iface {
                         s3Info.setBucket(storagePolicyProperties.get(S3Resource.S3_BUCKET));
                         s3Info.setS3MaxConn(
                                 Integer.parseInt(storagePolicyProperties.get(S3Resource.S3_MAX_CONNECTIONS)));
-                        s3Info.setS3RequestTimeoutMs(
-                                Integer.parseInt(storagePolicyProperties.get(S3Resource.S3_REQUEST_TIMEOUT_MS)));
-                        s3Info.setS3ConnTimeoutMs(
-                                Integer.parseInt(storagePolicyProperties.get(S3Resource.S3_CONNECTION_TIMEOUT_MS)));
+                        s3Info.setS3RequestTimeoutMs(Integer.parseInt(
+                                storagePolicyProperties.get(S3Resource.S3_REQUEST_TIMEOUT_MS)));
+                        s3Info.setS3ConnTimeoutMs(Integer.parseInt(
+                                storagePolicyProperties.get(S3Resource.S3_CONNECTION_TIMEOUT_MS)));
                     });
 
                     rEntry.setS3StorageParam(s3Info);
@@ -1230,3 +1359,4 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         return result;
     }
 }
+

@@ -79,7 +79,7 @@ public:
                                            BeConsts::MAX_DECIMAL128_PRECISION, 0)},
                     {"Decimal128I", std::make_shared<DataTypeDecimal<Decimal128I>>(
                                             BeConsts::MAX_DECIMAL128_PRECISION, 0)},
-                    {"Json", std::make_shared<DataTypeJsonb>()},
+                    {"Jsonb", std::make_shared<DataTypeJsonb>()},
                     {"BitMap", std::make_shared<DataTypeBitMap>()},
                     {"Hll", std::make_shared<DataTypeHLL>()},
             };
@@ -122,6 +122,10 @@ public:
 
     DataTypePtr create_data_type(const TTypeDesc& raw_type) {
         return create_data_type(TypeDescriptor::from_thrift(raw_type), raw_type.is_nullable);
+    }
+
+    DataTypePtr create_data_type(const FieldType& type, int precision, int scale) {
+        return _create_primitive_data_type(type, precision, scale);
     }
 
 private:

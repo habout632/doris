@@ -257,7 +257,8 @@ VDataStreamRecvr::VDataStreamRecvr(
         std::shared_ptr<QueryStatisticsRecvr> sub_plan_query_statistics_recvr)
         : _mgr(stream_mgr),
 #ifdef USE_MEM_TRACKER
-          _state(state),
+          _query_mem_tracker(state->query_mem_tracker()),
+          _query_id(state->query_id()),
 #endif
           _fragment_instance_id(fragment_instance_id),
           _dest_node_id(dest_node_id),
@@ -269,8 +270,9 @@ VDataStreamRecvr::VDataStreamRecvr(
           _profile(profile),
           _sub_plan_query_statistics_recvr(sub_plan_query_statistics_recvr) {
     // DataStreamRecvr may be destructed after the instance execution thread ends.
-    _mem_tracker = std::make_unique<MemTracker>(
-            "VDataStreamRecvr:" + print_id(_fragment_instance_id), _profile);
+    _mem_tracker =
+            std::make_unique<MemTracker>("VDataStreamRecvr:" + print_id(_fragment_instance_id),
+                                         _profile, nullptr, "PeakMemoryUsage");
     SCOPED_CONSUME_MEM_TRACKER(_mem_tracker.get());
 
     // Create one queue per sender if is_merging is true.
@@ -319,9 +321,7 @@ Status VDataStreamRecvr::create_merger(const std::vector<VExprContext*>& orderin
 
 void VDataStreamRecvr::add_block(const PBlock& pblock, int sender_id, int be_number,
                                  int64_t packet_seq, ::google::protobuf::Closure** done) {
-    SCOPED_ATTACH_TASK(_state->query_mem_tracker(), print_id(_state->query_id()),
-                       _fragment_instance_id);
-    SCOPED_CONSUME_MEM_TRACKER(_mem_tracker.get());
+    SCOPED_ATTACH_TASK(_query_mem_tracker, print_id(_query_id), _fragment_instance_id);
     int use_sender_id = _is_merging ? sender_id : 0;
     _sender_queues[use_sender_id]->add_block(pblock, be_number, packet_seq, done);
 }

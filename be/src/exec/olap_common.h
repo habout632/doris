@@ -598,13 +598,6 @@ bool ColumnValueRange<primitive_type>::convert_to_avg_range_value(
             max_value.set_type(TimeType::TIME_DATE);
         }
 
-        if (contain_null()) {
-            begin_scan_keys.emplace_back();
-            begin_scan_keys.back().add_null();
-            end_scan_keys.emplace_back();
-            end_scan_keys.back().add_null();
-        }
-
         if (min_value > max_value || max_scan_key_num == 1) {
             return no_split();
         }
@@ -628,6 +621,13 @@ bool ColumnValueRange<primitive_type>::convert_to_avg_range_value(
             return no_split();
         }
 
+        // Add null key if contain null, must do after no_split check
+        if (contain_null()) {
+            begin_scan_keys.emplace_back();
+            begin_scan_keys.back().add_null();
+            end_scan_keys.emplace_back();
+            end_scan_keys.back().add_null();
+        }
         while (true) {
             begin_scan_keys.emplace_back();
             begin_scan_keys.back().add_value(
@@ -1053,7 +1053,21 @@ Status OlapScanKeys::extend_scan_key(ColumnValueRange<primitive_type>& range,
     else {
         _has_range_value = true;
 
-        if (_begin_scan_keys.empty()) {
+        /// if max < min, this range should only contains a null value.
+        if (range.get_range_max_value() < range.get_range_min_value()) {
+            CHECK(range.contain_null());
+            if (_begin_scan_keys.empty()) {
+                _begin_scan_keys.emplace_back();
+                _begin_scan_keys.back().add_null();
+                _end_scan_keys.emplace_back();
+                _end_scan_keys.back().add_null();
+            } else {
+                for (int i = 0; i < _begin_scan_keys.size(); ++i) {
+                    _begin_scan_keys[i].add_null();
+                    _end_scan_keys[i].add_null();
+                }
+            }
+        } else if (_begin_scan_keys.empty()) {
             _begin_scan_keys.emplace_back();
             _begin_scan_keys.back().add_value(cast_to_string<primitive_type, CppType>(
                                                       range.get_range_min_value(), range.scale()),

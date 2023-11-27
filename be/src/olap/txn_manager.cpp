@@ -70,6 +70,7 @@ using std::stringstream;
 using std::vector;
 
 namespace doris {
+using namespace ErrorCode;
 
 TxnManager::TxnManager(int32_t txn_map_shard_size, int32_t txn_shard_size)
         : _txn_map_shard_size(txn_map_shard_size), _txn_shard_size(txn_shard_size) {
@@ -152,7 +153,7 @@ Status TxnManager::prepare_txn(TPartitionId partition_id, TTransactionId transac
     if (txn_partition_map.size() > config::max_runnings_transactions_per_txn_map) {
         LOG(WARNING) << "too many transactions: " << txn_tablet_map.size()
                      << ", limit: " << config::max_runnings_transactions_per_txn_map;
-        return Status::OLAPInternalError(OLAP_ERR_TOO_MANY_TRANSACTIONS);
+        return Status::Error<TOO_MANY_TRANSACTIONS>();
     }
 
     // not found load id
@@ -180,12 +181,21 @@ void TxnManager::set_txn_related_delete_bitmap(TPartitionId partition_id,
     std::unique_lock<std::mutex> txn_lock(_get_txn_lock(transaction_id));
     {
         // get tx
-        std::shared_lock rdlock(_get_txn_map_lock(transaction_id));
+        std::lock_guard<std::shared_mutex> wrlock(_get_txn_map_lock(transaction_id));
         txn_tablet_map_t& txn_tablet_map = _get_txn_tablet_map(transaction_id);
         auto it = txn_tablet_map.find(key);
-        DCHECK(it != txn_tablet_map.end());
+        if (it == txn_tablet_map.end()) {
+            LOG(WARNING) << "transaction_id: " << transaction_id
+                         << " partition_id: " << partition_id << " may be cleared";
+            return;
+        }
         auto load_itr = it->second.find(tablet_info);
-        DCHECK(load_itr != it->second.end());
+        if (load_itr == it->second.end()) {
+            LOG(WARNING) << "transaction_id: " << transaction_id
+                         << " partition_id: " << partition_id << " tablet_id: " << tablet_id
+                         << " may be cleared";
+            return;
+        }
         TabletTxnInfo& load_info = load_itr->second;
         load_info.unique_key_merge_on_write = unique_key_merge_on_write;
         load_info.delete_bitmap = delete_bitmap;
@@ -209,7 +219,7 @@ Status TxnManager::commit_txn(OlapMeta* meta, TPartitionId partition_id,
         LOG(WARNING) << "could not commit txn because rowset ptr is null. "
                      << "partition_id: " << key.first << ", transaction_id: " << key.second
                      << ", tablet: " << tablet_info.to_string();
-        return Status::OLAPInternalError(OLAP_ERR_ROWSET_INVALID);
+        return Status::Error<ROWSET_INVALID>();
     }
 
     std::unique_lock<std::mutex> txn_lock(_get_txn_lock(transaction_id));
@@ -246,7 +256,7 @@ Status TxnManager::commit_txn(OlapMeta* meta, TPartitionId partition_id,
                                  << ", tablet: " << tablet_info.to_string()
                                  << ", exist rowset_id: " << load_info.rowset->rowset_id()
                                  << ", new rowset_id: " << rowset_ptr->rowset_id();
-                    return Status::OLAPInternalError(OLAP_ERR_PUSH_TRANSACTION_ALREADY_EXIST);
+                    return Status::Error<PUSH_TRANSACTION_ALREADY_EXIST>();
                 }
             }
         }
@@ -262,13 +272,21 @@ Status TxnManager::commit_txn(OlapMeta* meta, TPartitionId partition_id,
             LOG(WARNING) << "save committed rowset failed. when commit txn rowset_id:"
                          << rowset_ptr->rowset_id() << "tablet id: " << tablet_id
                          << "txn id:" << transaction_id;
-            return Status::OLAPInternalError(OLAP_ERR_ROWSET_SAVE_FAILED);
+            return Status::Error<ROWSET_SAVE_FAILED>();
         }
     }
 
     {
         std::lock_guard<std::shared_mutex> wrlock(_get_txn_map_lock(transaction_id));
         TabletTxnInfo load_info(load_id, rowset_ptr);
+        if (is_recovery) {
+            TabletSharedPtr tablet = StorageEngine::instance()->tablet_manager()->get_tablet(
+                    tablet_info.tablet_id, tablet_info.tablet_uid);
+            if (tablet != nullptr && tablet->enable_unique_key_merge_on_write()) {
+                load_info.unique_key_merge_on_write = true;
+                load_info.delete_bitmap.reset(new DeleteBitmap(tablet->tablet_id()));
+            }
+        }
         txn_tablet_map_t& txn_tablet_map = _get_txn_tablet_map(transaction_id);
         txn_tablet_map[key][tablet_info] = load_info;
         _insert_txn_partition_map_unlocked(transaction_id, partition_id);
@@ -289,11 +307,11 @@ Status TxnManager::publish_txn(OlapMeta* meta, TPartitionId partition_id,
     pair<int64_t, int64_t> key(partition_id, transaction_id);
     TabletInfo tablet_info(tablet_id, schema_hash, tablet_uid);
     RowsetSharedPtr rowset_ptr = nullptr;
-    TabletTxnInfo* load_info = nullptr;
+    TabletTxnInfo load_info;
     {
-        std::unique_lock<std::mutex> txn_lock(_get_txn_lock(transaction_id));
         {
-            std::shared_lock rlock(_get_txn_map_lock(transaction_id));
+            std::unique_lock<std::mutex> txn_rlock(_get_txn_lock(transaction_id));
+            std::shared_lock txn_map_rlock(_get_txn_map_lock(transaction_id));
             txn_tablet_map_t& txn_tablet_map = _get_txn_tablet_map(transaction_id);
             auto it = txn_tablet_map.find(key);
             if (it != txn_tablet_map.end()) {
@@ -301,8 +319,8 @@ Status TxnManager::publish_txn(OlapMeta* meta, TPartitionId partition_id,
                 if (load_itr != it->second.end()) {
                     // found load for txn,tablet
                     // case 1: user commit rowset, then the load id must be equal
-                    load_info = &load_itr->second;
-                    rowset_ptr = load_info->rowset;
+                    load_info = load_itr->second;
+                    rowset_ptr = load_info.rowset;
                 }
             }
         }
@@ -314,14 +332,13 @@ Status TxnManager::publish_txn(OlapMeta* meta, TPartitionId partition_id,
             rowset_ptr->make_visible(version);
             // update delete_bitmap
             {
-                if (load_info != nullptr && load_info->unique_key_merge_on_write) {
+                if (load_info.unique_key_merge_on_write) {
                     auto tablet =
                             StorageEngine::instance()->tablet_manager()->get_tablet(tablet_id);
                     if (tablet == nullptr) {
                         return Status::OK();
                     }
-                    RETURN_IF_ERROR(tablet->update_delete_bitmap(
-                            rowset_ptr, load_info->delete_bitmap, load_info->rowset_ids));
+                    RETURN_IF_ERROR(tablet->update_delete_bitmap(rowset_ptr, &load_info));
                     std::shared_lock rlock(tablet->get_header_lock());
                     tablet->save_meta();
                 }
@@ -333,10 +350,10 @@ Status TxnManager::publish_txn(OlapMeta* meta, TPartitionId partition_id,
                 LOG(WARNING) << "save committed rowset failed. when publish txn rowset_id:"
                              << rowset_ptr->rowset_id() << ", tablet id: " << tablet_id
                              << ", txn id:" << transaction_id;
-                return Status::OLAPInternalError(OLAP_ERR_ROWSET_SAVE_FAILED);
+                return Status::Error<ROWSET_SAVE_FAILED>();
             }
         } else {
-            return Status::OLAPInternalError(OLAP_ERR_TRANSACTION_NOT_EXIST);
+            return Status::Error<TRANSACTION_NOT_EXIST>();
         }
     }
     {
@@ -380,7 +397,7 @@ Status TxnManager::rollback_txn(TPartitionId partition_id, TTransactionId transa
             if (load_info.rowset != nullptr) {
                 // if rowset is not null, it means other thread may commit the rowset
                 // should not delete txn any more
-                return Status::OLAPInternalError(OLAP_ERR_TRANSACTION_ALREADY_COMMITTED);
+                return Status::Error<TRANSACTION_ALREADY_COMMITTED>();
             }
         }
         it->second.erase(tablet_info);
@@ -406,7 +423,7 @@ Status TxnManager::delete_txn(OlapMeta* meta, TPartitionId partition_id,
     txn_tablet_map_t& txn_tablet_map = _get_txn_tablet_map(transaction_id);
     auto it = txn_tablet_map.find(key);
     if (it == txn_tablet_map.end()) {
-        return Status::OLAPInternalError(OLAP_ERR_TRANSACTION_NOT_EXIST);
+        return Status::Error<TRANSACTION_NOT_EXIST>();
     }
     auto load_itr = it->second.find(tablet_info);
     if (load_itr != it->second.end()) {
@@ -422,7 +439,7 @@ Status TxnManager::delete_txn(OlapMeta* meta, TPartitionId partition_id,
                              << ", tablet: " << tablet_info.to_string()
                              << ", rowset id: " << load_info.rowset->rowset_id()
                              << ", version: " << load_info.rowset->version().first;
-                return Status::OLAPInternalError(OLAP_ERR_TRANSACTION_ALREADY_COMMITTED);
+                return Status::Error<TRANSACTION_ALREADY_COMMITTED>();
             } else {
                 RowsetMetaManager::remove(meta, tablet_uid, load_info.rowset->rowset_id());
 #ifndef BE_TEST

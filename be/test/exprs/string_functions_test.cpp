@@ -129,27 +129,6 @@ TEST_F(StringFunctionsTest, money_format_double) {
     delete context;
 }
 
-TEST_F(StringFunctionsTest, money_format_decimal_v2) {
-    doris_udf::FunctionContext* context = new doris_udf::FunctionContext();
-
-    DecimalV2Value dv1(std::string("3333333333.2222222222"));
-    DecimalV2Val value1;
-    dv1.to_decimal_val(&value1);
-
-    StringVal result = StringFunctions::money_format(context, value1);
-    StringVal expected = AnyValUtil::from_string(ctx, std::string("3,333,333,333.22"));
-    EXPECT_EQ(expected, result);
-
-    DecimalV2Value dv2(std::string("-740740740.71604938271975308642"));
-    DecimalV2Val value2;
-    dv2.to_decimal_val(&value2);
-
-    result = StringFunctions::money_format(context, value2);
-    expected = AnyValUtil::from_string(ctx, std::string("-740,740,740.72"));
-    EXPECT_EQ(expected, result);
-    delete context;
-}
-
 TEST_F(StringFunctionsTest, split_part) {
     doris_udf::FunctionContext* context = new doris_udf::FunctionContext();
 
@@ -187,6 +166,55 @@ TEST_F(StringFunctionsTest, split_part) {
             AnyValUtil::from_string(ctx, std::string("#123")),
             StringFunctions::split_part(context, StringVal("abc###123###234"), StringVal("##"), 2));
 
+    EXPECT_EQ(AnyValUtil::from_string(ctx, std::string("234")),
+              StringFunctions::split_part(context, StringVal("abc###123###234"), StringVal("##"),
+                                          -1));
+
+    EXPECT_EQ(AnyValUtil::from_string(ctx, std::string("123#")),
+              StringFunctions::split_part(context, StringVal("abc###123###234"), StringVal("##"),
+                                          -2));
+
+    EXPECT_EQ(AnyValUtil::from_string(ctx, std::string("abc#")),
+              StringFunctions::split_part(context, StringVal("abc###123###234"), StringVal("##"),
+                                          -3));
+
+    EXPECT_EQ(StringVal::null(), StringFunctions::split_part(context, StringVal("abc###123###234"),
+                                                             StringVal("##"), -4));
+
+    EXPECT_EQ(AnyValUtil::from_string(ctx, std::string("234")),
+              StringFunctions::split_part(context, StringVal("abc#123##234"), StringVal("#"), -1));
+
+    EXPECT_EQ(AnyValUtil::from_string(ctx, std::string("")),
+              StringFunctions::split_part(context, StringVal("abc#123##234"), StringVal("#"), -2));
+
+    EXPECT_EQ(AnyValUtil::from_string(ctx, std::string("123")),
+              StringFunctions::split_part(context, StringVal("abc#123##234"), StringVal("#"), -3));
+
+    EXPECT_EQ(AnyValUtil::from_string(ctx, std::string("abc")),
+              StringFunctions::split_part(context, StringVal("abc#123##234"), StringVal("#"), -4));
+
+    EXPECT_EQ(StringVal::null(),
+              StringFunctions::split_part(context, StringVal("abc#123##234"), StringVal("#"), -5));
+
+    EXPECT_EQ(StringVal::null(), StringFunctions::split_part(context, StringVal("abc#123##234"),
+                                                             StringVal("#"), IntVal::null()));
+
+    EXPECT_EQ(StringVal::null(), StringFunctions::split_part(context, StringVal("abc#123##234"),
+                                                             StringVal::null(), -1));
+
+    EXPECT_EQ(
+            AnyValUtil::from_string(ctx, std::string("")),
+            StringFunctions::split_part(context, StringVal("2019年9月-12月"), StringVal("月"), -1));
+    EXPECT_EQ(
+            AnyValUtil::from_string(ctx, std::string("-12")),
+            StringFunctions::split_part(context, StringVal("2019年9月-12月"), StringVal("月"), -2));
+
+    EXPECT_EQ(
+            AnyValUtil::from_string(ctx, std::string("2019年9")),
+            StringFunctions::split_part(context, StringVal("2019年9月-12月"), StringVal("月"), -3));
+
+    EXPECT_EQ(StringVal::null(), StringFunctions::split_part(context, StringVal("2019年9月-12月"),
+                                                             StringVal("月"), -4));
     delete context;
 }
 

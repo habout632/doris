@@ -63,8 +63,6 @@ void NewFileScanNode::set_scan_ranges(const std::vector<TScanRangeParams>& scan_
         LOG(INFO) << "Merge " << scan_ranges.size() << " scan ranges to " << _scan_ranges.size();
     }
     if (scan_ranges.size() > 0) {
-        _input_tuple_id =
-                scan_ranges[0].scan_range.ext_scan_range.file_scan_range.params.src_tuple_id;
         _output_tuple_id =
                 scan_ranges[0].scan_range.ext_scan_range.file_scan_range.params.dest_tuple_id;
     }
@@ -100,8 +98,8 @@ Status NewFileScanNode::_init_scanners(std::list<VScanner*>* scanners) {
 }
 
 VScanner* NewFileScanNode::_create_scanner(const TFileScanRange& scan_range) {
-    VScanner* scanner =
-            new VFileScanner(_state, this, _limit_per_scanner, scan_range, runtime_profile());
+    VScanner* scanner = new VFileScanner(_state, this, _limit_per_scanner, scan_range,
+                                         runtime_profile(), _kv_cache);
     ((VFileScanner*)scanner)->prepare(_vconjunct_ctx_ptr.get(), &_colname_to_value_range);
     _scanner_pool.add(scanner);
     // TODO: Can we remove _conjunct_ctxs and use _vconjunct_ctx_ptr instead?

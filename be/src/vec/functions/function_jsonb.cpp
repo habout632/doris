@@ -18,6 +18,11 @@
 #include <boost/token_functions.hpp>
 #include <vector>
 
+#ifdef __AVX2__
+#include "util/jsonb_parser_simd.h"
+#else
+#include "util/jsonb_parser.h"
+#endif
 #include "util/string_parser.hpp"
 #include "util/string_util.h"
 #include "vec/columns/column.h"
@@ -193,6 +198,10 @@ public:
         size_t size = col_from.size();
         col_to->reserve(size);
 
+        // parser can be reused for performance
+        JsonbParser parser;
+        JsonbErrType error = JsonbErrType::E_NONE;
+
         for (size_t i = 0; i < input_rows_count; ++i) {
             if (col_from.is_null_at(i)) {
                 null_map->get_data()[i] = 1;
@@ -201,8 +210,6 @@ public:
             }
 
             const auto& val = col_from_string->get_data_at(i);
-            JsonbParser parser;
-            JsonbErrType error = JsonbErrType::E_NONE;
             if (parser.parse(val.data, val.size)) {
                 // insert jsonb format data
                 col_to->insert_data(parser.getWriter().getOutput()->getBuffer(),

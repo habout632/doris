@@ -32,6 +32,7 @@
 #include "olap/wrapper_field.h"
 #include "runtime/memory/mem_tracker.h"
 #include "util/defer_op.h"
+#include "util/trace.h"
 #include "vec/aggregate_functions/aggregate_function.h"
 #include "vec/aggregate_functions/aggregate_function_reader.h"
 #include "vec/aggregate_functions/aggregate_function_simple_factory.h"
@@ -43,6 +44,7 @@
 using std::nothrow;
 
 namespace doris {
+using namespace ErrorCode;
 
 constexpr int ALTER_TABLE_BATCH_SIZE = 4096;
 
@@ -158,7 +160,7 @@ public:
                         agg_functions[j - key_number]->insert_result_into(
                                 agg_places[j - key_number],
                                 finalized_block.get_by_position(j).column->assume_mutable_ref());
-                        agg_functions[j - key_number]->create(agg_places[j - key_number]);
+                        agg_functions[j - key_number]->reset(agg_places[j - key_number]);
                     }
 
                     if (i == rows - 1 || finalized_block.rows() == ALTER_TABLE_BATCH_SIZE) {
@@ -315,7 +317,7 @@ ColumnMapping* RowBlockChanger::get_mutable_column_mapping(size_t column_index) 
                          << " origin_type="                                                      \
                          << ref_block->tablet_schema()->column(ref_column).type()                \
                          << ", alter_type=" << mutable_block->tablet_schema()->column(i).type(); \
-            return Status::OLAPInternalError(OLAP_ERR_SCHEMA_CHANGE_INFO_INVALID);               \
+            return Status::Error<SCHEMA_CHANGE_INFO_INVALID>();                                  \
         }                                                                                        \
         break;                                                                                   \
     }
@@ -580,19 +582,19 @@ Status RowBlockChanger::change_row_block(const RowBlock* ref_block, int32_t data
                                          const uint64_t* filtered_rows) const {
     if (mutable_block == nullptr) {
         LOG(FATAL) << "mutable block is uninitialized.";
-        return Status::OLAPInternalError(OLAP_ERR_NOT_INITED);
+        return Status::Error<UNINITIALIZED>();
     } else if (mutable_block->tablet_schema()->num_columns() != _schema_mapping.size()) {
         LOG(WARNING) << "mutable block does not match with schema mapping rules. "
                      << "block_schema_size=" << mutable_block->tablet_schema()->num_columns()
                      << ", mapping_schema_size=" << _schema_mapping.size();
-        return Status::OLAPInternalError(OLAP_ERR_NOT_INITED);
+        return Status::Error<UNINITIALIZED>();
     }
 
     if (mutable_block->capacity() < ref_block->row_block_info().row_num) {
         LOG(WARNING) << "mutable block is not large enough for storing the changed block. "
                      << "mutable_block_size=" << mutable_block->capacity()
                      << ", ref_block_row_num=" << ref_block->row_block_info().row_num;
-        return Status::OLAPInternalError(OLAP_ERR_NOT_INITED);
+        return Status::Error<UNINITIALIZED>();
     }
 
     mutable_block->clear();
@@ -600,13 +602,13 @@ Status RowBlockChanger::change_row_block(const RowBlock* ref_block, int32_t data
     RowCursor write_helper;
     if (write_helper.init(mutable_block->tablet_schema()) != Status::OK()) {
         LOG(WARNING) << "fail to init rowcursor.";
-        return Status::OLAPInternalError(OLAP_ERR_NOT_INITED);
+        return Status::Error<UNINITIALIZED>();
     }
 
     RowCursor read_helper;
     if (read_helper.init(ref_block->tablet_schema()) != Status::OK()) {
         LOG(WARNING) << "fail to init rowcursor.";
-        return Status::OLAPInternalError(OLAP_ERR_NOT_INITED);
+        return Status::Error<UNINITIALIZED>();
     }
 
     // a.1 First determine whether the data needs to be filtered, and finally only those marked as 1 are left as needed
@@ -637,7 +639,7 @@ Status RowBlockChanger::change_row_block(const RowBlock* ref_block, int32_t data
                 } else {
                     LOG(WARNING) << "error materialized view function : "
                                  << _schema_mapping[i].materialized_function;
-                    return Status::OLAPInternalError(OLAP_ERR_SCHEMA_CHANGE_INFO_INVALID);
+                    return Status::Error<SCHEMA_CHANGE_INFO_INVALID>();
                 }
                 VLOG_NOTICE << "_schema_mapping[" << i << "].materialized_function : "
                             << _schema_mapping[i].materialized_function;
@@ -649,7 +651,7 @@ Status RowBlockChanger::change_row_block(const RowBlock* ref_block, int32_t data
                     if (!_do_materialized_transform(&read_helper, &write_helper,
                                                     ref_block->tablet_schema()->column(ref_column),
                                                     i, _schema_mapping[i].ref_column, mem_pool)) {
-                        return Status::OLAPInternalError(OLAP_ERR_DATA_QUALITY_ERR);
+                        return Status::Error<DATA_QUALITY_ERR>();
                     }
                 }
                 continue;
@@ -738,7 +740,7 @@ Status RowBlockChanger::change_row_block(const RowBlock* ref_block, int32_t data
                     LOG(WARNING) << "the column type which was altered from was unsupported."
                                  << " from_type="
                                  << ref_block->tablet_schema()->column(ref_column).type();
-                    return Status::OLAPInternalError(OLAP_ERR_SCHEMA_CHANGE_INFO_INVALID);
+                    return Status::Error<SCHEMA_CHANGE_INFO_INVALID>();
                 }
 
                 if (newtype < reftype) {
@@ -784,7 +786,7 @@ Status RowBlockChanger::change_block(vectorized::Block* ref_block,
         LOG(WARNING) << "block does not match with schema mapping rules. "
                      << "block_schema_size=" << new_block->columns()
                      << ", mapping_schema_size=" << _schema_mapping.size();
-        return Status::OLAPInternalError(OLAP_ERR_NOT_INITED);
+        return Status::Error<UNINITIALIZED>();
     }
 
     ObjectPool pool;
@@ -1017,7 +1019,7 @@ Status RowBlockAllocator::allocate(RowBlock** row_block, size_t num_rows, bool n
 
     if (_memory_limitation > 0 && _tracker->consumption() + row_block_size > _memory_limitation) {
         *row_block = nullptr;
-        return Status::OLAPInternalError(OLAP_ERR_FETCH_MEMORY_EXCEEDED);
+        return Status::Error<FETCH_MEMORY_EXCEEDED>();
     }
 
     // TODO(lijiao) : Why abandon the original m_row_block_buffer
@@ -1025,7 +1027,7 @@ Status RowBlockAllocator::allocate(RowBlock** row_block, size_t num_rows, bool n
 
     if (*row_block == nullptr) {
         LOG(WARNING) << "failed to malloc RowBlock. size=" << sizeof(RowBlock);
-        return Status::OLAPInternalError(OLAP_ERR_MALLOC_ERROR);
+        return Status::Error<MEM_ALLOC_FAILED>();
     }
 
     RowBlockInfo row_block_info(0U, num_rows);
@@ -1263,7 +1265,7 @@ Status SchemaChangeDirectly::_inner_process(RowsetReaderSharedPtr rowset_reader,
         _row_block_allocator = new RowBlockAllocator(new_tablet->tablet_schema(), 0);
         if (_row_block_allocator == nullptr) {
             LOG(FATAL) << "failed to malloc RowBlockAllocator. size=" << sizeof(RowBlockAllocator);
-            return Status::OLAPInternalError(OLAP_ERR_INPUT_PARAMETER_ERROR);
+            return Status::Error<INVALID_ARGUMENT>();
         }
     }
 
@@ -1271,12 +1273,12 @@ Status SchemaChangeDirectly::_inner_process(RowsetReaderSharedPtr rowset_reader,
         _cursor = new (nothrow) RowCursor();
         if (nullptr == _cursor) {
             LOG(WARNING) << "fail to allocate row cursor.";
-            return Status::OLAPInternalError(OLAP_ERR_INPUT_PARAMETER_ERROR);
+            return Status::Error<INVALID_ARGUMENT>();
         }
 
         if (!_cursor->init(new_tablet->tablet_schema())) {
             LOG(WARNING) << "fail to init row cursor.";
-            return Status::OLAPInternalError(OLAP_ERR_INPUT_PARAMETER_ERROR);
+            return Status::Error<INVALID_ARGUMENT>();
         }
     }
 
@@ -1309,7 +1311,7 @@ Status SchemaChangeDirectly::_inner_process(RowsetReaderSharedPtr rowset_reader,
         _add_filtered_rows(filtered_rows);
 
         if (!_write_row_block(rowset_writer, new_row_block.get())) {
-            res = Status::OLAPInternalError(OLAP_ERR_SCHEMA_CHANGE_INFO_INVALID);
+            res = Status::Error<SCHEMA_CHANGE_INFO_INVALID>();
             LOG(WARNING) << "failed to write row block.";
             return res;
         }
@@ -1319,7 +1321,7 @@ Status SchemaChangeDirectly::_inner_process(RowsetReaderSharedPtr rowset_reader,
     }
 
     if (!rowset_writer->flush()) {
-        return Status::OLAPInternalError(OLAP_ERR_ALTER_STATUS_ERR);
+        return Status::Error<ALTER_STATUS_ERR>();
     }
 
     return res;
@@ -1344,7 +1346,7 @@ Status VSchemaChangeDirectly::_inner_process(RowsetReaderSharedPtr rowset_reader
     } while (true);
 
     if (!rowset_writer->flush()) {
-        return Status::OLAPInternalError(OLAP_ERR_ALTER_STATUS_ERR);
+        return Status::Error<ALTER_STATUS_ERR>();
     }
 
     return Status::OK();
@@ -1380,7 +1382,7 @@ Status SchemaChangeWithSorting::_inner_process(RowsetReaderSharedPtr rowset_read
                 new (nothrow) RowBlockAllocator(new_tablet->tablet_schema(), _memory_limitation);
         if (_row_block_allocator == nullptr) {
             LOG(FATAL) << "failed to malloc RowBlockAllocator. size=" << sizeof(RowBlockAllocator);
-            return Status::OLAPInternalError(OLAP_ERR_INPUT_PARAMETER_ERROR);
+            return Status::Error<INVALID_ARGUMENT>();
         }
     }
 
@@ -1424,8 +1426,8 @@ Status SchemaChangeWithSorting::_inner_process(RowsetReaderSharedPtr rowset_read
         // that mean RowBlockAllocator::alocate() memory exceeded.
         // But we can flush row_block_arr if row_block_arr is not empty.
         // Don't return directly.
-        if (OLAP_ERR_MALLOC_ERROR == st.precise_code()) {
-            return Status::OLAPInternalError(OLAP_ERR_MALLOC_ERROR);
+        if (st.is<MEM_ALLOC_FAILED>()) {
+            return st;
         } else if (st) {
             // do memory check for sorting, in case schema change task fail at row block sorting because of
             // not doing internal sorting first
@@ -1440,12 +1442,11 @@ Status SchemaChangeWithSorting::_inner_process(RowsetReaderSharedPtr rowset_read
 
         if (new_row_block == nullptr) {
             if (row_block_arr.empty()) {
-                LOG(WARNING) << "Memory limitation is too small for Schema Change."
+                LOG(WARNING) << "Memory limitation is too small for Schema Change: "
                              << "memory_limitation=" << _memory_limitation
-                             << "You can increase the memory "
-                             << "by changing the "
-                                "Config.memory_limitation_per_thread_for_schema_change_bytes";
-                return Status::OLAPInternalError(OLAP_ERR_FETCH_MEMORY_EXCEEDED);
+                             << ". You can increase the memory by changing the config: "
+                             << "memory_limitation_per_thread_for_schema_change_bytes";
+                return Status::Error<FETCH_MEMORY_EXCEEDED>();
             }
 
             // enter here while memory limitation is reached.
@@ -1456,7 +1457,7 @@ Status SchemaChangeWithSorting::_inner_process(RowsetReaderSharedPtr rowset_read
                         oldest_write_timestamp, newest_write_timestamp, new_tablet,
                         segments_overlap, &rowset)) {
                 LOG(WARNING) << "failed to sorting internally.";
-                return Status::OLAPInternalError(OLAP_ERR_ALTER_STATUS_ERR);
+                return Status::Error<ALTER_STATUS_ERR>();
             }
 
             src_rowsets.push_back(rowset);
@@ -1486,7 +1487,7 @@ Status SchemaChangeWithSorting::_inner_process(RowsetReaderSharedPtr rowset_read
             if (!row_block_sorter.sort(&new_row_block)) {
                 row_block_arr.push_back(new_row_block);
                 LOG(WARNING) << "failed to sort row block.";
-                return Status::OLAPInternalError(OLAP_ERR_ALTER_STATUS_ERR);
+                return Status::Error<ALTER_STATUS_ERR>();
             }
             row_block_arr.push_back(new_row_block);
         } else {
@@ -1508,7 +1509,7 @@ Status SchemaChangeWithSorting::_inner_process(RowsetReaderSharedPtr rowset_read
                                oldest_write_timestamp, newest_write_timestamp, new_tablet,
                                segments_overlap, &rowset)) {
             LOG(WARNING) << "failed to sorting internally.";
-            return Status::OLAPInternalError(OLAP_ERR_ALTER_STATUS_ERR);
+            return Status::Error<ALTER_STATUS_ERR>();
         }
 
         src_rowsets.push_back(rowset);
@@ -1529,11 +1530,11 @@ Status SchemaChangeWithSorting::_inner_process(RowsetReaderSharedPtr rowset_read
             LOG(WARNING) << "create empty version for schema change failed."
                          << " version=" << rowset_writer->version().first << "-"
                          << rowset_writer->version().second;
-            return Status::OLAPInternalError(OLAP_ERR_ALTER_STATUS_ERR);
+            return Status::Error<ALTER_STATUS_ERR>();
         }
     } else if (!_external_sorting(src_rowsets, rowset_writer, new_tablet)) {
         LOG(WARNING) << "failed to sorting externally.";
-        return Status::OLAPInternalError(OLAP_ERR_ALTER_STATUS_ERR);
+        return Status::Error<ALTER_STATUS_ERR>();
     }
 
     return res;
@@ -1604,7 +1605,7 @@ Status VSchemaChangeWithSorting::_inner_process(RowsetReaderSharedPtr rowset_rea
                              << " _memory_limitation=" << _memory_limitation
                              << ", new_block->allocated_bytes()=" << new_block->allocated_bytes()
                              << ", consumption=" << _mem_tracker->consumption();
-                return Status::OLAPInternalError(OLAP_ERR_INPUT_PARAMETER_ERROR);
+                return Status::Error<INVALID_ARGUMENT>();
             }
         }
         _mem_tracker->consume(new_block->allocated_bytes());
@@ -1730,9 +1731,9 @@ Status VSchemaChangeWithSorting::_external_sorting(vector<RowsetSharedPtr>& src_
 
 Status SchemaChangeHandler::process_alter_tablet_v2(const TAlterTabletReqV2& request) {
     if (!request.__isset.desc_tbl) {
-        return Status::OLAPInternalError(OLAP_ERR_INPUT_PARAMETER_ERROR)
-                .append("desc_tbl is not set. Maybe the FE version is not equal to the BE "
-                        "version.");
+        return Status::Error<INVALID_ARGUMENT>().append(
+                "desc_tbl is not set. Maybe the FE version is not equal to the BE "
+                "version.");
     }
 
     LOG(INFO) << "begin to do request alter tablet: base_tablet_id=" << request.base_tablet_id
@@ -1743,7 +1744,7 @@ Status SchemaChangeHandler::process_alter_tablet_v2(const TAlterTabletReqV2& req
             StorageEngine::instance()->tablet_manager()->get_tablet(request.base_tablet_id);
     if (base_tablet == nullptr) {
         LOG(WARNING) << "fail to find base tablet. base_tablet=" << request.base_tablet_id;
-        return Status::OLAPInternalError(OLAP_ERR_TABLE_NOT_FOUND);
+        return Status::Error<TABLE_NOT_FOUND>();
     }
     // Lock schema_change_lock util schema change info is stored in tablet header
     std::unique_lock<std::mutex> schema_change_lock(base_tablet->get_schema_change_lock(),
@@ -1751,7 +1752,7 @@ Status SchemaChangeHandler::process_alter_tablet_v2(const TAlterTabletReqV2& req
     if (!schema_change_lock.owns_lock()) {
         LOG(WARNING) << "failed to obtain schema change lock. "
                      << "base_tablet=" << request.base_tablet_id;
-        return Status::OLAPInternalError(OLAP_ERR_TRY_LOCK_FAILED);
+        return Status::Error<TRY_LOCK_FAILED>();
     }
 
     Status res = _do_process_alter_tablet_v2(request);
@@ -1775,7 +1776,7 @@ Status SchemaChangeHandler::_do_process_alter_tablet_v2(const TAlterTabletReqV2&
             StorageEngine::instance()->tablet_manager()->get_tablet(request.base_tablet_id);
     if (base_tablet == nullptr) {
         LOG(WARNING) << "fail to find base tablet. base_tablet=" << request.base_tablet_id;
-        return Status::OLAPInternalError(OLAP_ERR_TABLE_NOT_FOUND);
+        return Status::Error<TABLE_NOT_FOUND>();
     }
 
     // new tablet has to exist
@@ -1784,7 +1785,7 @@ Status SchemaChangeHandler::_do_process_alter_tablet_v2(const TAlterTabletReqV2&
     if (new_tablet == nullptr) {
         LOG(WARNING) << "fail to find new tablet."
                      << " new_tablet=" << request.new_tablet_id;
-        return Status::OLAPInternalError(OLAP_ERR_TABLE_NOT_FOUND);
+        return Status::Error<TABLE_NOT_FOUND>();
     }
 
     // check if tablet's state is not_ready, if it is ready, it means the tablet already finished
@@ -1804,11 +1805,11 @@ Status SchemaChangeHandler::_do_process_alter_tablet_v2(const TAlterTabletReqV2&
 
     std::shared_lock base_migration_rlock(base_tablet->get_migration_lock(), std::try_to_lock);
     if (!base_migration_rlock.owns_lock()) {
-        return Status::OLAPInternalError(OLAP_ERR_RWLOCK_ERROR);
+        return Status::Error<TRY_LOCK_FAILED>();
     }
     std::shared_lock new_migration_rlock(new_tablet->get_migration_lock(), std::try_to_lock);
     if (!new_migration_rlock.owns_lock()) {
-        return Status::OLAPInternalError(OLAP_ERR_RWLOCK_ERROR);
+        return Status::Error<TRY_LOCK_FAILED>();
     }
 
     std::vector<Version> versions_to_be_changed;
@@ -1846,6 +1847,7 @@ Status SchemaChangeHandler::_do_process_alter_tablet_v2(const TAlterTabletReqV2&
         std::lock_guard<std::mutex> base_tablet_lock(base_tablet->get_push_lock());
         std::lock_guard<std::mutex> new_tablet_lock(new_tablet->get_push_lock());
         std::lock_guard<std::shared_mutex> base_tablet_wlock(base_tablet->get_header_lock());
+        SCOPED_SIMPLE_TRACE_IF_TIMEOUT(TRACE_TABLET_LOCK_THRESHOLD);
         std::lock_guard<std::shared_mutex> new_tablet_wlock(new_tablet->get_header_lock());
 
         do {
@@ -1887,7 +1889,7 @@ Status SchemaChangeHandler::_do_process_alter_tablet_v2(const TAlterTabletReqV2&
                     LOG(WARNING) << "New tablet has a version " << pair.first
                                  << " crossing base tablet's max_version="
                                  << max_rowset->end_version();
-                    return Status::OLAPInternalError(OLAP_ERR_VERSION_ALREADY_MERGED);
+                    return Status::Error<VERSION_ALREADY_MERGED>();
                 }
             }
             std::vector<RowsetSharedPtr> empty_vec;
@@ -1913,7 +1915,7 @@ Status SchemaChangeHandler::_do_process_alter_tablet_v2(const TAlterTabletReqV2&
                 LOG(WARNING) << "fail to acquire all data sources. "
                              << "version_num=" << versions_to_be_changed.size()
                              << ", data_source_num=" << rs_readers.size();
-                res = Status::OLAPInternalError(OLAP_ERR_ALTER_DELTA_DOES_NOT_EXISTS);
+                res = Status::Error<ALTER_DELTA_DOES_NOT_EXISTS>();
                 break;
             }
             auto& all_del_preds = base_tablet->delete_predicates();
@@ -1964,6 +1966,18 @@ Status SchemaChangeHandler::_do_process_alter_tablet_v2(const TAlterTabletReqV2&
         sc_params.ref_rowset_readers = rs_readers;
         sc_params.delete_handler = &delete_handler;
         sc_params.base_tablet_schema = base_tablet_schema;
+        DCHECK(request.__isset.alter_tablet_type);
+        switch (request.alter_tablet_type) {
+        case TAlterTabletType::SCHEMA_CHANGE:
+            sc_params.alter_tablet_type = AlterTabletType::SCHEMA_CHANGE;
+            break;
+        case TAlterTabletType::ROLLUP:
+            sc_params.alter_tablet_type = AlterTabletType::ROLLUP;
+            break;
+        case TAlterTabletType::MIGRATION:
+            sc_params.alter_tablet_type = AlterTabletType::MIGRATION;
+            break;
+        }
         if (request.__isset.materialized_view_params) {
             for (auto item : request.materialized_view_params) {
                 AlterMaterializedViewParam mv_param;
@@ -2052,7 +2066,8 @@ Status SchemaChangeHandler::_do_process_alter_tablet_v2(const TAlterTabletReqV2&
             // step 3
             std::lock_guard<std::mutex> rwlock(new_tablet->get_rowset_update_lock());
             std::lock_guard<std::shared_mutex> new_wlock(new_tablet->get_header_lock());
-            int64_t new_max_version = new_tablet->max_version().second;
+            SCOPED_SIMPLE_TRACE_IF_TIMEOUT(TRACE_TABLET_LOCK_THRESHOLD);
+            int64_t new_max_version = new_tablet->max_version_unlocked().second;
             rowsets.clear();
             if (max_version < new_max_version) {
                 LOG(INFO)
@@ -2082,6 +2097,7 @@ Status SchemaChangeHandler::_do_process_alter_tablet_v2(const TAlterTabletReqV2&
         } else {
             // set state to ready
             std::lock_guard<std::shared_mutex> new_wlock(new_tablet->get_header_lock());
+            SCOPED_SIMPLE_TRACE_IF_TIMEOUT(TRACE_TABLET_LOCK_THRESHOLD);
             res = new_tablet->set_tablet_state(TabletState::TABLET_RUNNING);
             if (!res) {
                 break;
@@ -2117,12 +2133,12 @@ Status SchemaChangeHandler::_get_versions_to_be_changed(
     RowsetSharedPtr rowset = base_tablet->rowset_with_max_version();
     if (rowset == nullptr) {
         LOG(WARNING) << "Tablet has no version. base_tablet=" << base_tablet->full_name();
-        return Status::OLAPInternalError(OLAP_ERR_ALTER_DELTA_DOES_NOT_EXISTS);
+        return Status::Error<ALTER_DELTA_DOES_NOT_EXISTS>();
     }
     *max_rowset = rowset;
 
     RETURN_NOT_OK(base_tablet->capture_consistent_versions(Version(0, rowset->version().second),
-                                                           versions_to_be_changed));
+                                                           versions_to_be_changed, false, false));
 
     return Status::OK();
 }
@@ -2150,11 +2166,16 @@ Status SchemaChangeHandler::_convert_historical_rowsets(const SchemaChangeParams
 
     // a.Parse the Alter request and convert it into an internal representation
     Status res = _parse_request(sc_params, &rb_changer, &sc_sorting, &sc_directly);
+    LOG(INFO) << "schema change type, sc_sorting: " << sc_sorting
+              << ", sc_directly: " << sc_directly
+              << ", base_tablet=" << sc_params.base_tablet->full_name()
+              << ", new_tablet=" << sc_params.new_tablet->full_name();
 
     auto process_alter_exit = [&]() -> Status {
         {
             // save tablet meta here because rowset meta is not saved during add rowset
             std::lock_guard<std::shared_mutex> new_wlock(sc_params.new_tablet->get_header_lock());
+            SCOPED_SIMPLE_TRACE_IF_TIMEOUT(TRACE_TABLET_LOCK_THRESHOLD);
             sc_params.new_tablet->save_meta();
         }
         if (res) {
@@ -2170,6 +2191,12 @@ Status SchemaChangeHandler::_convert_historical_rowsets(const SchemaChangeParams
 
     if (!res) {
         LOG(WARNING) << "failed to parse the request. res=" << res;
+        return process_alter_exit();
+    }
+
+    if (!sc_sorting && !sc_directly && sc_params.alter_tablet_type == AlterTabletType::ROLLUP) {
+        res = Status::InternalError(
+                "Don't support to add materialized view by linked schema change");
         return process_alter_exit();
     }
 
@@ -2194,7 +2221,7 @@ Status SchemaChangeHandler::_convert_historical_rowsets(const SchemaChangeParams
                 rs_reader->oldest_write_timestamp(), rs_reader->newest_write_timestamp(),
                 rs_reader->rowset()->rowset_meta()->fs(), &rowset_writer);
         if (!status.ok()) {
-            res = Status::OLAPInternalError(OLAP_ERR_ROWSET_BUILDER_INIT);
+            res = Status::Error<ROWSET_BUILDER_INIT>();
             return process_alter_exit();
         }
 
@@ -2219,7 +2246,7 @@ Status SchemaChangeHandler::_convert_historical_rowsets(const SchemaChangeParams
             return process_alter_exit();
         }
         res = sc_params.new_tablet->add_rowset(new_rowset);
-        if (res.precise_code() == OLAP_ERR_PUSH_VERSION_ALREADY_EXIST) {
+        if (res.is<PUSH_VERSION_ALREADY_EXIST>()) {
             LOG(WARNING) << "version already exist, version revert occurred. "
                          << "tablet=" << sc_params.new_tablet->full_name() << ", version='"
                          << rs_reader->version().first << "-" << rs_reader->version().second;
@@ -2262,7 +2289,7 @@ Status SchemaChangeHandler::_parse_request(const SchemaChangeParams& sc_params,
     for (int i = 0, new_schema_size = new_tablet->tablet_schema()->num_columns();
          i < new_schema_size; ++i) {
         const TabletColumn& new_column = new_tablet->tablet_schema()->column(i);
-        const string& column_name = new_column.name();
+        const std::string& column_name = new_column.name();
         ColumnMapping* column_mapping = rb_changer->get_mutable_column_mapping(i);
         column_mapping->new_column = &new_column;
 
@@ -2278,7 +2305,7 @@ Status SchemaChangeHandler::_parse_request(const SchemaChangeParams& sc_params,
                 LOG(WARNING) << "referenced column was missing. "
                              << "[column=" << column_name << " referenced_column=" << column_index
                              << "]";
-                return Status::OLAPInternalError(OLAP_ERR_CE_CMD_PARAMS_ERROR);
+                return Status::Error<CE_CMD_PARAMS_ERROR>();
             }
         }
 
@@ -2288,6 +2315,11 @@ Status SchemaChangeHandler::_parse_request(const SchemaChangeParams& sc_params,
             continue;
         }
 
+        if (column_name.find("__doris_shadow_") == 0) {
+            // Should delete in the future, just a protection for bug.
+            LOG(INFO) << "a shadow column is encountered " << column_name;
+            return Status::InternalError("failed due to operate on shadow column");
+        }
         // Newly added column go here
         column_mapping->ref_column = -1;
 
@@ -2297,8 +2329,9 @@ Status SchemaChangeHandler::_parse_request(const SchemaChangeParams& sc_params,
         RETURN_IF_ERROR(
                 _init_column_mapping(column_mapping, new_column, new_column.default_value()));
 
-        VLOG_TRACE << "A column with default value will be added after schema changing. "
-                   << "column=" << column_name << ", default_value=" << new_column.default_value();
+        LOG(INFO) << "A column with default value will be added after schema changing. "
+                  << "column=" << column_name << ", default_value=" << new_column.default_value()
+                  << " to table " << new_tablet->get_table_id();
     }
 
     // Check if re-aggregation is needed.
@@ -2341,6 +2374,12 @@ Status SchemaChangeHandler::_parse_request(const SchemaChangeParams& sc_params,
         // is less, which means the data in new tablet should be more aggregated.
         // so we use sorting schema change to sort and merge the data.
         *sc_sorting = true;
+        return Status::OK();
+    }
+
+    if (new_tablet->enable_unique_key_merge_on_write() &&
+        new_tablet->num_key_columns() > base_tablet_schema->num_key_columns()) {
+        *sc_directly = true;
         return Status::OK();
     }
 
@@ -2401,7 +2440,7 @@ Status SchemaChangeHandler::_init_column_mapping(ColumnMapping* column_mapping,
     column_mapping->default_value = WrapperField::create(column_schema);
 
     if (column_mapping->default_value == nullptr) {
-        return Status::OLAPInternalError(OLAP_ERR_MALLOC_ERROR);
+        return Status::Error<MEM_ALLOC_FAILED>();
     }
 
     if (column_schema.is_nullable() && value.length() == 0) {
@@ -2434,7 +2473,7 @@ Status SchemaChangeHandler::_validate_alter_result(TabletSharedPtr new_tablet,
     for (auto& pair : version_rowsets) {
         RowsetSharedPtr rowset = pair.second;
         if (!rowset->check_file_exist()) {
-            return Status::OLAPInternalError(OLAP_ERR_FILE_NOT_EXIST);
+            return Status::Error<FILE_NOT_EXIST>();
         }
     }
     return Status::OK();

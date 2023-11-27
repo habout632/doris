@@ -76,7 +76,7 @@ void SizeBasedCumulativeCompactionPolicy::calculate_cumulative_point(
         CHECK((*base_rowset_meta)->start_version() == 0);
 
         int64_t promotion_size = 0;
-        _calc_promotion_size(*base_rowset_meta, &promotion_size);
+        _calc_promotion_size(tablet, *base_rowset_meta, &promotion_size);
 
         int64_t prev_version = -1;
         for (const RowsetMetaSharedPtr& rs : existing_rss) {
@@ -119,7 +119,8 @@ void SizeBasedCumulativeCompactionPolicy::calculate_cumulative_point(
     }
 }
 
-void SizeBasedCumulativeCompactionPolicy::_calc_promotion_size(RowsetMetaSharedPtr base_rowset_meta,
+void SizeBasedCumulativeCompactionPolicy::_calc_promotion_size(Tablet* tablet,
+                                                               RowsetMetaSharedPtr base_rowset_meta,
                                                                int64_t* promotion_size) {
     int64_t base_size = base_rowset_meta->total_disk_size();
     *promotion_size = base_size * _size_based_promotion_ratio;
@@ -130,12 +131,12 @@ void SizeBasedCumulativeCompactionPolicy::_calc_promotion_size(RowsetMetaSharedP
     } else if (*promotion_size <= _size_based_promotion_min_size) {
         *promotion_size = _size_based_promotion_min_size;
     }
-    _refresh_tablet_size_based_promotion_size(*promotion_size);
+    _refresh_tablet_size_based_promotion_size(tablet, *promotion_size);
 }
 
 void SizeBasedCumulativeCompactionPolicy::_refresh_tablet_size_based_promotion_size(
-        int64_t promotion_size) {
-    _tablet_size_based_promotion_size = promotion_size;
+        Tablet* tablet, int64_t promotion_size) {
+    tablet->set_cumulative_promotion_size(promotion_size);
 }
 
 void SizeBasedCumulativeCompactionPolicy::update_cumulative_point(
@@ -152,14 +153,14 @@ void SizeBasedCumulativeCompactionPolicy::update_cumulative_point(
         // if rowsets have no delete version, check output_rowset total disk size
         // satisfies promotion size.
         size_t total_size = output_rowset->rowset_meta()->total_disk_size();
-        if (total_size >= _tablet_size_based_promotion_size) {
+        if (total_size >= tablet->cumulative_promotion_size()) {
             tablet->set_cumulative_layer_point(output_rowset->end_version() + 1);
         }
     }
 }
 
 void SizeBasedCumulativeCompactionPolicy::calc_cumulative_compaction_score(
-        TabletState state, const std::vector<RowsetMetaSharedPtr>& all_metas,
+        Tablet* tablet, TabletState state, const std::vector<RowsetMetaSharedPtr>& all_metas,
         int64_t current_cumulative_point, uint32_t* score) {
     bool base_rowset_exist = false;
     const int64_t point = current_cumulative_point;
@@ -200,7 +201,7 @@ void SizeBasedCumulativeCompactionPolicy::calc_cumulative_compaction_score(
 
     // Use "first"(not base) version to calc promotion size
     // because some tablet do not have base version(under alter operation)
-    _calc_promotion_size(first_meta, &promotion_size);
+    _calc_promotion_size(tablet, first_meta, &promotion_size);
 
     // If base version does not exist, but its state is RUNNING.
     // It is abnormal, do not select it and set *score = 0
@@ -240,7 +241,8 @@ int SizeBasedCumulativeCompactionPolicy::pick_input_rowsets(
         const int64_t max_compaction_score, const int64_t min_compaction_score,
         std::vector<RowsetSharedPtr>* input_rowsets, Version* last_delete_version,
         size_t* compaction_score) {
-    size_t promotion_size = _tablet_size_based_promotion_size;
+    size_t promotion_size = tablet->cumulative_promotion_size();
+    auto max_version = tablet->max_version().first;
     int transient_size = 0;
     *compaction_score = 0;
     int64_t total_size = 0;
@@ -258,6 +260,13 @@ int SizeBasedCumulativeCompactionPolicy::pick_input_rowsets(
                 input_rowsets->clear();
                 *compaction_score = 0;
                 transient_size = 0;
+                continue;
+            }
+        }
+        if (tablet->tablet_state() == TABLET_NOTREADY) {
+            // If tablet under alter, keep latest 10 version so that base tablet max version
+            // not merged in new tablet, and then we can copy data from base tablet
+            if (rowset->version().second < max_version - 10) {
                 continue;
             }
         }
@@ -290,9 +299,10 @@ int SizeBasedCumulativeCompactionPolicy::pick_input_rowsets(
         return transient_size;
     }
 
-    auto rs_iter = input_rowsets->begin();
-    while (rs_iter != input_rowsets->end()) {
-        auto rs_meta = (*rs_iter)->rowset_meta();
+    auto rs_begin = input_rowsets->begin();
+    size_t new_compaction_score = *compaction_score;
+    while (rs_begin != input_rowsets->end()) {
+        auto& rs_meta = (*rs_begin)->rowset_meta();
         int current_level = _level_size(rs_meta->total_disk_size());
         int remain_level = _level_size(total_size - rs_meta->total_disk_size());
         // if current level less then remain level, input rowsets contain current rowset
@@ -301,10 +311,32 @@ int SizeBasedCumulativeCompactionPolicy::pick_input_rowsets(
             break;
         }
         total_size -= rs_meta->total_disk_size();
-        *compaction_score -= rs_meta->get_compaction_score();
-
-        rs_iter = input_rowsets->erase(rs_iter);
+        new_compaction_score -= rs_meta->get_compaction_score();
+        ++rs_begin;
     }
+    if (rs_begin == input_rowsets->end() && *compaction_score >= max_compaction_score) {
+        // No suitable level size found in `input_rowsets` but score of `input_rowsets` exceed max compaction score,
+        // which means `input_rowsets` will never change and this tablet will never execute cumulative compaction.
+        // MUST execute compaction on these `input_rowsets` to reduce compaction score.
+        RowsetSharedPtr rs_with_max_score;
+        uint32_t max_score = 1;
+        for (auto& rs : *input_rowsets) {
+            if (rs->rowset_meta()->get_compaction_score() > max_score) {
+                max_score = rs->rowset_meta()->get_compaction_score();
+                rs_with_max_score = rs;
+            }
+        }
+        if (rs_with_max_score) {
+            input_rowsets->clear();
+            input_rowsets->push_back(std::move(rs_with_max_score));
+            *compaction_score = max_score;
+            return transient_size;
+        }
+        // no rowset is OVERLAPPING, execute compaction on all input rowsets
+        return transient_size;
+    }
+    input_rowsets->erase(input_rowsets->begin(), rs_begin);
+    *compaction_score = new_compaction_score;
 
     VLOG_CRITICAL << "cumulative compaction size_based policy, compaction_score = "
                   << *compaction_score << ", total_size = " << total_size

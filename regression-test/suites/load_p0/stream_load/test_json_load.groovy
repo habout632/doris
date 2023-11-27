@@ -116,8 +116,6 @@ suite("test_json_load", "p0") {
     
     def load_json_data = {new_json_reader_flag, label, strip_flag, read_flag, format_flag, exprs, json_paths, 
                         json_root, where_expr, fuzzy_flag, file_name, ignore_failure=false ->
-        // should be delete after new_load_scan is ready
-        sql """ADMIN SET FRONTEND CONFIG ("enable_new_load_scan_node" = "${new_json_reader_flag}");"""
         
         // load the json data
         streamLoad {
@@ -150,9 +148,6 @@ suite("test_json_load", "p0") {
                 assertTrue(json.NumberLoadedRows > 0 && json.LoadBytes > 0)
             }
         }
-
-        // should be deleted after new_load_scan is ready
-        sql """ADMIN SET FRONTEND CONFIG ("enable_new_load_scan_node" = "false");"""
     }
     
     def load_from_hdfs1 = {testTablex, label, hdfsFilePath, format, brokerName, hdfsUser, hdfsPasswd ->
@@ -529,8 +524,6 @@ suite("test_json_load", "p0") {
     try {
         sql "DROP TABLE IF EXISTS ${testTable}"
         create_test_table3.call(testTable)
-        // should be delete after new_load_scan is ready
-        sql """ADMIN SET FRONTEND CONFIG ("enable_new_load_scan_node" = "false");"""
         // load the json data
         streamLoad {
             table "${testTable}"
@@ -557,16 +550,12 @@ suite("test_json_load", "p0") {
                 assertTrue(json.NumberLoadedRows > 0 && json.LoadBytes > 0)
             }
         }
-        // should be deleted after new_load_scan is ready
-        sql """ADMIN SET FRONTEND CONFIG ("enable_new_load_scan_node" = "false");"""
         sql "sync"
         qt_select13 "select * from ${testTable} order by id"
 
 
         sql "DROP TABLE IF EXISTS ${testTable}"
         create_test_table3.call(testTable)
-        // should be delete after new_load_scan is ready
-        sql """ADMIN SET FRONTEND CONFIG ("enable_new_load_scan_node" = "true");"""
         // load the json data
         streamLoad {
             table "${testTable}"
@@ -593,8 +582,6 @@ suite("test_json_load", "p0") {
                 assertTrue(json.NumberLoadedRows > 0 && json.LoadBytes > 0)
             }
         }
-        // should be deleted after new_load_scan is ready
-        sql """ADMIN SET FRONTEND CONFIG ("enable_new_load_scan_node" = "false");"""
         sql "sync"
         qt_select13 "select * from ${testTable} order by id"
 
@@ -682,7 +669,48 @@ suite("test_json_load", "p0") {
     } finally {
         try_sql("DROP TABLE IF EXISTS ${testTable}")
     }
-    
+
+    // case19: test case sensitive json load
+     try {
+        sql "DROP TABLE IF EXISTS ${testTable}"
+
+        create_test_table1.call(testTable)
+        load_json_data.call('true', 'test_json_load_case19', 'false', 'true', 'json', 'Id, cIty, CodE', '',
+                '', '', '', 'case_sensitive_json.json')
+        sql "sync"
+        qt_select19 "select * from ${testTable} order by id"
+
+    } finally {
+        try_sql("DROP TABLE IF EXISTS ${testTable}")
+    }
+
+    // case22: nested and it's member with jsonpath
+    try {
+        testTable = "test_json_load"
+        sql "DROP TABLE IF EXISTS ${testTable}"
+        sql """CREATE TABLE IF NOT EXISTS ${testTable}
+        (
+         `productid` bigint NOT NULL COMMENT "productid",
+         `deviceid` bigint NOT NULL COMMENT "deviceid",
+         `datatimestamp` string  NULL COMMENT "datatimestamp",
+         `dt` int   NULL COMMENT "dt",
+         `data` string 
+        )
+        DUPLICATE KEY(`productid`, `deviceid`)
+        DISTRIBUTED BY RANDOM BUCKETS auto
+        properties(
+            "replication_num" = "1"
+        );
+        """
+1
+        load_json_data.call("${testTable}", 'with_jsonpath', '', 'true', 'json', """productid, deviceid, data, datatimestamp, dt=from_unixtime(substr(datatimestamp,1,10),'%Y%m%d')""",
+                '["$.productid","$.deviceid","$.data","$.data.datatimestamp"]', '', '', '', 'with_jsonpath.json')
+        qt_select22 "select * from ${testTable}"
+
+    } finally {
+        try_sql("DROP TABLE IF EXISTS ${testTable}")
+    }
+
     // if 'enableHdfs' in regression-conf.groovy has been set to true,
     // the test will run these case as below.
     if (enableHdfs()) {

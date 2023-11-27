@@ -124,20 +124,14 @@ Status StorageEngine::start_bg_threads() {
             scoped_refptr<Thread> path_scan_thread;
             RETURN_IF_ERROR(Thread::create(
                     "StorageEngine", "path_scan_thread",
-                    [this, data_dir]() {
-                        SCOPED_CONSUME_MEM_TRACKER(_mem_tracker);
-                        this->_path_scan_thread_callback(data_dir);
-                    },
+                    [this, data_dir]() { this->_path_scan_thread_callback(data_dir); },
                     &path_scan_thread));
             _path_scan_threads.emplace_back(path_scan_thread);
 
             scoped_refptr<Thread> path_gc_thread;
             RETURN_IF_ERROR(Thread::create(
                     "StorageEngine", "path_gc_thread",
-                    [this, data_dir]() {
-                        SCOPED_CONSUME_MEM_TRACKER(_mem_tracker);
-                        this->_path_gc_thread_callback(data_dir);
-                    },
+                    [this, data_dir]() { this->_path_gc_thread_callback(data_dir); },
                     &path_gc_thread));
             _path_gc_threads.emplace_back(path_gc_thread);
         }
@@ -176,9 +170,8 @@ void StorageEngine::_fd_cache_clean_callback() {
 #ifdef GOOGLE_PROFILER
     ProfilerRegisterThread();
 #endif
-    int32_t interval = 600;
+    int32_t interval = config::cache_clean_interval;
     while (!_stop_background_threads_latch.wait_for(std::chrono::seconds(interval))) {
-        interval = config::cache_clean_interval;
         if (interval <= 0) {
             LOG(WARNING) << "config of file descriptor clean interval is illegal: [" << interval
                          << "], force set to 3600 ";
@@ -419,7 +412,8 @@ void StorageEngine::_compaction_tasks_producer_callback() {
 
     int64_t interval = config::generate_compaction_tasks_min_interval_ms;
     do {
-        if (!config::disable_auto_compaction) {
+        if (!config::disable_auto_compaction &&
+            !MemInfo::is_exceed_soft_mem_limit(GB_EXCHANGE_BYTE)) {
             _adjust_compaction_thread_num();
 
             bool check_score = false;
@@ -474,7 +468,7 @@ void StorageEngine::_compaction_tasks_producer_callback() {
                 Status st = _submit_compaction_task(tablet, compaction_type);
                 if (!st.ok()) {
                     LOG(WARNING) << "failed to submit compaction task for tablet: "
-                                 << tablet->tablet_id() << ", err: " << st.get_error_msg();
+                                 << tablet->tablet_id() << ", err: " << st;
                 }
             }
             interval = config::generate_compaction_tasks_min_interval_ms;
@@ -659,7 +653,7 @@ Status StorageEngine::_submit_compaction_task(TabletSharedPtr tablet,
                     "tablet_id={}, compaction_type={}, "
                     "permit={}, current_permit={}, status={}",
                     tablet->tablet_id(), compaction_type, permits, _permit_limiter.usage(),
-                    st.get_error_msg());
+                    st.to_string());
         }
         return st;
     }
@@ -763,18 +757,28 @@ void StorageEngine::_cooldown_tasks_producer_callback() {
             });
 
             if (!st.ok()) {
-                LOG(INFO) << "failed to submit cooldown task, err msg: " << st.get_error_msg();
+                LOG(INFO) << "failed to submit cooldown task, err msg: " << st;
             }
         }
     } while (!_stop_background_threads_latch.wait_for(std::chrono::seconds(interval)));
 }
 
 void StorageEngine::_cache_file_cleaner_tasks_producer_callback() {
-    int64_t interval = config::generate_cache_cleaner_task_interval_sec;
-    do {
+    while (true) {
+        int64_t interval = config::generate_cache_cleaner_task_interval_sec;
+        if (interval <= 0) {
+            interval = 10;
+        }
+        bool stop = _stop_background_threads_latch.wait_for(std::chrono::seconds(interval));
+        if (stop) {
+            break;
+        }
+        if (config::generate_cache_cleaner_task_interval_sec <= 0) {
+            continue;
+        }
         LOG(INFO) << "Begin to Clean cache files";
         FileCacheManager::instance()->gc_file_caches();
-    } while (!_stop_background_threads_latch.wait_for(std::chrono::seconds(interval)));
+    }
 }
 
 } // namespace doris

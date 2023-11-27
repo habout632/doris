@@ -26,6 +26,7 @@
 #include "vec/core/block.h"
 #include "vec/exec/scan/vscanner.h"
 namespace doris::vectorized {
+using namespace ErrorCode;
 
 NewJsonReader::NewJsonReader(RuntimeState* state, RuntimeProfile* profile, ScannerCounter* counter,
                              const TFileScanRangeParams& params, const TFileRangeDesc& range,
@@ -105,7 +106,7 @@ Status NewJsonReader::get_next_block(Block* block, size_t* read_rows, bool* eof)
         return Status::OK();
     }
 
-    const int batch_size = _state->batch_size();
+    const int batch_size = std::max(_state->batch_size(), (int)_MIN_BATCH_SIZE);
     auto columns = block->mutate_columns();
 
     while (columns[0]->size() < batch_size && !_reader_eof) {
@@ -120,11 +121,11 @@ Status NewJsonReader::get_next_block(Block* block, size_t* read_rows, bool* eof)
         bool is_empty_row = false;
 
         RETURN_IF_ERROR(_read_json_column(columns, _file_slot_descs, &is_empty_row, &_reader_eof));
-        ++(*read_rows);
         if (is_empty_row) {
             // Read empty row, just continue
             continue;
         }
+        ++(*read_rows);
     }
 
     columns.clear();
@@ -139,8 +140,8 @@ Status NewJsonReader::get_columns(std::unordered_map<std::string, TypeDescriptor
     return Status::OK();
 }
 
-Status NewJsonReader::get_parsered_schema(std::vector<std::string>* col_names,
-                                          std::vector<TypeDescriptor>* col_types) {
+Status NewJsonReader::get_parsed_schema(std::vector<std::string>* col_names,
+                                        std::vector<TypeDescriptor>* col_types) {
     RETURN_IF_ERROR(_get_range_params());
 
     RETURN_IF_ERROR(_open_file_reader());
@@ -355,7 +356,7 @@ Status NewJsonReader::_vhandle_simple_json(std::vector<MutableColumnPtr>& column
         bool valid = false;
         if (_next_row >= _total_rows) { // parse json and generic document
             Status st = _parse_json(is_empty_row, eof);
-            if (st.is_data_quality_error()) {
+            if (st.is<DATA_QUALITY_ERROR>()) {
                 continue; // continue to read next
             }
             RETURN_IF_ERROR(st);
@@ -426,7 +427,7 @@ Status NewJsonReader::_vhandle_flat_array_complex_json(
     do {
         if (_next_row >= _total_rows) {
             Status st = _parse_json(is_empty_row, eof);
-            if (st.is_data_quality_error()) {
+            if (st.is<DATA_QUALITY_ERROR>()) {
                 continue; // continue to read next
             }
             RETURN_IF_ERROR(st);
@@ -456,7 +457,7 @@ Status NewJsonReader::_vhandle_nested_complex_json(std::vector<MutableColumnPtr>
                                                    bool* is_empty_row, bool* eof) {
     while (true) {
         Status st = _parse_json(is_empty_row, eof);
-        if (st.is_data_quality_error()) {
+        if (st.is<DATA_QUALITY_ERROR>()) {
             continue; // continue to read next
         }
         RETURN_IF_ERROR(st);
@@ -767,7 +768,8 @@ Status NewJsonReader::_write_data_to_column(rapidjson::Value::ConstValueIterator
 
     // TODO: if the vexpr can support another 'slot_desc type' than 'TYPE_VARCHAR',
     // we need use a function to support these types to insert data in columns.
-    DCHECK(slot_desc->type().type == TYPE_VARCHAR);
+    DCHECK(slot_desc->type().type == TYPE_VARCHAR || slot_desc->type().type == TYPE_STRING)
+            << slot_desc->type().type << ", query id: " << print_id(_state->query_id());
     assert_cast<ColumnString*>(column_ptr)->insert_data(str_value, wbytes);
 
     *valid = true;

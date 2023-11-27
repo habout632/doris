@@ -21,6 +21,7 @@
 #include <stdint.h>
 
 #include <chrono>
+#include <climits>
 #include <cstddef>
 #include <iostream>
 
@@ -36,6 +37,7 @@ class DateTimeValue;
 namespace vectorized {
 
 enum TimeUnit {
+    MICROSECOND,
     SECOND,
     MINUTE,
     HOUR,
@@ -111,6 +113,9 @@ struct TimeInterval {
         case SECOND_MICROSECOND:
             microsecond = count;
             break;
+        case MICROSECOND:
+            microsecond = count;
+            break;
         default:
             break;
         }
@@ -137,6 +142,10 @@ const int TIME_MAX_MINUTE = 59;
 const int TIME_MAX_SECOND = 59;
 const int TIME_MAX_VALUE = 10000 * TIME_MAX_HOUR + 100 * TIME_MAX_MINUTE + TIME_MAX_SECOND;
 const int TIME_MAX_VALUE_SECONDS = 3600 * TIME_MAX_HOUR + 60 * TIME_MAX_MINUTE + TIME_MAX_SECOND;
+
+constexpr int HOUR_PER_DAY = 24;
+constexpr int64_t SECOND_PER_HOUR = 3600;
+constexpr int64_t SECOND_PER_MINUTE = 60;
 
 constexpr size_t const_length(const char* str) {
     return (str == nullptr || *str == 0) ? 0 : const_length(str + 1) + 1;
@@ -175,6 +184,7 @@ static constexpr uint32_t MIN_YEAR = 0;
 
 static constexpr uint32_t DATEV2_YEAR_WIDTH = 23;
 static constexpr uint32_t DATETIMEV2_YEAR_WIDTH = 18;
+static constexpr uint32_t DATETIMEV2_MONTH_WIDTH = 4;
 
 static RE2 time_zone_offset_format_reg("^[+-]{1}\\d{2}\\:\\d{2}$");
 
@@ -380,7 +390,7 @@ public:
         return true;
     };
 
-    uint64_t daynr() const { return calc_daynr(_year, _month, _day); }
+    int32_t daynr() const { return calc_daynr(_year, _month, _day); }
 
     int year() const { return _year; }
     int month() const { return _month; }
@@ -391,6 +401,9 @@ public:
     int minute() const { return _minute; }
     int second() const { return _second; }
     int neg() const { return _neg; }
+    int64_t time_part_to_seconds() const {
+        return _hour * SECOND_PER_HOUR + _minute * SECOND_PER_MINUTE + _second;
+    }
 
     bool check_loss_accuracy_cast_to_date() {
         auto loss_accuracy = _hour != 0 || _minute != 0 || _second != 0;
@@ -604,20 +617,14 @@ public:
         return _s_max_datetime_value;
     }
 
-    int64_t second_diff(const VecDateTimeValue& rhs) const {
-        int day_diff = daynr() - rhs.daynr();
-        int time_diff = (hour() * 3600 + minute() * 60 + second()) -
-                        (rhs.hour() * 3600 + rhs.minute() * 60 + rhs.second());
-        return day_diff * 3600 * 24 + time_diff;
+    template <typename T>
+    int64_t time_part_diff(const T& rhs) const {
+        return time_part_to_seconds() - rhs.time_part_to_seconds();
     }
 
     template <typename T>
-    int64_t second_diff(const DateV2Value<T>& rhs) const;
-
-    int64_t time_part_diff(const VecDateTimeValue& rhs) const {
-        int time_diff = (hour() * 3600 + minute() * 60 + second()) -
-                        (rhs.hour() * 3600 + rhs.minute() * 60 + rhs.second());
-        return time_diff;
+    int64_t second_diff(const T& rhs) const {
+        return (daynr() - rhs.daynr()) * SECOND_PER_HOUR * HOUR_PER_DAY + time_part_diff(rhs);
     }
 
     void set_type(int type);
@@ -629,7 +636,7 @@ public:
                _day > 0;
     }
 
-    void convert_vec_dt_to_dt(doris::DateTimeValue* dt);
+    void convert_vec_dt_to_dt(doris::DateTimeValue* dt) const;
     void convert_dt_to_vec_dt(doris::DateTimeValue* dt);
     int64_t to_datetime_int64() const;
 
@@ -724,8 +731,7 @@ template <typename T>
 class DateV2Value {
 public:
     static constexpr bool is_datetime = std::is_same_v<T, DateTimeV2ValueType>;
-    using underlying_value =
-            std::conditional_t<std::is_same_v<T, DateTimeV2ValueType>, uint64_t, uint32_t>;
+    using underlying_value = std::conditional_t<is_datetime, uint64_t, uint32_t>;
 
     // Constructor
     DateV2Value<T>() : date_v2_value_(0, 0, 0, 0, 0, 0, 0) {}
@@ -834,7 +840,7 @@ public:
         return true;
     };
 
-    uint32_t daynr() const {
+    int32_t daynr() const {
         return calc_daynr(date_v2_value_.year_, date_v2_value_.month_, date_v2_value_.day_);
     }
 
@@ -868,6 +874,10 @@ public:
         } else {
             return 0;
         }
+    }
+
+    int64_t time_part_to_seconds() const {
+        return hour() * SECOND_PER_HOUR + minute() * SECOND_PER_MINUTE + second();
     }
 
     uint16_t year() const { return date_v2_value_.year_; }
@@ -1059,23 +1069,15 @@ public:
         }
     }
 
+    //only calculate the diff of dd:mm:ss
     template <typename RHS>
-    int64_t second_diff(const DateV2Value<RHS>& rhs) const {
-        int day_diff = daynr() - rhs.daynr();
-        return day_diff * 3600 * 24 + (hour() * 3600 + minute() * 60 + second()) -
-               (rhs.hour() * 3600 + rhs.minute() * 60 + rhs.second());
+    int64_t time_part_diff(const RHS& rhs) const {
+        return time_part_to_seconds() - rhs.time_part_to_seconds();
     }
 
-    int64_t second_diff(const VecDateTimeValue& rhs) const {
-        int day_diff = daynr() - rhs.daynr();
-        return day_diff * 3600 * 24 + (hour() * 3600 + minute() * 60 + second()) -
-               (rhs.hour() * 3600 + rhs.minute() * 60 + rhs.second());
-    };
-
-    int64_t time_part_diff(const VecDateTimeValue& rhs) const {
-        int time_diff = (hour() * 3600 + minute() * 60 + second()) -
-                        (rhs.hour() * 3600 + rhs.minute() * 60 + rhs.second());
-        return time_diff;
+    template <typename RHS>
+    int64_t second_diff(const RHS& rhs) const {
+        return (daynr() - rhs.daynr()) * SECOND_PER_HOUR * HOUR_PER_DAY + time_part_diff(rhs);
     }
 
     bool can_cast_to_date_without_loss_accuracy() {
@@ -1315,8 +1317,9 @@ int64_t datetime_diff(const DateV2Value<T0>& ts_value1, const DateV2Value<T1>& t
         int month = (ts_value2.year() - ts_value1.year()) * 12 +
                     (ts_value2.month() - ts_value1.month());
         if constexpr (std::is_same_v<T0, T1>) {
-            int shift_bits = DateV2Value<T0>::is_datetime ? DATETIMEV2_YEAR_WIDTH + 5
-                                                          : DATEV2_YEAR_WIDTH + 5;
+            int shift_bits = DateV2Value<T0>::is_datetime
+                                     ? DATETIMEV2_YEAR_WIDTH + DATETIMEV2_MONTH_WIDTH
+                                     : DATEV2_YEAR_WIDTH + DATETIMEV2_MONTH_WIDTH;
             decltype(ts_value2.to_date_int_val()) minus_one = -1;
             if (month > 0) {
                 month -= ((ts_value2.to_date_int_val() & (minus_one >> shift_bits)) <
@@ -1329,23 +1332,27 @@ int64_t datetime_diff(const DateV2Value<T0>& ts_value1, const DateV2Value<T1>& t
             auto ts1_int_value = ((uint64_t)ts_value1.to_date_int_val()) << TIME_PART_LENGTH;
             if (month > 0) {
                 month -= ((ts_value2.to_date_int_val() &
-                           (uint64_minus_one >> (DATETIMEV2_YEAR_WIDTH + 5))) <
-                          (ts1_int_value & (uint64_minus_one >> (DATETIMEV2_YEAR_WIDTH + 5))));
+                           (uint64_minus_one >> (DATETIMEV2_YEAR_WIDTH + DATETIMEV2_MONTH_WIDTH))) <
+                          (ts1_int_value &
+                           (uint64_minus_one >> (DATETIMEV2_YEAR_WIDTH + DATETIMEV2_MONTH_WIDTH))));
             } else if (month < 0) {
                 month += ((ts_value2.to_date_int_val() &
-                           (uint64_minus_one >> (DATETIMEV2_YEAR_WIDTH + 5))) >
-                          (ts1_int_value & (uint64_minus_one >> (DATETIMEV2_YEAR_WIDTH + 5))));
+                           (uint64_minus_one >> (DATETIMEV2_YEAR_WIDTH + DATETIMEV2_MONTH_WIDTH))) >
+                          (ts1_int_value &
+                           (uint64_minus_one >> (DATETIMEV2_YEAR_WIDTH + DATETIMEV2_MONTH_WIDTH))));
             }
         } else {
             auto ts2_int_value = ((uint64_t)ts_value2.to_date_int_val()) << TIME_PART_LENGTH;
             if (month > 0) {
-                month -= ((ts2_int_value & (uint64_minus_one >> (DATETIMEV2_YEAR_WIDTH + 5))) <
+                month -= ((ts2_int_value &
+                           (uint64_minus_one >> (DATETIMEV2_YEAR_WIDTH + DATETIMEV2_MONTH_WIDTH))) <
                           (ts_value1.to_date_int_val() &
-                           (uint64_minus_one >> (DATETIMEV2_YEAR_WIDTH + 5))));
+                           (uint64_minus_one >> (DATETIMEV2_YEAR_WIDTH + DATETIMEV2_MONTH_WIDTH))));
             } else if (month < 0) {
-                month += ((ts2_int_value & (uint64_minus_one >> (DATETIMEV2_YEAR_WIDTH + 5))) >
+                month += ((ts2_int_value &
+                           (uint64_minus_one >> (DATETIMEV2_YEAR_WIDTH + DATETIMEV2_MONTH_WIDTH))) >
                           (ts_value1.to_date_int_val() &
-                           (uint64_minus_one >> (DATETIMEV2_YEAR_WIDTH + 5))));
+                           (uint64_minus_one >> (DATETIMEV2_YEAR_WIDTH + DATETIMEV2_MONTH_WIDTH))));
             }
         }
         return month;
@@ -1504,16 +1511,15 @@ struct DateTraits<uint64_t> {
 } // namespace vectorized
 } // namespace doris
 
-namespace std {
 template <>
-struct hash<doris::vectorized::VecDateTimeValue> {
+struct std::hash<doris::vectorized::VecDateTimeValue> {
     size_t operator()(const doris::vectorized::VecDateTimeValue& v) const {
         return doris::vectorized::hash_value(v);
     }
 };
 
 template <>
-struct hash<doris::vectorized::DateV2Value<doris::vectorized::DateV2ValueType>> {
+struct std::hash<doris::vectorized::DateV2Value<doris::vectorized::DateV2ValueType>> {
     size_t operator()(
             const doris::vectorized::DateV2Value<doris::vectorized::DateV2ValueType>& v) const {
         return doris::vectorized::hash_value(v);
@@ -1521,10 +1527,9 @@ struct hash<doris::vectorized::DateV2Value<doris::vectorized::DateV2ValueType>> 
 };
 
 template <>
-struct hash<doris::vectorized::DateV2Value<doris::vectorized::DateTimeV2ValueType>> {
+struct std::hash<doris::vectorized::DateV2Value<doris::vectorized::DateTimeV2ValueType>> {
     size_t operator()(
             const doris::vectorized::DateV2Value<doris::vectorized::DateTimeV2ValueType>& v) const {
         return doris::vectorized::hash_value(v);
     }
 };
-} // namespace std

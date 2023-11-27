@@ -797,7 +797,8 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback implements 
 
     public String errorTabletsToJson() {
         Map<Long, String> map = Maps.newHashMap();
-        errorTabletInfos.stream().limit(3).forEach(p -> map.put(p.getTabletId(), p.getMsg()));
+        errorTabletInfos.stream().limit(Config.max_error_tablet_of_broker_load)
+            .forEach(p -> map.put(p.getTabletId(), p.getMsg()));
         Gson gson = new GsonBuilder().disableHtmlEscaping().create();
         return gson.toJson(map);
     }
@@ -1178,6 +1179,10 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback implements 
 
     public boolean isSingleTabletLoadPerSink() {
         return (boolean) jobProperties.get(LoadStmt.LOAD_TO_SINGLE_TABLET);
+    }
+
+    public boolean useNewLoadScanNode() {
+        return (boolean) jobProperties.getOrDefault(LoadStmt.USE_NEW_LOAD_SCAN_NODE, false);
     }
 
     // Return true if this job is finished for a long time

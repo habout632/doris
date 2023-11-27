@@ -71,7 +71,7 @@ public:
     Status new_iterator(const Schema& schema, const StorageReadOptions& read_options,
                         std::unique_ptr<RowwiseIterator>* iter);
 
-    uint64_t id() const { return _segment_id; }
+    uint32_t id() const { return _segment_id; }
 
     RowsetId rowset_id() const { return _rowset_id; }
 
@@ -93,6 +93,8 @@ public:
 
     Status lookup_row_key(const Slice& key, RowLocation* row_location);
 
+    Status read_key_by_rowid(uint32_t row_id, std::string* key);
+
     // only used by UT
     const SegmentFooterPB& footer() const { return _footer; }
 
@@ -108,6 +110,8 @@ public:
         DCHECK(_tablet_schema->keys_type() == UNIQUE_KEYS && _footer.has_primary_key_index_meta());
         return _footer.primary_key_index_meta().max_key();
     };
+
+    int64_t meta_mem_usage() const { return _meta_mem_usage; }
 
 private:
     DISALLOW_COPY_AND_ASSIGN(Segment);

@@ -321,6 +321,8 @@ protected:
     bool _is_closed = false;
 
     RuntimeState* _state;
+    // rows number received per tablet, tablet_id -> rows_num
+    std::vector<std::pair<int64_t, int64_t>> _tablets_received_rows;
 
 private:
     std::unique_ptr<RowBatch> _cur_batch;
@@ -368,6 +370,12 @@ public:
         return mem_consumption;
     }
 
+    void set_tablets_received_rows(
+            const std::vector<std::pair<int64_t, int64_t>>& tablets_received_rows, int64_t node_id);
+
+    // check whether the rows num written by different replicas is consistent
+    Status check_tablet_received_rows_consistency();
+
 private:
     friend class NodeChannel;
     friend class VNodeChannel;
@@ -398,6 +406,9 @@ private:
     Status _intolerable_failure_status = Status::OK();
 
     std::unique_ptr<MemTracker> _index_channel_tracker;
+    // rows num received by DeltaWriter per tablet, tablet_id -> <node_Id, rows_num>
+    // used to verify whether the rows num received by different replicas is consistent
+    std::map<int64_t, std::vector<std::pair<int64_t, int64_t>>> _tablets_received_rows;
 };
 
 template <typename Row>
@@ -409,7 +420,7 @@ void IndexChannel::add_row(const Row& tuple, int64_t tablet_id) {
         // if this node channel is already failed, this add_row will be skipped
         auto st = channel->add_row(tuple, tablet_id);
         if (!st.ok()) {
-            mark_as_failed(channel->node_id(), channel->host(), st.get_error_msg(), tablet_id);
+            mark_as_failed(channel->node_id(), channel->host(), st.to_string(), tablet_id);
             // continue add row to other node, the error will be checked for every batch outside
         }
     }
@@ -440,6 +451,11 @@ public:
     // Returns the runtime profile for the sink.
     RuntimeProfile* profile() override { return _profile; }
 
+    // the consumer func of sending pending batches in every NodeChannel.
+    // use polling & NodeChannel::try_send_and_fetch_status() to achieve nonblocking sending.
+    // only focus on pending batches and channel status, the internal errors of NodeChannels will be handled by the producer
+    void send_batch_process();
+
 private:
     // convert input batch to output batch which will be loaded into OLAP table.
     // this is only used in insert statement.
@@ -453,11 +469,6 @@ private:
                           int* filtered_rows, bool* stop_processing);
     bool _validate_cell(const TypeDescriptor& type, const std::string& col_name, void* slot,
                         size_t slot_index, fmt::memory_buffer& error_msg, RowBatch* batch);
-
-    // the consumer func of sending pending batches in every NodeChannel.
-    // use polling & NodeChannel::try_send_and_fetch_status() to achieve nonblocking sending.
-    // only focus on pending batches and channel status, the internal errors of NodeChannels will be handled by the producer
-    void _send_batch_process(RuntimeState* state);
 
 protected:
     friend class NodeChannel;
@@ -508,8 +519,7 @@ protected:
     // index_channel
     std::vector<std::shared_ptr<IndexChannel>> _channels;
 
-    CountDownLatch _stop_background_threads_latch;
-    scoped_refptr<Thread> _sender_thread;
+    bthread_t _sender_thread = 0;
     std::unique_ptr<ThreadPoolToken> _send_batch_thread_pool_token;
 
     std::vector<DecimalV2Value> _max_decimalv2_val;
@@ -566,6 +576,7 @@ private:
     OlapTablePartitionParam* _partition = nullptr;
     std::vector<ExprContext*> _output_expr_ctxs;
     std::unique_ptr<RowBatch> _output_batch;
+    RuntimeState* _state = nullptr;
 };
 
 } // namespace stream_load

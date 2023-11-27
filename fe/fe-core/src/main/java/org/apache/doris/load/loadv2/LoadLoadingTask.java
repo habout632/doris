@@ -45,6 +45,7 @@ import org.apache.logging.log4j.Logger;
 
 import java.util.List;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 public class LoadLoadingTask extends LoadTask {
     private static final Logger LOG = LogManager.getLogger(LoadLoadingTask.class);
@@ -69,6 +70,7 @@ public class LoadLoadingTask extends LoadTask {
     private final int sendBatchParallelism;
     private final boolean loadZeroTolerance;
     private final boolean singleTabletLoadPerSink;
+    private final boolean useNewLoadScanNode;
 
     private LoadingTaskPlanner planner;
 
@@ -76,11 +78,12 @@ public class LoadLoadingTask extends LoadTask {
     private long beginTime;
 
     public LoadLoadingTask(Database db, OlapTable table,
-                           BrokerDesc brokerDesc, List<BrokerFileGroup> fileGroups,
-                           long jobDeadlineMs, long execMemLimit, boolean strictMode,
-                           long txnId, LoadTaskCallback callback, String timezone,
-                           long timeoutS, int loadParallelism, int sendBatchParallelism,
-                           boolean loadZeroTolerance, RuntimeProfile profile, boolean singleTabletLoadPerSink) {
+            BrokerDesc brokerDesc, List<BrokerFileGroup> fileGroups,
+            long jobDeadlineMs, long execMemLimit, boolean strictMode,
+            long txnId, LoadTaskCallback callback, String timezone,
+            long timeoutS, int loadParallelism, int sendBatchParallelism,
+            boolean loadZeroTolerance, RuntimeProfile profile, boolean singleTabletLoadPerSink,
+            boolean useNewLoadScanNode) {
         super(callback, TaskType.LOADING);
         this.db = db;
         this.table = table;
@@ -99,13 +102,15 @@ public class LoadLoadingTask extends LoadTask {
         this.loadZeroTolerance = loadZeroTolerance;
         this.jobProfile = profile;
         this.singleTabletLoadPerSink = singleTabletLoadPerSink;
+        this.useNewLoadScanNode = useNewLoadScanNode;
     }
 
     public void init(TUniqueId loadId, List<List<TBrokerFileStatus>> fileStatusList,
             int fileNum, UserIdentity userInfo) throws UserException {
         this.loadId = loadId;
         planner = new LoadingTaskPlanner(callback.getCallbackId(), txnId, db.getId(), table, brokerDesc, fileGroups,
-                strictMode, timezone, this.timeoutS, this.loadParallelism, this.sendBatchParallelism, userInfo);
+                strictMode, timezone, this.timeoutS, this.loadParallelism, this.sendBatchParallelism,
+                this.useNewLoadScanNode, userInfo);
         planner.plan(loadId, fileStatusList, fileNum);
     }
 
@@ -172,7 +177,9 @@ public class LoadLoadingTask extends LoadTask {
                         curCoordinator.getLoadCounters(),
                         curCoordinator.getTrackingUrl(),
                         TabletCommitInfo.fromThrift(curCoordinator.getCommitInfos()),
-                        ErrorTabletInfo.fromThrift(curCoordinator.getErrorTabletInfos()));
+                        ErrorTabletInfo.fromThrift(curCoordinator.getErrorTabletInfos()
+                                .stream().limit(Config.max_error_tablet_of_broker_load).collect(Collectors.toList())));
+                curCoordinator.getErrorTabletInfos().clear();
                 // Create profile of this task and add to the job profile.
                 createProfile(curCoordinator);
             } else {

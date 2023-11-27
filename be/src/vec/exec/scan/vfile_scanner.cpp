@@ -22,7 +22,6 @@
 
 #include <vec/data_types/data_type_factory.hpp>
 
-#include "../format/table/iceberg_reader.h"
 #include "common/logging.h"
 #include "common/utils.h"
 #include "exec/arrow/orc_reader.h"
@@ -40,21 +39,29 @@
 #include "vec/functions/simple_function_factory.h"
 
 namespace doris::vectorized {
+using namespace ErrorCode;
 
 VFileScanner::VFileScanner(RuntimeState* state, NewFileScanNode* parent, int64_t limit,
-                           const TFileScanRange& scan_range, RuntimeProfile* profile)
-        : VScanner(state, static_cast<VScanNode*>(parent), limit),
+                           const TFileScanRange& scan_range, RuntimeProfile* profile,
+                           KVCache<std::string>& kv_cache)
+        : VScanner(state, static_cast<VScanNode*>(parent), limit, profile),
           _params(scan_range.params),
           _ranges(scan_range.ranges),
           _next_range(0),
           _cur_reader(nullptr),
           _cur_reader_eof(false),
           _mem_pool(std::make_unique<MemPool>()),
-          _profile(profile),
+          _kv_cache(kv_cache),
           _strict_mode(false) {
     if (scan_range.params.__isset.strict_mode) {
         _strict_mode = scan_range.params.strict_mode;
     }
+
+    // For load scanner, there are input and output tuple.
+    // For query scanner, there is only output tuple
+    _input_tuple_desc = state->desc_tbl().get_tuple_descriptor(_params.src_tuple_id);
+    _real_tuple_desc = _input_tuple_desc == nullptr ? _output_tuple_desc : _input_tuple_desc;
+    _is_load = (_input_tuple_desc != nullptr);
 }
 
 Status VFileScanner::prepare(
@@ -72,6 +79,7 @@ Status VFileScanner::prepare(
     _pre_filter_timer = ADD_TIMER(_parent->_scanner_profile, "FileScannerPreFilterTimer");
     _convert_to_output_block_timer =
             ADD_TIMER(_parent->_scanner_profile, "FileScannerConvertOuputBlockTime");
+    _file_counter = ADD_COUNTER(_parent->_scanner_profile, "FileReaderCounter", TUnit::UNIT);
 
     if (vconjunct_ctx_ptr != nullptr) {
         // Copy vconjunct_ctx_ptr from scan node to this scanner's _vconjunct_ctx.
@@ -79,7 +87,6 @@ Status VFileScanner::prepare(
     }
 
     if (_is_load) {
-        _src_block_mem_reuse = true;
         _src_row_desc.reset(new RowDescriptor(_state->desc_tbl(),
                                               std::vector<TupleId>({_input_tuple_desc->id()}),
                                               std::vector<bool>({false})));
@@ -209,7 +216,10 @@ Status VFileScanner::_init_src_block(Block* block) {
             data_type = DataTypeFactory::instance().create_data_type(it->second, true);
         }
         if (data_type == nullptr) {
-            return Status::NotSupported(fmt::format("Not support arrow type:{}", slot->col_name()));
+            return Status::NotSupported("Not support data type {} for column {}",
+                                        it == _name_to_col_type.end() ? slot->type().debug_string()
+                                                                      : it->second.debug_string(),
+                                        slot->col_name());
         }
         MutableColumnPtr data_column = data_type->create_column();
         _src_block.insert(
@@ -365,23 +375,18 @@ Status VFileScanner::_convert_to_output_block(Block* block) {
     size_t rows = _src_block.rows();
     auto filter_column = vectorized::ColumnUInt8::create(rows, 1);
     auto& filter_map = filter_column->get_data();
-    auto origin_column_num = _src_block.columns();
 
     for (auto slot_desc : _output_tuple_desc->slots()) {
         if (!slot_desc->is_materialized()) {
             continue;
         }
-        int dest_index = ctx_idx++;
+        int dest_index = ctx_idx;
 
         auto* ctx = _dest_vexpr_ctx[dest_index];
         int result_column_id = -1;
         // PT1 => dest primitive type
         RETURN_IF_ERROR(ctx->execute(&_src_block, &result_column_id));
-        bool is_origin_column = result_column_id < origin_column_num;
-        auto column_ptr =
-                is_origin_column && _src_block_mem_reuse
-                        ? _src_block.get_by_position(result_column_id).column->clone_resized(rows)
-                        : _src_block.get_by_position(result_column_id).column;
+        vectorized::ColumnPtr column_ptr = _src_block.get_by_position(result_column_id).column;
         // column_ptr maybe a ColumnConst, convert it to a normal column
         column_ptr = column_ptr->convert_to_full_column_if_const();
 
@@ -443,14 +448,11 @@ Status VFileScanner::_convert_to_output_block(Block* block) {
         block->insert(dest_index, vectorized::ColumnWithTypeAndName(std::move(column_ptr),
                                                                     slot_desc->get_data_type_ptr(),
                                                                     slot_desc->col_name()));
+        ctx_idx++;
     }
 
     // after do the dest block insert operation, clear _src_block to remove the reference of origin column
-    if (_src_block_mem_reuse) {
-        _src_block.clear_column_data(origin_column_num);
-    } else {
-        _src_block.clear();
-    }
+    _src_block.clear();
 
     size_t dest_size = block->columns();
     // do filter
@@ -471,6 +473,7 @@ Status VFileScanner::_get_next_reader() {
             return Status::OK();
         }
         const TFileRangeDesc& range = _ranges[_next_range++];
+        COUNTER_UPDATE(_file_counter, 1);
 
         // create reader for specific format
         // TODO: add json, avro
@@ -481,19 +484,24 @@ Status VFileScanner::_get_next_reader() {
             ParquetReader* parquet_reader =
                     new ParquetReader(_profile, _params, range, _state->query_options().batch_size,
                                       const_cast<cctz::time_zone*>(&_state->timezone_obj()));
-            if (_push_down_expr == nullptr && _vconjunct_ctx != nullptr) {
+            RETURN_IF_ERROR(parquet_reader->open());
+            if (!_is_load && _push_down_expr == nullptr && _vconjunct_ctx != nullptr) {
                 RETURN_IF_ERROR(_vconjunct_ctx->clone(_state, &_push_down_expr));
                 _discard_conjuncts();
             }
-            init_status = parquet_reader->init_reader(_file_col_names, _colname_to_value_range,
-                                                      _push_down_expr);
-            if (_params.__isset.table_format_params &&
-                _params.table_format_params.table_format_type == "iceberg") {
-                IcebergTableReader* iceberg_reader = new IcebergTableReader(
-                        (GenericReader*)parquet_reader, _profile, _state, _params);
-                iceberg_reader->init_row_filters();
+            if (range.__isset.table_format_params &&
+                range.table_format_params.table_format_type == "iceberg") {
+                IcebergTableReader* iceberg_reader =
+                        new IcebergTableReader((GenericReader*)parquet_reader, _profile, _state,
+                                               _params, range, _kv_cache);
+                init_status = iceberg_reader->init_reader(_file_col_names, _col_id_name_map,
+                                                          _colname_to_value_range, _push_down_expr);
+                RETURN_IF_ERROR(iceberg_reader->init_row_filters(range));
                 _cur_reader.reset((GenericReader*)iceberg_reader);
             } else {
+                std::vector<std::string> place_holder;
+                init_status = parquet_reader->init_reader(_file_col_names, place_holder,
+                                                          _colname_to_value_range, _push_down_expr);
                 _cur_reader.reset((GenericReader*)parquet_reader);
             }
             break;
@@ -527,11 +535,14 @@ Status VFileScanner::_get_next_reader() {
             return Status::InternalError("Not supported file format: {}", _params.format_type);
         }
 
-        if (init_status.is_end_of_file()) {
+        if (init_status.is<END_OF_FILE>()) {
             continue;
         } else if (!init_status.ok()) {
+            if (init_status.is<NOT_FOUND>()) {
+                return init_status;
+            }
             return Status::InternalError("failed to init reader for file {}, err: {}", range.path,
-                                         init_status.get_error_msg());
+                                         init_status.to_string());
         }
 
         _name_to_col_type.clear();
@@ -632,10 +643,10 @@ Status VFileScanner::_init_expr_ctxes() {
         }
         if (slot_info.is_file_slot) {
             _file_slot_descs.emplace_back(it->second);
-            auto iti = full_src_index_map.find(slot_id);
-            _file_slot_index_map.emplace(slot_id, iti->second);
-            _file_slot_name_map.emplace(it->second->col_name(), iti->second);
             _file_col_names.push_back(it->second->col_name());
+            if (it->second->col_unique_id() > 0) {
+                _col_id_name_map.emplace(it->second->col_unique_id(), it->second->col_name());
+            }
         } else {
             _partition_slot_descs.emplace_back(it->second);
             if (_is_load) {
@@ -648,8 +659,27 @@ Status VFileScanner::_init_expr_ctxes() {
         }
     }
 
+    // set column name to default value expr map
+    for (auto slot_desc : _real_tuple_desc->slots()) {
+        if (!slot_desc->is_materialized()) {
+            continue;
+        }
+        vectorized::VExprContext* ctx = nullptr;
+        auto it = _params.default_value_of_src_slot.find(slot_desc->id());
+        if (it != std::end(_params.default_value_of_src_slot)) {
+            if (!it->second.nodes.empty()) {
+                RETURN_IF_ERROR(
+                        vectorized::VExpr::create_expr_tree(_state->obj_pool(), it->second, &ctx));
+                RETURN_IF_ERROR(ctx->prepare(_state, *_default_val_row_desc));
+                RETURN_IF_ERROR(ctx->open(_state));
+            }
+            // if expr is empty, the default value will be null
+            _col_default_value_ctx.emplace(slot_desc->col_name(), ctx);
+        }
+    }
+
     if (_is_load) {
-        // follow desc expr map and src default value expr map is only for load task.
+        // follow desc expr map is only for load task.
         bool has_slot_id_map = _params.__isset.dest_sid_to_src_sid_without_trans;
         int idx = 0;
         for (auto slot_desc : _output_tuple_desc->slots()) {
@@ -686,24 +716,6 @@ Status VFileScanner::_init_expr_ctxes() {
                                                          full_src_index_map[_src_slot_it->first]);
                     _src_slot_descs_order_by_dest.emplace_back(_src_slot_it->second);
                 }
-            }
-        }
-
-        for (auto slot_desc : _real_tuple_desc->slots()) {
-            if (!slot_desc->is_materialized()) {
-                continue;
-            }
-            vectorized::VExprContext* ctx = nullptr;
-            auto it = _params.default_value_of_src_slot.find(slot_desc->id());
-            if (it != std::end(_params.default_value_of_src_slot)) {
-                if (!it->second.nodes.empty()) {
-                    RETURN_IF_ERROR(vectorized::VExpr::create_expr_tree(_state->obj_pool(),
-                                                                        it->second, &ctx));
-                    RETURN_IF_ERROR(ctx->prepare(_state, *_default_val_row_desc));
-                    RETURN_IF_ERROR(ctx->open(_state));
-                }
-                // if expr is empty, the default value will be null
-                _col_default_value_ctx.emplace(slot_desc->col_name(), ctx);
             }
         }
     }

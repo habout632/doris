@@ -24,13 +24,11 @@
 namespace doris::vectorized {
 
 NewOlapScanner::NewOlapScanner(RuntimeState* state, NewOlapScanNode* parent, int64_t limit,
-                               bool aggregation, bool need_agg_finalize,
-                               const TPaloScanRange& scan_range, RuntimeProfile* profile)
-        : VScanner(state, static_cast<VScanNode*>(parent), limit),
+                               bool aggregation, bool need_agg_finalize, RuntimeProfile* profile)
+        : VScanner(state, static_cast<VScanNode*>(parent), limit, profile),
           _aggregation(aggregation),
           _need_agg_finalize(need_agg_finalize),
-          _version(-1),
-          _profile(profile) {
+          _version(-1) {
     _tablet_schema = std::make_shared<TabletSchema>();
 }
 
@@ -92,8 +90,8 @@ Status NewOlapScanner::prepare(const TPaloScanRange& scan_range,
             // to prevent this case: when there are lots of olap scanners to run for example 10000
             // the rowsets maybe compacted when the last olap scanner starts
             Version rd_version(0, _version);
-            Status acquire_reader_st =
-                    _tablet->capture_rs_readers(rd_version, &_tablet_reader_params.rs_readers);
+            Status acquire_reader_st = _tablet->capture_rs_readers(
+                    rd_version, &_tablet_reader_params.rs_readers, _state->skip_missing_version());
             if (!acquire_reader_st.ok()) {
                 LOG(WARNING) << "fail to init reader.res=" << acquire_reader_st;
                 std::stringstream ss;
@@ -261,7 +259,7 @@ Status NewOlapScanner::_init_tablet_reader_params(
         _tablet_reader_params.use_page_cache = true;
     }
 
-    if (_tablet->enable_unique_key_merge_on_write()) {
+    if (_tablet->enable_unique_key_merge_on_write() && !_state->skip_delete_bitmap()) {
         _tablet_reader_params.delete_bitmap = &_tablet->tablet_meta()->delete_bitmap();
     }
 
@@ -309,13 +307,13 @@ Status NewOlapScanner::_init_return_columns() {
 }
 
 Status NewOlapScanner::_get_block_impl(RuntimeState* state, Block* block, bool* eof) {
-    if (!_profile_updated) {
-        _profile_updated = _tablet_reader->update_profile(_profile);
-    }
     // Read one block from block reader
     // ATTN: Here we need to let the _get_block_impl method guarantee the semantics of the interface,
     // that is, eof can be set to true only when the returned block is empty.
     RETURN_IF_ERROR(_tablet_reader->next_block_with_aggregation(block, nullptr, nullptr, eof));
+    if (!_profile_updated) {
+        _profile_updated = _tablet_reader->update_profile(_profile);
+    }
     if (block->rows() > 0) {
         *eof = false;
     }
@@ -384,8 +382,14 @@ void NewOlapScanner::_update_counters_before_close() {
     COUNTER_UPDATE(olap_parent->_vec_cond_timer, stats.vec_cond_ns);
     COUNTER_UPDATE(olap_parent->_short_cond_timer, stats.short_cond_ns);
     COUNTER_UPDATE(olap_parent->_block_init_timer, stats.block_init_ns);
+    COUNTER_UPDATE(olap_parent->_block_init_get_row_range_by_keys_timer,
+                   stats.block_init_get_row_range_by_keys_ns);
+    COUNTER_UPDATE(olap_parent->_block_init_get_row_range_by_conditions_timer,
+                   stats.block_init_get_row_range_by_conditions_ns);
     COUNTER_UPDATE(olap_parent->_block_init_seek_timer, stats.block_init_seek_ns);
     COUNTER_UPDATE(olap_parent->_block_init_seek_counter, stats.block_init_seek_num);
+    COUNTER_UPDATE(olap_parent->_block_conditions_filtered_timer,
+                   stats.block_conditions_filtered_ns);
     COUNTER_UPDATE(olap_parent->_first_read_timer, stats.first_read_ns);
     COUNTER_UPDATE(olap_parent->_first_read_seek_timer, stats.block_first_read_seek_ns);
     COUNTER_UPDATE(olap_parent->_first_read_seek_counter, stats.block_first_read_seek_num);
@@ -393,7 +397,12 @@ void NewOlapScanner::_update_counters_before_close() {
     COUNTER_UPDATE(olap_parent->_lazy_read_seek_timer, stats.block_lazy_read_seek_ns);
     COUNTER_UPDATE(olap_parent->_lazy_read_seek_counter, stats.block_lazy_read_seek_num);
     COUNTER_UPDATE(olap_parent->_output_col_timer, stats.output_col_ns);
-    COUNTER_UPDATE(olap_parent->_rows_vec_cond_counter, stats.rows_vec_cond_filtered);
+    COUNTER_UPDATE(olap_parent->_rows_vec_cond_filtered_counter, stats.rows_vec_cond_filtered);
+    COUNTER_UPDATE(olap_parent->_rows_short_circuit_cond_filtered_counter,
+                   stats.rows_short_circuit_cond_filtered);
+    COUNTER_UPDATE(olap_parent->_rows_vec_cond_input_counter, stats.vec_cond_input_rows);
+    COUNTER_UPDATE(olap_parent->_rows_short_circuit_cond_input_counter,
+                   stats.short_circuit_cond_input_rows);
 
     COUNTER_UPDATE(olap_parent->_stats_filtered_counter, stats.rows_stats_filtered);
     COUNTER_UPDATE(olap_parent->_bf_filtered_counter, stats.rows_bf_filtered);

@@ -104,6 +104,7 @@ Status VDataStreamSender::Channel::send_current_block(bool eos) {
 }
 
 Status VDataStreamSender::Channel::send_local_block(bool eos) {
+    SCOPED_TIMER(_parent->_local_send_timer);
     std::shared_ptr<VDataStreamRecvr> recvr =
             _parent->state()->exec_env()->vstream_mgr()->find_recvr(_fragment_instance_id,
                                                                     _dest_node_id);
@@ -112,6 +113,7 @@ Status VDataStreamSender::Channel::send_local_block(bool eos) {
     if (recvr != nullptr) {
         COUNTER_UPDATE(_parent->_local_bytes_send_counter, block.bytes());
         COUNTER_UPDATE(_parent->_local_sent_rows, block.rows());
+        COUNTER_UPDATE(_parent->_blocks_sent_counter, 1);
         recvr->add_block(&block, _parent->_sender_id, true);
         if (eos) {
             recvr->remove_sender(_parent->_sender_id, _be_number);
@@ -121,12 +123,14 @@ Status VDataStreamSender::Channel::send_local_block(bool eos) {
 }
 
 Status VDataStreamSender::Channel::send_local_block(Block* block) {
+    SCOPED_TIMER(_parent->_local_send_timer);
     std::shared_ptr<VDataStreamRecvr> recvr =
             _parent->state()->exec_env()->vstream_mgr()->find_recvr(_fragment_instance_id,
                                                                     _dest_node_id);
     if (recvr != nullptr) {
         COUNTER_UPDATE(_parent->_local_bytes_send_counter, block->bytes());
         COUNTER_UPDATE(_parent->_local_sent_rows, block->rows());
+        COUNTER_UPDATE(_parent->_blocks_sent_counter, 1);
         recvr->add_block(block, _parent->_sender_id, false);
     }
     return Status::OK();
@@ -134,6 +138,7 @@ Status VDataStreamSender::Channel::send_local_block(Block* block) {
 
 Status VDataStreamSender::Channel::send_block(PBlock* block, bool eos) {
     SCOPED_TIMER(_parent->_brpc_send_timer);
+    COUNTER_UPDATE(_parent->_blocks_sent_counter, 1);
     if (_closure == nullptr) {
         _closure = new RefCountClosure<PTransmitDataResult>();
         _closure->ref();
@@ -211,13 +216,16 @@ Status VDataStreamSender::Channel::add_rows(Block* block, const std::vector<int>
             row_add = row_wait_add;
         }
 
-        _mutable_block->add_rows(block, begin, begin + row_add);
+        {
+            SCOPED_TIMER(_parent->_split_block_distribute_by_channel_timer);
+            _mutable_block->add_rows(block, begin, begin + row_add);
+        }
 
         row_wait_add -= row_add;
         begin += row_add;
 
         if (row_add == max_add) {
-            RETURN_IF_ERROR(send_current_block());
+            RETURN_IF_ERROR(send_current_block(false));
         }
     }
 
@@ -228,7 +236,7 @@ Status VDataStreamSender::Channel::close_wait(RuntimeState* state) {
     if (_need_close) {
         Status st = _wait_last_brpc();
         if (!st.ok()) {
-            state->log_error(st.get_error_msg());
+            state->log_error(st.to_string());
         }
         _need_close = false;
         return st;
@@ -256,7 +264,7 @@ Status VDataStreamSender::Channel::close_internal() {
 Status VDataStreamSender::Channel::close(RuntimeState* state) {
     Status st = close_internal();
     if (!st.ok()) {
-        state->log_error(st.get_error_msg());
+        state->log_error(st.to_string());
     }
     return st;
 }
@@ -280,6 +288,10 @@ VDataStreamSender::VDataStreamSender(ObjectPool* pool, int sender_id, const RowD
           _profile(nullptr),
           _serialize_batch_timer(nullptr),
           _bytes_sent_counter(nullptr),
+          _local_send_timer(nullptr),
+          _split_block_hash_compute_timer(nullptr),
+          _split_block_distribute_by_channel_timer(nullptr),
+          _blocks_sent_counter(nullptr),
           _local_bytes_send_counter(nullptr),
           _dest_node_id(sink.dest_node_id),
           _transfer_large_data_by_brpc(config::transfer_large_data_by_brpc) {
@@ -291,7 +303,6 @@ VDataStreamSender::VDataStreamSender(ObjectPool* pool, int sender_id, const RowD
            sink.output_partition.type == TPartitionType::BUCKET_SHFFULE_HASH_PARTITIONED);
     //
     std::map<int64_t, int64_t> fragment_id_to_channel_index;
-
     for (int i = 0; i < destinations.size(); ++i) {
         // Select first dest as transfer chain.
         bool is_transfer_chain = (i == 0);
@@ -314,6 +325,7 @@ VDataStreamSender::VDataStreamSender(ObjectPool* pool, int sender_id, const RowD
 }
 
 VDataStreamSender::VDataStreamSender(ObjectPool* pool, int sender_id, const RowDescriptor& row_desc,
+                                     PlanNodeId dest_node_id,
                                      const std::vector<TPlanFragmentDestination>& destinations,
                                      int per_channel_buffer_size,
                                      bool send_query_statistics_with_every_batch)
@@ -321,6 +333,7 @@ VDataStreamSender::VDataStreamSender(ObjectPool* pool, int sender_id, const RowD
           _pool(pool),
           _row_desc(row_desc),
           _current_channel_idx(0),
+          _part_type(TPartitionType::UNPARTITIONED),
           _ignore_not_found(true),
           _cur_pb_block(&_pb_block1),
           _profile(nullptr),
@@ -329,9 +342,27 @@ VDataStreamSender::VDataStreamSender(ObjectPool* pool, int sender_id, const RowD
           _brpc_send_timer(nullptr),
           _brpc_wait_timer(nullptr),
           _bytes_sent_counter(nullptr),
+          _local_send_timer(nullptr),
+          _split_block_hash_compute_timer(nullptr),
+          _split_block_distribute_by_channel_timer(nullptr),
+          _blocks_sent_counter(nullptr),
           _local_bytes_send_counter(nullptr),
-          _dest_node_id(0) {
+          _dest_node_id(dest_node_id) {
     _name = "VDataStreamSender";
+    std::map<int64_t, int64_t> fragment_id_to_channel_index;
+    for (int i = 0; i < destinations.size(); ++i) {
+        const auto& fragment_instance_id = destinations[i].fragment_instance_id;
+        if (fragment_id_to_channel_index.find(fragment_instance_id.lo) ==
+            fragment_id_to_channel_index.end()) {
+            _channel_shared_ptrs.emplace_back(
+                    new Channel(this, row_desc, destinations[i].brpc_server, fragment_instance_id,
+                                _dest_node_id, per_channel_buffer_size, false,
+                                send_query_statistics_with_every_batch));
+        }
+        fragment_id_to_channel_index.emplace(fragment_instance_id.lo,
+                                             _channel_shared_ptrs.size() - 1);
+        _channels.push_back(_channel_shared_ptrs.back().get());
+    }
 }
 
 VDataStreamSender::VDataStreamSender(ObjectPool* pool, const RowDescriptor& row_desc,
@@ -349,6 +380,10 @@ VDataStreamSender::VDataStreamSender(ObjectPool* pool, const RowDescriptor& row_
           _brpc_send_timer(nullptr),
           _brpc_wait_timer(nullptr),
           _bytes_sent_counter(nullptr),
+          _local_send_timer(nullptr),
+          _split_block_hash_compute_timer(nullptr),
+          _split_block_distribute_by_channel_timer(nullptr),
+          _blocks_sent_counter(nullptr),
           _local_bytes_send_counter(nullptr),
           _dest_node_id(0) {
     _name = "VDataStreamSender";
@@ -405,7 +440,8 @@ Status VDataStreamSender::prepare(RuntimeState* state) {
     _profile = _pool->add(new RuntimeProfile(title));
     SCOPED_TIMER(_profile->total_time_counter());
     _mem_tracker = std::make_unique<MemTracker>(
-            "VDataStreamSender:" + print_id(state->fragment_instance_id()), _profile);
+            "VDataStreamSender:" + print_id(state->fragment_instance_id()), _profile, nullptr,
+            "PeakMemoryUsage");
     SCOPED_CONSUME_MEM_TRACKER(_mem_tracker.get());
 
     if (_part_type == TPartitionType::UNPARTITIONED || _part_type == TPartitionType::RANDOM) {
@@ -433,6 +469,11 @@ Status VDataStreamSender::prepare(RuntimeState* state) {
     _compress_timer = ADD_TIMER(profile(), "CompressTime");
     _brpc_send_timer = ADD_TIMER(profile(), "BrpcSendTime");
     _brpc_wait_timer = ADD_TIMER(profile(), "BrpcSendTime.Wait");
+    _local_send_timer = ADD_TIMER(profile(), "LocalSendTime");
+    _split_block_hash_compute_timer = ADD_TIMER(profile(), "SplitBlockHashComputeTime");
+    _split_block_distribute_by_channel_timer =
+            ADD_TIMER(profile(), "SplitBlockDistributeByChannelTime");
+    _blocks_sent_counter = ADD_COUNTER(profile(), "BlocksSent", TUnit::UNIT);
     _overall_throughput = profile()->add_derived_counter(
             "OverallThroughput", TUnit::BYTES_PER_SECOND,
             std::bind<int64_t>(&RuntimeProfile::units_per_second, _bytes_sent_counter,
@@ -523,18 +564,22 @@ Status VDataStreamSender::send(RuntimeState* state, Block* block) {
         // TODO: after we support new shuffle hash method, should simple the code
         if (_part_type == TPartitionType::HASH_PARTITIONED) {
             if (!_new_shuffle_hash_method) {
+                SCOPED_TIMER(_split_block_hash_compute_timer);
                 // for each row, we have a siphash val
                 std::vector<SipHash> siphashs(rows);
                 // result[j] means column index, i means rows index
                 for (int j = 0; j < result_size; ++j) {
+                    // complex type most not implement get_data_at() method which column_const will call
                     block->get_by_position(result[j]).column->update_hashes_with_value(siphashs);
                 }
                 for (int i = 0; i < rows; i++) {
                     hashes[i] = siphashs[i].get64() % element_size;
                 }
             } else {
+                SCOPED_TIMER(_split_block_hash_compute_timer);
                 // result[j] means column index, i means rows index, here to calculate the xxhash value
                 for (int j = 0; j < result_size; ++j) {
+                    // complex type most not implement get_data_at() method which column_const will call
                     block->get_by_position(result[j]).column->update_hashes_with_value(hashes);
                 }
 
@@ -547,6 +592,7 @@ Status VDataStreamSender::send(RuntimeState* state, Block* block) {
             RETURN_IF_ERROR(channel_add_rows(_channels, element_size, hashes, rows, block));
         } else {
             for (int j = 0; j < result_size; ++j) {
+                // complex type most not implement get_data_at() method which column_const will call
                 block->get_by_position(result[j]).column->update_crcs_with_value(
                         hash_vals, _partition_expr_ctxs[j]->root()->type().type);
             }

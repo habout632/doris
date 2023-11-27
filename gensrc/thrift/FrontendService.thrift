@@ -287,6 +287,7 @@ struct TGetDbsParams {
   2: optional string user   // deprecated
   3: optional string user_ip    // deprecated
   4: optional Types.TUserIdentity current_user_ident // to replace the user and user ip
+  5: optional string catalog
 }
 
 // getDbNames returns a list of database names and catalog names
@@ -406,6 +407,10 @@ struct TReportExecStatusParams {
   17: optional i64 loaded_bytes
 
   18: optional list<Types.TErrorTabletInfo> errorTabletInfos
+
+  // 19: optional i32 fragment_id
+
+  20: optional PaloInternalService.TQueryType query_type
 }
 
 struct TFeResult {
@@ -436,6 +441,7 @@ struct TMasterOpRequest {
     19: optional map<string, string> session_variables
     20: optional bool foldConstantByBe
     21: optional map<string, string> trace_carrier
+    22: optional bool syncJournalOnly // if set to true, this request means to do nothing but just sync max journal id of master
 }
 
 struct TColumnDefinition {
@@ -544,6 +550,10 @@ struct TStreamLoadPutRequest {
     38: optional string header_type
     39: optional string hidden_columns
     40: optional PlanNodes.TFileCompressType compress_type
+    41: optional i64 file_size // only for stream load with parquet or orc
+    42: optional bool trim_double_quotes // trim double quotes for csv
+    // 43: optional i32 skip_lines // csv skip line num, only used when csv header_type is not set.
+    44: optional bool enable_profile
 }
 
 struct TStreamLoadPutResult {
@@ -691,11 +701,20 @@ struct TInitExternalCtlMetaResult {
 
 enum TSchemaTableName{
   BACKENDS = 0,
+  ICEBERG_TABLE_META = 1,
+}
+
+struct TMetadataTableRequestParams {
+  1: optional PlanNodes.TIcebergMetadataParams iceberg_metadata_params
+  2: optional string catalog
+  3: optional string database
+  4: optional string table
 }
 
 struct TFetchSchemaTableDataRequest {
   1: optional string cluster_name
   2: optional TSchemaTableName schema_table_name
+  3: optional TMetadataTableRequestParams metada_table_params
 }
 
 struct TFetchSchemaTableDataResult {

@@ -35,9 +35,16 @@ NewOlapScanNode::NewOlapScanNode(ObjectPool* pool, const TPlanNode& tnode,
     }
 }
 
+Status NewOlapScanNode::collect_query_statistics(QueryStatistics* statistics) {
+    RETURN_IF_ERROR(ExecNode::collect_query_statistics(statistics));
+    statistics->add_scan_bytes(_read_compressed_counter->value());
+    statistics->add_scan_rows(_raw_rows_counter->value());
+    statistics->add_cpu_ms(_scan_cpu_timer->value() / NANOS_PER_MILLIS);
+    return Status::OK();
+}
+
 Status NewOlapScanNode::prepare(RuntimeState* state) {
     RETURN_IF_ERROR(VScanNode::prepare(state));
-    SCOPED_CONSUME_MEM_TRACKER(mem_tracker());
     return Status::OK();
 }
 
@@ -64,10 +71,22 @@ Status NewOlapScanNode::_init_profile() {
     _raw_rows_counter = ADD_COUNTER(_segment_profile, "RawRowsRead", TUnit::UNIT);
     _block_convert_timer = ADD_TIMER(_scanner_profile, "BlockConvertTime");
     _block_init_timer = ADD_TIMER(_segment_profile, "BlockInitTime");
+    _block_init_get_row_range_by_keys_timer =
+            ADD_TIMER(_segment_profile, "BlockInitGetRowRangeByKeysTime");
+    _block_init_get_row_range_by_conditions_timer =
+            ADD_TIMER(_segment_profile, "BlockInitGetRowRangeByConditionsTime");
     _block_init_seek_timer = ADD_TIMER(_segment_profile, "BlockInitSeekTime");
     _block_init_seek_counter = ADD_COUNTER(_segment_profile, "BlockInitSeekCount", TUnit::UNIT);
+    _block_conditions_filtered_timer = ADD_TIMER(_segment_profile, "BlockConditionsFilteredTime");
 
-    _rows_vec_cond_counter = ADD_COUNTER(_segment_profile, "RowsVectorPredFiltered", TUnit::UNIT);
+    _rows_vec_cond_filtered_counter =
+            ADD_COUNTER(_segment_profile, "RowsVectorPredFiltered", TUnit::UNIT);
+    _rows_short_circuit_cond_filtered_counter =
+            ADD_COUNTER(_segment_profile, "RowsShortCircuitPredFiltered", TUnit::UNIT);
+    _rows_vec_cond_input_counter =
+            ADD_COUNTER(_segment_profile, "RowsVectorPredInput", TUnit::UNIT);
+    _rows_short_circuit_cond_input_counter =
+            ADD_COUNTER(_segment_profile, "RowsShortCircuitPredInput", TUnit::UNIT);
     _vec_cond_timer = ADD_TIMER(_segment_profile, "VectorPredEvalTime");
     _short_cond_timer = ADD_TIMER(_segment_profile, "ShortPredEvalTime");
     _first_read_timer = ADD_TIMER(_segment_profile, "FirstReadTime");
@@ -206,6 +225,12 @@ Status NewOlapScanNode::_build_key_ranges_and_filters() {
                             if (exact_range) {
                                 _colname_to_value_range.erase(iter->first);
                             }
+                        } else {
+                            // if exceed max_pushdown_conditions_per_column, use whole_value_rang instead
+                            // and will not erase from _colname_to_value_range, it must be not exact_range
+                            temp_range.set_whole_value_range();
+                            RETURN_IF_ERROR(_scan_keys.extend_scan_key(
+                                    temp_range, _max_scan_key_num, &exact_range, &eos));
                         }
                         return Status::OK();
                     },
@@ -244,12 +269,15 @@ Status NewOlapScanNode::_build_key_ranges_and_filters() {
     return Status::OK();
 }
 
-VScanNode::PushDownType NewOlapScanNode::_should_push_down_function_filter(
-        VectorizedFnCall* fn_call, VExprContext* expr_ctx, StringVal* constant_str,
-        doris_udf::FunctionContext** fn_ctx) {
+Status NewOlapScanNode::_should_push_down_function_filter(VectorizedFnCall* fn_call,
+                                                          VExprContext* expr_ctx,
+                                                          StringVal* constant_str,
+                                                          doris_udf::FunctionContext** fn_ctx,
+                                                          VScanNode::PushDownType& pdt) {
     // Now only `like` function filters is supported to push down
     if (fn_call->fn().name.function_name != "like") {
-        return PushDownType::UNACCEPTABLE;
+        pdt = PushDownType::UNACCEPTABLE;
+        return Status::OK();
     }
 
     const auto& children = fn_call->children();
@@ -263,19 +291,24 @@ VScanNode::PushDownType NewOlapScanNode::_should_push_down_function_filter(
         }
         if (!children[1 - i]->is_constant()) {
             // only handle constant value
-            return PushDownType::UNACCEPTABLE;
+            pdt = PushDownType::UNACCEPTABLE;
+            return Status::OK();
         } else {
             DCHECK(children[1 - i]->type().is_string_type());
-            if (const ColumnConst* const_column = check_and_get_column<ColumnConst>(
-                        children[1 - i]->get_const_col(expr_ctx)->column_ptr)) {
+            ColumnPtrWrapper* const_col_wrapper = nullptr;
+            RETURN_IF_ERROR(children[1 - i]->get_const_col(expr_ctx, &const_col_wrapper));
+            if (const ColumnConst* const_column =
+                        check_and_get_column<ColumnConst>(const_col_wrapper->column_ptr)) {
                 *constant_str = const_column->get_data_at(0).to_string_val();
             } else {
-                return PushDownType::UNACCEPTABLE;
+                pdt = PushDownType::UNACCEPTABLE;
+                return Status::OK();
             }
         }
     }
     *fn_ctx = func_cxt;
-    return PushDownType::ACCEPTABLE;
+    pdt = PushDownType::ACCEPTABLE;
+    return Status::OK();
 }
 
 // PlanFragmentExecutor will call this method to set scan range
@@ -365,13 +398,17 @@ Status NewOlapScanNode::_init_scanners(std::list<VScanner*>* scanners) {
 
             NewOlapScanner* scanner = new NewOlapScanner(
                     _state, this, _limit_per_scanner, _olap_scan_node.is_preaggregation,
-                    _need_agg_finalize, *scan_range, _scanner_profile.get());
+                    _need_agg_finalize, _scanner_profile.get());
             // add scanner to pool before doing prepare.
             // so that scanner can be automatically deconstructed if prepare failed.
             _scanner_pool.add(scanner);
-            RETURN_IF_ERROR(scanner->prepare(*scan_range, scanner_ranges, _vconjunct_ctx_ptr.get(),
-                                             _olap_filters, _filter_predicates,
-                                             _push_down_functions));
+            Status st = scanner->prepare(*scan_range, scanner_ranges, _vconjunct_ctx_ptr.get(),
+                                         _olap_filters, _filter_predicates, _push_down_functions);
+            if (!st.ok()) {
+                // during prepare, scanner already cloned vexpr_context, should call close to release it.
+                scanner->close(_state);
+                return st;
+            }
             scanners->push_back((VScanner*)scanner);
             disk_set.insert(scanner->scan_disk());
         }

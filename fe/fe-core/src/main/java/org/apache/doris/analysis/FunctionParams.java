@@ -75,7 +75,7 @@ public class FunctionParams implements Writable {
     }
 
     public TAggregateExpr createTAggregateExpr(boolean isMergeAggFn) {
-        List<TTypeDesc> paramTypes = new ArrayList<TTypeDesc>();
+        List<TTypeDesc> paramTypes = new ArrayList<>();
         if (exprs != null) {
             for (Expr expr : exprs) {
                 TTypeDesc desc = expr.getType().toThrift();
@@ -119,7 +119,7 @@ public class FunctionParams implements Writable {
         }
     }
 
-    public void readFields(DataInput in) throws IOException {
+    private void readFields(DataInput in) throws IOException {
         isStar = in.readBoolean();
         isDistinct = in.readBoolean();
         if (in.readBoolean()) {

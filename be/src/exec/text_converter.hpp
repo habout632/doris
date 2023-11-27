@@ -205,6 +205,7 @@ inline bool TextConverter::write_vec_column(const SlotDescriptor* slot_desc,
         }
     }
 
+    bool insert_after_parse_failure = true;
     StringParser::ParseResult parse_result = StringParser::PARSE_SUCCESS;
     // Parse the raw-text data. Translate the text string to internal format.
     switch (slot_desc->type().type) {
@@ -271,6 +272,7 @@ inline bool TextConverter::write_vec_column(const SlotDescriptor* slot_desc,
         vectorized::VecDateTimeValue ts_slot;
         if (!ts_slot.from_date_str(data, len)) {
             parse_result = StringParser::PARSE_FAILURE;
+            insert_after_parse_failure = false;
             break;
         }
         ts_slot.cast_to_date();
@@ -278,11 +280,23 @@ inline bool TextConverter::write_vec_column(const SlotDescriptor* slot_desc,
                 reinterpret_cast<char*>(&ts_slot), 0);
         break;
     }
-
+    case TYPE_DATEV2: {
+        vectorized::VecDateTimeValue ts_slot;
+        if (!ts_slot.from_date_str(data, len)) {
+            parse_result = StringParser::PARSE_FAILURE;
+            insert_after_parse_failure = false;
+            break;
+        }
+        ts_slot.cast_to_date();
+        uint32_t num = ts_slot.to_date_v2();
+        reinterpret_cast<vectorized::ColumnVector<vectorized::UInt32>*>(col_ptr)->insert_value(num);
+        break;
+    }
     case TYPE_DATETIME: {
         vectorized::VecDateTimeValue ts_slot;
         if (!ts_slot.from_date_str(data, len)) {
             parse_result = StringParser::PARSE_FAILURE;
+            insert_after_parse_failure = false;
             break;
         }
         ts_slot.to_datetime();
@@ -290,30 +304,80 @@ inline bool TextConverter::write_vec_column(const SlotDescriptor* slot_desc,
                 reinterpret_cast<char*>(&ts_slot), 0);
         break;
     }
+    case TYPE_DATETIMEV2: {
+        vectorized::VecDateTimeValue ts_slot;
+        if (!ts_slot.from_date_str(data, len)) {
+            parse_result = StringParser::PARSE_FAILURE;
+            insert_after_parse_failure = false;
+            break;
+        }
+        ts_slot.to_datetime();
+        uint64_t num = ts_slot.to_datetime_v2();
+        reinterpret_cast<vectorized::ColumnVector<vectorized::UInt64>*>(col_ptr)->insert_value(num);
+        break;
+    }
 
     case TYPE_DECIMALV2: {
         DecimalV2Value decimal_slot;
         if (decimal_slot.parse_from_str(data, len)) {
             parse_result = StringParser::PARSE_FAILURE;
+            insert_after_parse_failure = false;
             break;
         }
         reinterpret_cast<vectorized::ColumnVector<vectorized::Int128>*>(col_ptr)->insert_value(
                 decimal_slot.value());
         break;
     }
-
+    case TYPE_DECIMAL32: {
+        StringParser::ParseResult result = StringParser::PARSE_SUCCESS;
+        int32_t value = StringParser::string_to_decimal<int32_t>(
+                data, len, slot_desc->type().precision, slot_desc->type().scale, &result);
+        if (result != StringParser::PARSE_SUCCESS) {
+            parse_result = StringParser::PARSE_FAILURE;
+            break;
+        }
+        reinterpret_cast<vectorized::ColumnVector<vectorized::Int32>*>(col_ptr)->insert_value(
+                value);
+        break;
+    }
+    case TYPE_DECIMAL64: {
+        StringParser::ParseResult result = StringParser::PARSE_SUCCESS;
+        int64_t value = StringParser::string_to_decimal<int64_t>(
+                data, len, slot_desc->type().precision, slot_desc->type().scale, &result);
+        if (result != StringParser::PARSE_SUCCESS) {
+            parse_result = StringParser::PARSE_FAILURE;
+            break;
+        }
+        reinterpret_cast<vectorized::ColumnVector<vectorized::Int64>*>(col_ptr)->insert_value(
+                value);
+        break;
+    }
+    case TYPE_DECIMAL128I: {
+        StringParser::ParseResult result = StringParser::PARSE_SUCCESS;
+        vectorized::Int128 value = StringParser::string_to_decimal<vectorized::Int128>(
+                data, len, slot_desc->type().precision, slot_desc->type().scale, &result);
+        if (result != StringParser::PARSE_SUCCESS) {
+            parse_result = StringParser::PARSE_FAILURE;
+            break;
+        }
+        reinterpret_cast<vectorized::ColumnVector<vectorized::Int128>*>(col_ptr)->insert_value(
+                value);
+        break;
+    }
     default:
         DCHECK(false) << "bad slot type: " << slot_desc->type();
         break;
     }
 
     if (UNLIKELY(parse_result == StringParser::PARSE_FAILURE)) {
-        if (true == slot_desc->is_nullable()) {
+        if (slot_desc->is_nullable()) {
             auto* nullable_column = reinterpret_cast<vectorized::ColumnNullable*>(nullable_col_ptr);
             size_t size = nullable_column->get_null_map_data().size();
             doris::vectorized::NullMap& null_map_data = nullable_column->get_null_map_data();
             null_map_data[size - 1] = 1;
-            nullable_column->get_nested_column().insert_default();
+            if (!insert_after_parse_failure) {
+                nullable_column->get_nested_column().insert_default();
+            }
         }
         return false;
     }

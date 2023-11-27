@@ -124,7 +124,7 @@ public:
     // @param [in] root_path specify root path of new tablet
     // @param [in] request specify new tablet info
     // @param [in] restore whether we're restoring a tablet from trash
-    // @return OLAP_SUCCESS if load tablet success
+    // @return OK if load tablet success
     Status load_header(const std::string& shard_path, const TCloneReq& request,
                        bool restore = false);
 
@@ -169,6 +169,7 @@ public:
     Status start_trash_sweep(double* usage, bool ignore_guard = false);
 
     void stop();
+    bool stopped() { return _stopped; }
 
     void create_cumulative_compaction(TabletSharedPtr best_tablet,
                                       std::shared_ptr<CumulativeCompaction>& cumulative_compaction);
@@ -211,7 +212,7 @@ private:
     Status _check_all_root_path_cluster_id();
     Status _judge_and_update_effective_cluster_id(int32_t cluster_id);
 
-    bool _delete_tablets_on_unused_root_path();
+    void _exit_if_too_many_disks_are_failed();
 
     void _clean_unused_txns();
 
@@ -317,14 +318,14 @@ private:
     int32_t _effective_cluster_id;
     bool _is_all_cluster_id_exist;
 
+    bool _stopped;
+
     static StorageEngine* _s_instance;
 
     std::mutex _gc_mutex;
     // map<rowset_id(str), RowsetSharedPtr>, if we use RowsetId as the key, we need custom hash func
     std::unordered_map<std::string, RowsetSharedPtr> _unused_rowsets;
 
-    // StorageEngine oneself
-    std::shared_ptr<MemTracker> _mem_tracker;
     // Count the memory consumption of segment compaction tasks.
     std::shared_ptr<MemTracker> _segcompaction_mem_tracker;
     // This mem tracker is only for tracking memory use by segment meta data such as footer or index page.

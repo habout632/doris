@@ -20,6 +20,7 @@ package org.apache.doris.common.util;
 import org.apache.doris.analysis.TimestampArithmeticExpr.TimeUnit;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Database;
+import org.apache.doris.catalog.DistributionInfo;
 import org.apache.doris.catalog.DynamicPartitionProperty;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.OlapTable;
@@ -39,6 +40,7 @@ import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.FeNameFormat;
 import org.apache.doris.common.UserException;
 import org.apache.doris.policy.StoragePolicy;
+import org.apache.doris.thrift.TStorageMedium;
 
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
@@ -85,11 +87,12 @@ public class DynamicPartitionUtil {
         RangePartitionInfo rangePartitionInfo = (RangePartitionInfo) partitionInfo;
         Preconditions.checkState(!rangePartitionInfo.isMultiColumnPartition());
         Column partitionColumn = rangePartitionInfo.getPartitionColumns().get(0);
-        if ((partitionColumn.getDataType() == PrimitiveType.DATE)
+        if ((partitionColumn.getDataType() == PrimitiveType.DATE
+                || partitionColumn.getDataType() == PrimitiveType.DATEV2)
                 && (timeUnit.equalsIgnoreCase(TimeUnit.HOUR.toString()))) {
             ErrorReport.reportDdlException(DynamicPartitionProperty.TIME_UNIT + " could not be "
-                    + TimeUnit.HOUR.toString() + " when type of partition column "
-                    + partitionColumn.getDisplayName() + " is " + PrimitiveType.DATE.toString());
+                    + TimeUnit.HOUR + " when type of partition column "
+                    + partitionColumn.getDisplayName() + " is " + PrimitiveType.DATE + " or " + PrimitiveType.DATEV2);
         } else if (PrimitiveType.getIntegerTypes().contains(partitionColumn.getDataType())
                 && timeUnit.equalsIgnoreCase(TimeUnit.HOUR.toString())) {
             // The partition column's type is INT, not support HOUR
@@ -346,22 +349,30 @@ public class DynamicPartitionUtil {
 
     private static void checkRemoteStoragePolicy(String policyName) throws DdlException {
         if (Strings.isNullOrEmpty(policyName)) {
-            LOG.info(DynamicPartitionProperty.REMOTE_STORAGE_POLICY + " is null, remove this key");
+            LOG.info(DynamicPartitionProperty.STORAGE_POLICY + " is null, remove this key");
             return;
         }
         if (policyName.isEmpty()) {
-            throw new DdlException(DynamicPartitionProperty.REMOTE_STORAGE_POLICY + " is empty.");
+            throw new DdlException(DynamicPartitionProperty.STORAGE_POLICY + " is empty.");
         }
         StoragePolicy checkedPolicyCondition = StoragePolicy.ofCheck(policyName);
         if (!Env.getCurrentEnv().getPolicyMgr().existPolicy(checkedPolicyCondition)) {
             throw new DdlException(
-                    DynamicPartitionProperty.REMOTE_STORAGE_POLICY + ": " + policyName + " doesn't exist.");
+                    DynamicPartitionProperty.STORAGE_POLICY + ": " + policyName + " doesn't exist.");
         }
         StoragePolicy storagePolicy = (StoragePolicy) Env.getCurrentEnv().getPolicyMgr()
                 .getPolicy(checkedPolicyCondition);
         if (Strings.isNullOrEmpty(storagePolicy.getCooldownTtl())) {
             throw new DdlException("Storage policy cooldown type need to be cooldownTtl for properties "
-                    + DynamicPartitionProperty.REMOTE_STORAGE_POLICY + ": " + policyName);
+                    + DynamicPartitionProperty.STORAGE_POLICY + ": " + policyName);
+        }
+    }
+
+    private static void checkStorageMedium(String storageMedium) throws DdlException {
+        try {
+            TStorageMedium.valueOf(storageMedium.toUpperCase());
+        } catch (IllegalArgumentException e) {
+            throw new DdlException("invalid storage medium: " + storageMedium + ". Should be SSD or HDD");
         }
     }
 
@@ -389,10 +400,12 @@ public class DynamicPartitionUtil {
     // Check if all requried properties has been set.
     // And also check all optional properties, if not set, set them to default value.
     public static boolean checkInputDynamicPartitionProperties(Map<String, String> properties,
-            PartitionInfo partitionInfo) throws DdlException {
+            OlapTable olapTable) throws DdlException {
         if (properties == null || properties.isEmpty()) {
             return false;
         }
+
+        PartitionInfo partitionInfo = olapTable.getPartitionInfo();
         if (partitionInfo.getType() != PartitionType.RANGE || partitionInfo.isMultiColumnPartition()) {
             throw new DdlException("Dynamic partition only support single-column range partition");
         }
@@ -433,7 +446,9 @@ public class DynamicPartitionUtil {
                 throw new DdlException("Must assign dynamic_partition.end properties");
             }
             if (Strings.isNullOrEmpty(buckets)) {
-                throw new DdlException("Must assign dynamic_partition.buckets properties");
+                DistributionInfo distributionInfo = olapTable.getDefaultDistributionInfo();
+                buckets = String.valueOf(distributionInfo.getBucketNum());
+                properties.put(DynamicPartitionProperty.BUCKETS, buckets);
             }
             if (Strings.isNullOrEmpty(timeZone)) {
                 properties.put(DynamicPartitionProperty.TIME_ZONE, TimeUtils.getSystemTimeZone().getID());
@@ -447,7 +462,7 @@ public class DynamicPartitionUtil {
             }
             if (Strings.isNullOrEmpty(reservedHistoryPeriods)) {
                 properties.put(DynamicPartitionProperty.RESERVED_HISTORY_PERIODS,
-                        String.valueOf(DynamicPartitionProperty.NOT_SET_RESERVED_HISTORY_PERIODS));
+                        DynamicPartitionProperty.NOT_SET_RESERVED_HISTORY_PERIODS);
             }
         }
         return true;
@@ -457,12 +472,6 @@ public class DynamicPartitionUtil {
         if (olapTable.getTableProperty() != null
                 && olapTable.getTableProperty().getDynamicPartitionProperty() != null) {
             if (olapTable.getTableProperty().getDynamicPartitionProperty().getEnable()) {
-                if (!isReplay) {
-                    // execute create partition first time only in master of FE, So no need execute
-                    // when it's replay
-                    Env.getCurrentEnv().getDynamicPartitionScheduler()
-                            .executeDynamicPartitionFirstTime(dbId, olapTable.getId());
-                }
                 Env.getCurrentEnv().getDynamicPartitionScheduler()
                         .registerDynamicPartitionTable(dbId, olapTable.getId());
             } else {
@@ -496,6 +505,7 @@ public class DynamicPartitionUtil {
             properties.remove(DynamicPartitionProperty.BUCKETS);
             analyzedProperties.put(DynamicPartitionProperty.BUCKETS, bucketsValue);
         }
+
         if (properties.containsKey(DynamicPartitionProperty.ENABLE)) {
             String enableValue = properties.get(DynamicPartitionProperty.ENABLE);
             checkEnable(enableValue);
@@ -616,12 +626,20 @@ public class DynamicPartitionUtil {
             properties.remove(DynamicPartitionProperty.RESERVED_HISTORY_PERIODS);
             analyzedProperties.put(DynamicPartitionProperty.RESERVED_HISTORY_PERIODS, reservedHistoryPeriods);
         }
-        if (properties.containsKey(DynamicPartitionProperty.REMOTE_STORAGE_POLICY)) {
-            String remoteStoragePolicy = properties.get(DynamicPartitionProperty.REMOTE_STORAGE_POLICY);
+        if (properties.containsKey(DynamicPartitionProperty.STORAGE_POLICY)) {
+            String remoteStoragePolicy = properties.get(DynamicPartitionProperty.STORAGE_POLICY);
             checkRemoteStoragePolicy(remoteStoragePolicy);
-            properties.remove(DynamicPartitionProperty.REMOTE_STORAGE_POLICY);
+            properties.remove(DynamicPartitionProperty.STORAGE_POLICY);
             if (!Strings.isNullOrEmpty(remoteStoragePolicy)) {
-                analyzedProperties.put(DynamicPartitionProperty.REMOTE_STORAGE_POLICY, remoteStoragePolicy);
+                analyzedProperties.put(DynamicPartitionProperty.STORAGE_POLICY, remoteStoragePolicy);
+            }
+        }
+        if (properties.containsKey(DynamicPartitionProperty.STORAGE_MEDIUM)) {
+            String storageMedium = properties.get(DynamicPartitionProperty.STORAGE_MEDIUM);
+            checkStorageMedium(storageMedium);
+            properties.remove(DynamicPartitionProperty.STORAGE_MEDIUM);
+            if (!Strings.isNullOrEmpty(storageMedium)) {
+                analyzedProperties.put(DynamicPartitionProperty.STORAGE_MEDIUM, storageMedium);
             }
         }
         return analyzedProperties;
@@ -657,7 +675,7 @@ public class DynamicPartitionUtil {
      */
     public static void checkAndSetDynamicPartitionProperty(OlapTable olapTable, Map<String, String> properties,
             Database db) throws UserException {
-        if (DynamicPartitionUtil.checkInputDynamicPartitionProperties(properties, olapTable.getPartitionInfo())) {
+        if (DynamicPartitionUtil.checkInputDynamicPartitionProperties(properties, olapTable)) {
             Map<String, String> dynamicPartitionProperties =
                     DynamicPartitionUtil.analyzeDynamicPartition(properties, olapTable, db);
             TableProperty tableProperty = olapTable.getTableProperty();
@@ -729,7 +747,7 @@ public class DynamicPartitionUtil {
     }
 
     public static String getHistoryPartitionRangeString(DynamicPartitionProperty dynamicPartitionProperty,
-            String time, String format) {
+            String time, String format) throws AnalysisException {
         ZoneId zoneId = dynamicPartitionProperty.getTimeZone().toZoneId();
         Date date = null;
         Timestamp timestamp = null;
@@ -740,8 +758,7 @@ public class DynamicPartitionUtil {
             date = simpleDateFormat.parse(time);
         } catch (ParseException e) {
             LOG.warn("Parse dynamic partition periods error. Error={}", e.getMessage());
-            return getFormattedTimeWithoutMinuteSecond(
-                    ZonedDateTime.parse(timestamp.toString(), dateTimeFormatter), format);
+            throw new AnalysisException("Parse dynamic partition periods error. Error=" + e.getMessage());
         }
         timestamp = new Timestamp(date.getTime());
         return getFormattedTimeWithoutMinuteSecond(

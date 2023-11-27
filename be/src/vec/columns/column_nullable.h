@@ -141,17 +141,26 @@ public:
 
     void insert_default() override {
         get_nested_column().insert_default();
-        get_null_map_data().push_back(1);
+        _get_null_map_data().push_back(1);
+        _has_null = true;
     }
 
     void insert_many_defaults(size_t length) override {
         get_nested_column().insert_many_defaults(length);
-        get_null_map_data().resize_fill(get_null_map_data().size() + length, 1);
+        _get_null_map_data().resize_fill(get_null_map_data().size() + length, 1);
+        _has_null = true;
+    }
+
+    void insert_not_null_elements(size_t num) {
+        get_nested_column().insert_many_defaults(num);
+        _get_null_map_column().fill(0, num);
+        _has_null = false;
     }
 
     void insert_null_elements(int num) {
         get_nested_column().insert_many_defaults(num);
-        get_null_map_column().fill(1, num);
+        _get_null_map_column().fill(1, num);
+        _has_null = true;
     }
 
     void pop_back(size_t n) override;
@@ -177,6 +186,10 @@ public:
                                 const uint8_t* __restrict null_data) const override;
     void update_hashes_with_value(uint64_t* __restrict hashes,
                                   const uint8_t* __restrict null_data) const override;
+    void update_xxHash_with_value(size_t start, size_t end, uint64_t& hash,
+                                  const uint8_t* __restrict null_data) const override;
+    void update_crc_with_value(size_t start, size_t end, uint64_t& hash,
+                               const uint8_t* __restrict null_data) const override;
     void get_extremes(Field& min, Field& max) const override;
 
     MutableColumns scatter(ColumnIndex num_columns, const Selector& selector) const override {
@@ -211,6 +224,7 @@ public:
 
     bool is_nullable() const override { return true; }
     bool is_bitmap() const override { return get_nested_column().is_bitmap(); }
+    bool is_hll() const override { return get_nested_column().is_hll(); }
     bool is_column_decimal() const override { return get_nested_column().is_column_decimal(); }
     bool is_column_string() const override { return get_nested_column().is_column_string(); }
     bool is_column_array() const override { return get_nested_column().is_column_array(); }
@@ -304,14 +318,26 @@ public:
         get_nested_column().convert_dict_codes_if_necessary();
     }
 
-    void generate_hash_values_for_runtime_filter() override {
-        get_nested_column().generate_hash_values_for_runtime_filter();
+    void initialize_hash_values_for_runtime_filter() override {
+        get_nested_column().initialize_hash_values_for_runtime_filter();
     }
 
     void sort_column(const ColumnSorter* sorter, EqualFlags& flags, IColumn::Permutation& perms,
                      EqualRange& range, bool last_column) const override;
 
+    void set_rowset_segment_id(std::pair<RowsetId, uint32_t> rowset_segment_id) override {
+        nested_column->set_rowset_segment_id(rowset_segment_id);
+    }
+
+    std::pair<RowsetId, uint32_t> get_rowset_segment_id() const override {
+        return nested_column->get_rowset_segment_id();
+    }
+
 private:
+    // the two functions will not update `_need_update_has_null`
+    ColumnUInt8& _get_null_map_column() { return assert_cast<ColumnUInt8&>(*null_map); }
+    NullMap& _get_null_map_data() { return get_null_map_column().get_data(); }
+
     WrappedPtr nested_column;
     WrappedPtr null_map;
 

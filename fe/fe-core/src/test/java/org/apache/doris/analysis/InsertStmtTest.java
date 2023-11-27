@@ -157,8 +157,9 @@ public class InsertStmtTest {
         ConnectContext ctx = UtFrameUtils.createDefaultCtx();
         String sql = "values(1,'a',2,'b')";
 
-        SqlScanner input = new SqlScanner(new StringReader(sql), ctx.getSessionVariable().getSqlMode());
-        SqlParser parser = new SqlParser(input);
+        org.apache.doris.analysis.SqlScanner input = new org.apache.doris.analysis.SqlScanner(
+                new StringReader(sql), ctx.getSessionVariable().getSqlMode());
+        org.apache.doris.analysis.SqlParser parser = new org.apache.doris.analysis.SqlParser(input);
         Analyzer analyzer = new Analyzer(ctx.getEnv(), ctx);
         StatementBase statementBase = null;
         try {
@@ -202,9 +203,10 @@ public class InsertStmtTest {
         FunctionCallExpr expr4 = (FunctionCallExpr) queryStmtSubstitute.getResultExprs().get(4);
         Assert.assertTrue(expr4.getFnName().getFunction().equals("to_bitmap"));
         List<Expr> slots = Lists.newArrayList();
-        expr4.collect(IntLiteral.class, slots);
+        expr4.collect(StringLiteral.class, slots);
         Assert.assertEquals(1, slots.size());
-        Assert.assertEquals(queryStmtSubstitute.getResultExprs().get(0), slots.get(0));
+        Assert.assertEquals(queryStmtSubstitute.getResultExprs().get(0).getStringValue(),
+                slots.get(0).getStringValue());
 
         Assert.assertTrue(queryStmtSubstitute.getResultExprs().get(5) instanceof FunctionCallExpr);
         FunctionCallExpr expr5 = (FunctionCallExpr) queryStmtSubstitute.getResultExprs().get(5);
@@ -220,8 +222,9 @@ public class InsertStmtTest {
         ConnectContext ctx = UtFrameUtils.createDefaultCtx();
         String sql = "select kk1, kk2, kk3, kk4 from db.tbl";
 
-        SqlScanner input = new SqlScanner(new StringReader(sql), ctx.getSessionVariable().getSqlMode());
-        SqlParser parser = new SqlParser(input);
+        org.apache.doris.analysis.SqlScanner input = new org.apache.doris.analysis.SqlScanner(
+                new StringReader(sql), ctx.getSessionVariable().getSqlMode());
+        org.apache.doris.analysis.SqlParser parser = new org.apache.doris.analysis.SqlParser(input);
         Analyzer analyzer = new Analyzer(ctx.getEnv(), ctx);
         StatementBase statementBase = null;
         try {

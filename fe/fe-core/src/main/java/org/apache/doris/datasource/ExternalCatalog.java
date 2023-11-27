@@ -21,15 +21,21 @@ import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.external.EsExternalDatabase;
 import org.apache.doris.catalog.external.ExternalDatabase;
+import org.apache.doris.catalog.external.ExternalTable;
 import org.apache.doris.catalog.external.HMSExternalDatabase;
+import org.apache.doris.catalog.external.IcebergExternalDatabase;
+import org.apache.doris.catalog.external.JdbcExternalDatabase;
 import org.apache.doris.cluster.ClusterNamespace;
+import org.apache.doris.common.DdlException;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
 import org.apache.doris.common.util.Util;
 import org.apache.doris.persist.gson.GsonPostProcessable;
 import org.apache.doris.persist.gson.GsonUtils;
+import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.MasterCatalogExecutor;
 
+import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.gson.annotations.SerializedName;
 import lombok.Data;
@@ -43,6 +49,7 @@ import java.io.DataOutput;
 import java.io.IOException;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * The abstract class for all types of external catalogs.
@@ -60,7 +67,7 @@ public abstract class ExternalCatalog implements CatalogIf<ExternalDatabase>, Wr
     protected String type;
     // save properties of this catalog, such as hive meta store url.
     @SerializedName(value = "catalogProperty")
-    protected CatalogProperty catalogProperty = new CatalogProperty();
+    protected CatalogProperty catalogProperty;
     @SerializedName(value = "initialized")
     private boolean initialized = false;
     @SerializedName(value = "idToDb")
@@ -68,8 +75,14 @@ public abstract class ExternalCatalog implements CatalogIf<ExternalDatabase>, Wr
     // db name does not contains "default_cluster"
     protected Map<String, Long> dbNameToId = Maps.newConcurrentMap();
     private boolean objectCreated = false;
+    protected boolean invalidCacheInInit = true;
 
     private ExternalSchemaCache schemaCache;
+
+    public ExternalCatalog(long catalogId, String name) {
+        this.id = catalogId;
+        this.name = name;
+    }
 
     /**
      * @return names of database in this catalog.
@@ -92,6 +105,17 @@ public abstract class ExternalCatalog implements CatalogIf<ExternalDatabase>, Wr
     public abstract boolean tableExist(SessionContext ctx, String dbName, String tblName);
 
     /**
+     * check if the specified table exist in doris.
+     *
+     * @param dbName
+     * @param tblName
+     * @return true if table exists, false otherwise
+     */
+    public boolean tableExistInLocal(String dbName, String tblName) {
+        throw new NotImplementedException();
+    }
+
+    /**
      * Catalog can't be init when creating because the external catalog may depend on third system.
      * So you have to make sure the client of third system is initialized before any method was called.
      */
@@ -100,7 +124,9 @@ public abstract class ExternalCatalog implements CatalogIf<ExternalDatabase>, Wr
         if (!initialized) {
             if (!Env.getCurrentEnv().isMaster()) {
                 // Forward to master and wait the journal to replay.
-                MasterCatalogExecutor remoteExecutor = new MasterCatalogExecutor();
+                int waitTimeOut = ConnectContext.get() == null ? 300
+                        : ConnectContext.get().getSessionVariable().getQueryTimeoutS();
+                MasterCatalogExecutor remoteExecutor = new MasterCatalogExecutor(waitTimeOut * 1000);
                 try {
                     remoteExecutor.forward(id, -1);
                 } catch (Exception e) {
@@ -121,23 +147,51 @@ public abstract class ExternalCatalog implements CatalogIf<ExternalDatabase>, Wr
         }
     }
 
+    public boolean isInitialized() {
+        return this.initialized;
+    }
+
     // init some local objects such as:
     // hms client, read properties from hive-site.xml, es client
     protected abstract void initLocalObjectsImpl();
 
+    // check if all required properties are set when creating catalog
+    public void checkProperties() throws DdlException {
+    }
+
     // init schema related objects
     protected abstract void init();
 
-    public void setUninitialized() {
+    public void setUninitialized(boolean invalidCache) {
+        this.objectCreated = false;
         this.initialized = false;
+        this.invalidCacheInInit = invalidCache;
+        if (invalidCache) {
+            Env.getCurrentEnv().getExtMetaCacheMgr().invalidateCatalogCache(id);
+        }
+    }
+
+    public void updateDbList() {
         Env.getCurrentEnv().getExtMetaCacheMgr().invalidateCatalogCache(id);
     }
 
     public ExternalDatabase getDbForReplay(long dbId) {
-        throw new NotImplementedException();
+        return idToDb.get(dbId);
     }
 
-    public abstract List<Column> getSchema(String dbName, String tblName);
+    public final List<Column> getSchema(String dbName, String tblName) {
+        makeSureInitialized();
+        Optional<ExternalDatabase> db = getDb(dbName);
+        if (db.isPresent()) {
+            Optional table = db.get().getTable(tblName);
+            if (table.isPresent()) {
+                return ((ExternalTable) table.get()).initSchema();
+            }
+        }
+        // return one column with unsupported type.
+        // not return empty to avoid some unexpected issue.
+        return Lists.newArrayList(Column.UNSUPPORTED_COLUMN);
+    }
 
     @Override
     public long getId() {
@@ -159,16 +213,57 @@ public abstract class ExternalCatalog implements CatalogIf<ExternalDatabase>, Wr
         return listDatabaseNames(null);
     }
 
+    @Override
+    public List<String> getDbNamesOrEmpty() {
+        if (initialized) {
+            try {
+                return getDbNames();
+            } catch (Exception e) {
+                LOG.warn("failed to get db names in catalog {}", getName(), e);
+                return Lists.newArrayList();
+            }
+        } else {
+            return Lists.newArrayList();
+        }
+    }
+
+    @Override
+    public String getResource() {
+        return catalogProperty.getResource();
+    }
+
     @Nullable
     @Override
     public ExternalDatabase getDbNullable(String dbName) {
-        throw new NotImplementedException();
+        try {
+            makeSureInitialized();
+        } catch (Exception e) {
+            LOG.warn("failed to get db {} in catalog {}", dbName, name, e);
+            return null;
+        }
+        String realDbName = ClusterNamespace.getNameFromFullName(dbName);
+        if (!dbNameToId.containsKey(realDbName)) {
+            return null;
+        }
+        return idToDb.get(dbNameToId.get(realDbName));
     }
 
     @Nullable
     @Override
     public ExternalDatabase getDbNullable(long dbId) {
-        throw new NotImplementedException();
+        try {
+            makeSureInitialized();
+        } catch (Exception e) {
+            LOG.warn("failed to get db {} in catalog {}", dbId, name, e);
+            return null;
+        }
+        return idToDb.get(dbId);
+    }
+
+    @Override
+    public List<Long> getDbIds() {
+        makeSureInitialized();
+        return Lists.newArrayList(dbNameToId.values());
     }
 
     @Override
@@ -183,7 +278,8 @@ public abstract class ExternalCatalog implements CatalogIf<ExternalDatabase>, Wr
 
     @Override
     public void modifyCatalogProps(Map<String, String> props) {
-        catalogProperty.setProperties(props);
+        catalogProperty.modifyCatalogProps(props);
+        notifyPropertiesUpdated();
     }
 
     @Override
@@ -196,7 +292,7 @@ public abstract class ExternalCatalog implements CatalogIf<ExternalDatabase>, Wr
         Map<Long, ExternalDatabase> tmpIdToDb = Maps.newConcurrentMap();
         for (int i = 0; i < log.getRefreshCount(); i++) {
             ExternalDatabase db = getDbForReplay(log.getRefreshDbIds().get(i));
-            db.setUnInitialized();
+            db.setUnInitialized(invalidCacheInInit);
             tmpDbNameToId.put(db.getFullName(), db.getId());
             tmpIdToDb.put(db.getId(), db);
         }
@@ -212,6 +308,22 @@ public abstract class ExternalCatalog implements CatalogIf<ExternalDatabase>, Wr
             case ES:
                 for (int i = 0; i < log.getCreateCount(); i++) {
                     EsExternalDatabase db = new EsExternalDatabase(
+                            this, log.getCreateDbIds().get(i), log.getCreateDbNames().get(i));
+                    tmpDbNameToId.put(db.getFullName(), db.getId());
+                    tmpIdToDb.put(db.getId(), db);
+                }
+                break;
+            case JDBC:
+                for (int i = 0; i < log.getCreateCount(); i++) {
+                    JdbcExternalDatabase db = new JdbcExternalDatabase(
+                            this, log.getCreateDbIds().get(i), log.getCreateDbNames().get(i));
+                    tmpDbNameToId.put(db.getFullName(), db.getId());
+                    tmpIdToDb.put(db.getId(), db);
+                }
+                break;
+            case ICEBERG:
+                for (int i = 0; i < log.getCreateCount(); i++) {
+                    IcebergExternalDatabase db = new IcebergExternalDatabase(
                             this, log.getCreateDbIds().get(i), log.getCreateDbNames().get(i));
                     tmpDbNameToId.put(db.getFullName(), db.getId());
                     tmpIdToDb.put(db.getId(), db);
@@ -239,6 +351,10 @@ public abstract class ExternalCatalog implements CatalogIf<ExternalDatabase>, Wr
 
     @Override
     public void gsonPostProcess() throws IOException {
+        if (idToDb == null) {
+            // ExternalCatalog is loaded from meta with older version
+            idToDb = Maps.newConcurrentMap();
+        }
         dbNameToId = Maps.newConcurrentMap();
         for (ExternalDatabase db : idToDb.values()) {
             dbNameToId.put(ClusterNamespace.getNameFromFullName(db.getFullName()), db.getId());
@@ -246,10 +362,22 @@ public abstract class ExternalCatalog implements CatalogIf<ExternalDatabase>, Wr
             db.setTableExtCatalog(this);
         }
         objectCreated = false;
+        if (this instanceof HMSExternalCatalog) {
+            ((HMSExternalCatalog) this).setLastSyncedEventId(-1L);
+        }
     }
 
     public void addDatabaseForTest(ExternalDatabase db) {
         idToDb.put(db.getId(), db);
         dbNameToId.put(ClusterNamespace.getNameFromFullName(db.getFullName()), db.getId());
     }
+
+    public void dropDatabase(String dbName) {
+        throw new NotImplementedException();
+    }
+
+    public void createDatabase(long dbId, String dbName) {
+        throw new NotImplementedException();
+    }
 }
+

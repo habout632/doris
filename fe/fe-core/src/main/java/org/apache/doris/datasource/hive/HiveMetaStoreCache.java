@@ -18,6 +18,7 @@
 package org.apache.doris.datasource.hive;
 
 import org.apache.doris.analysis.PartitionValue;
+import org.apache.doris.catalog.HdfsResource;
 import org.apache.doris.catalog.ListPartitionItem;
 import org.apache.doris.catalog.PartitionItem;
 import org.apache.doris.catalog.PartitionKey;
@@ -35,6 +36,7 @@ import org.apache.doris.metric.MetricRepo;
 import org.apache.doris.planner.ColumnBound;
 import org.apache.doris.planner.ListPartitionPrunerV2;
 import org.apache.doris.planner.PartitionPrunerV2Base.UniqueId;
+import org.apache.doris.planner.external.HiveSplit;
 
 import com.google.common.base.Preconditions;
 import com.google.common.cache.CacheBuilder;
@@ -45,18 +47,27 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Range;
 import com.google.common.collect.RangeMap;
+import com.google.common.collect.TreeRangeMap;
 import lombok.Data;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hdfs.HdfsConfiguration;
 import org.apache.hadoop.hive.metastore.api.Partition;
 import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
 import org.apache.hadoop.mapred.FileInputFormat;
+import org.apache.hadoop.mapred.FileSplit;
 import org.apache.hadoop.mapred.InputFormat;
 import org.apache.hadoop.mapred.InputSplit;
 import org.apache.hadoop.mapred.JobConf;
+import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.parquet.Strings;
 
+import java.io.UnsupportedEncodingException;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
+import java.security.PrivilegedExceptionAction;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -74,6 +85,7 @@ import java.util.stream.Stream;
 public class HiveMetaStoreCache {
     private static final Logger LOG = LogManager.getLogger(HiveMetaStoreCache.class);
     private static final int MIN_BATCH_FETCH_PARTITION_NUM = 50;
+    public static final String HIVE_DEFAULT_PARTITION = "__HIVE_DEFAULT_PARTITION__";
 
     private HMSExternalCatalog catalog;
 
@@ -91,7 +103,7 @@ public class HiveMetaStoreCache {
     }
 
     private void init(Executor executor) {
-        partitionValuesCache = CacheBuilder.newBuilder().maximumSize(Config.max_hive_partition_cache_num)
+        partitionValuesCache = CacheBuilder.newBuilder().maximumSize(Config.max_hive_table_cache_num)
                 .expireAfterAccess(Config.external_cache_expire_time_minutes_after_access, TimeUnit.MINUTES)
                 .build(CacheLoader.asyncReloading(
                         new CacheLoader<PartitionValueCacheKey, HivePartitionValues>() {
@@ -163,27 +175,43 @@ public class HiveMetaStoreCache {
             LOG.debug("load #{} partitions for {} in catalog {}", partitionNames.size(), key, catalog.getName());
         }
         Map<Long, PartitionItem> idToPartitionItem = Maps.newHashMapWithExpectedSize(partitionNames.size());
+        Map<String, Long> partitionNameToIdMap = Maps.newHashMapWithExpectedSize(partitionNames.size());
+        Map<Long, List<UniqueId>> idToUniqueIdsMap = Maps.newHashMapWithExpectedSize(partitionNames.size());
         long idx = 0;
         for (String partitionName : partitionNames) {
-            idToPartitionItem.put(idx++, toListPartitionItem(partitionName, key.types));
+            String decodedPartitionName;
+            try {
+                decodedPartitionName = URLDecoder.decode(partitionName, StandardCharsets.UTF_8.name());
+            } catch (UnsupportedEncodingException e) {
+                // It should not be here
+                throw new RuntimeException(e);
+            }
+            long partitionId = idx++;
+            ListPartitionItem listPartitionItem = toListPartitionItem(partitionName, key.types);
+            idToPartitionItem.put(partitionId, listPartitionItem);
+            partitionNameToIdMap.put(decodedPartitionName, partitionId);
         }
 
         Map<UniqueId, Range<PartitionKey>> uidToPartitionRange = null;
         Map<Range<PartitionKey>, UniqueId> rangeToId = null;
         RangeMap<ColumnBound, UniqueId> singleColumnRangeMap = null;
+        Map<UniqueId, Range<ColumnBound>> singleUidToColumnRangeMap = null;
         if (key.types.size() > 1) {
             // uidToPartitionRange and rangeToId are only used for multi-column partition
-            uidToPartitionRange = ListPartitionPrunerV2.genUidToPartitionRange(idToPartitionItem);
+            uidToPartitionRange = ListPartitionPrunerV2.genUidToPartitionRange(idToPartitionItem, idToUniqueIdsMap);
             rangeToId = ListPartitionPrunerV2.genRangeToId(uidToPartitionRange);
         } else {
             Preconditions.checkState(key.types.size() == 1, key.types);
             // singleColumnRangeMap is only used for single-column partition
-            singleColumnRangeMap = ListPartitionPrunerV2.genSingleColumnRangeMap(idToPartitionItem);
+            singleColumnRangeMap = ListPartitionPrunerV2.genSingleColumnRangeMap(idToPartitionItem, idToUniqueIdsMap);
+            singleUidToColumnRangeMap = ListPartitionPrunerV2.genSingleUidToColumnRange(singleColumnRangeMap);
         }
-        return new HivePartitionValues(idToPartitionItem, uidToPartitionRange, rangeToId, singleColumnRangeMap);
+        Map<Long, List<String>> partitionValuesMap = ListPartitionPrunerV2.getPartitionValuesMap(idToPartitionItem);
+        return new HivePartitionValues(idToPartitionItem, uidToPartitionRange, rangeToId, singleColumnRangeMap, idx,
+                partitionNameToIdMap, idToUniqueIdsMap, singleUidToColumnRangeMap, partitionValuesMap);
     }
 
-    private ListPartitionItem toListPartitionItem(String partitionName, List<Type> types) {
+    public ListPartitionItem toListPartitionItem(String partitionName, List<Type> types) {
         // Partition name will be in format: nation=cn/city=beijing
         // parse it to get values "cn" and "beijing"
         String[] parts = partitionName.split("/");
@@ -192,7 +220,14 @@ public class HiveMetaStoreCache {
         for (String part : parts) {
             String[] kv = part.split("=");
             Preconditions.checkState(kv.length == 2, partitionName);
-            values.add(new PartitionValue(kv[1]));
+            String decodedValue = null;
+            try {
+                decodedValue = URLDecoder.decode(kv[1], StandardCharsets.UTF_8.name());
+            } catch (UnsupportedEncodingException e) {
+                // It should not be here
+                throw new RuntimeException(e);
+            }
+            values.add(new PartitionValue(decodedValue, HIVE_DEFAULT_PARTITION.equals(decodedValue)));
         }
         try {
             PartitionKey key = PartitionKey.createListPartitionKeyWithTypes(values, types);
@@ -211,44 +246,90 @@ public class HiveMetaStoreCache {
                     sd.getInputFormat(), sd.getLocation(), key, catalog.getName());
         }
         // TODO: more info?
-        return new HivePartition(sd.getInputFormat(), sd.getLocation(), key.values);
+        return new HivePartition(key.dbName, key.tblName, false, sd.getInputFormat(), sd.getLocation(), key.values);
     }
 
     private ImmutableList<InputSplit> loadFiles(FileCacheKey key) {
-        String finalLocation = convertToS3IfNecessary(key.location);
-        Configuration conf = getConfiguration();
-        JobConf jobConf = new JobConf(conf);
-        // For Tez engine, it may generate subdirectories for "union" query.
-        // So there may be files and directories in the table directory at the same time. eg:
-        //      /user/hive/warehouse/region_tmp_union_all2/000000_0
-        //      /user/hive/warehouse/region_tmp_union_all2/1
-        //      /user/hive/warehouse/region_tmp_union_all2/2
-        // So we need to set this config to support visit dir recursively.
-        // Otherwise, getSplits() may throw exception: "Not a file xxx"
-        // https://blog.actorsfit.com/a?ID=00550-ce56ec63-1bff-4b0c-a6f7-447b93efaa31
-        jobConf.set("mapreduce.input.fileinputformat.input.dir.recursive", "true");
-        FileInputFormat.setInputPaths(jobConf, finalLocation);
+        ClassLoader classLoader = Thread.currentThread().getContextClassLoader();
         try {
-            InputFormat<?, ?> inputFormat = HiveUtil.getInputFormat(conf, key.inputFormat, false);
-            InputSplit[] splits = inputFormat.getSplits(jobConf, 0);
-            if (LOG.isDebugEnabled()) {
-                LOG.debug("load #{} files for {} in catalog {}", splits.length, key, catalog.getName());
+            Thread.currentThread().setContextClassLoader(ClassLoader.getSystemClassLoader());
+            String finalLocation = convertToS3IfNecessary(key.location);
+            JobConf jobConf = getJobConf();
+            // For Tez engine, it may generate subdirectories for "union" query.
+            // So there may be files and directories in the table directory at the same time. eg:
+            //      /us£er/hive/warehouse/region_tmp_union_all2/000000_0
+            //      /user/hive/warehouse/region_tmp_union_all2/1
+            //      /user/hive/warehouse/region_tmp_union_all2/2
+            // So we need to set this config to support visit dir recursively.
+            // Otherwise, getSplits() may throw exception: "Not a file xxx"
+            // https://blog.actorsfit.com/a?ID=00550-ce56ec63-1bff-4b0c-a6f7-447b93efaa31
+            jobConf.set("mapreduce.input.fileinputformat.input.dir.recursive", "true");
+            // FileInputFormat.setInputPaths() will call FileSystem.get(), which will create new FileSystem
+            // and save it in FileSystem.Cache. We don't need this cache.
+            jobConf.set("fs.hdfs.impl.disable.cache", "true");
+            FileInputFormat.setInputPaths(jobConf, finalLocation);
+            try {
+                InputFormat<?, ?> inputFormat = HiveUtil.getInputFormat(jobConf, key.inputFormat, false);
+                InputSplit[] splits;
+                String remoteUser = jobConf.get(HdfsResource.HADOOP_USER_NAME);
+                if (!Strings.isNullOrEmpty(remoteUser)) {
+                    UserGroupInformation ugi = UserGroupInformation.createRemoteUser(remoteUser);
+                    splits = ugi.doAs(
+                            (PrivilegedExceptionAction<InputSplit[]>) () -> inputFormat.getSplits(jobConf, 0));
+                } else {
+                    splits = inputFormat.getSplits(jobConf, 0 /* use hdfs block size as default */);
+                }
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("load #{} files for {} in catalog {}", splits.length, key, catalog.getName());
+                }
+                if (splits == null) {
+                    LOG.warn("Splits for location {} is null", finalLocation);
+                    return ImmutableList.copyOf(new HiveSplit[0]);
+                }
+                List<HiveSplit> hiveSplits = Lists.newArrayList();
+                List<String> pValues;
+                // handle default hive partition case, replace the default partition value with null_string.
+                if (key.hasDefaultPartitionValue) {
+                    pValues = Lists.newArrayList();
+                    for (String value : key.partitionValues) {
+                        if (HIVE_DEFAULT_PARTITION.equals(value)) {
+                            pValues.add(FeConstants.null_string);
+                        } else {
+                            pValues.add(value);
+                        }
+                    }
+                } else {
+                    pValues = key.partitionValues;
+                }
+                for (int i = 0; i < splits.length; i++) {
+                    if (splits[i].getLength() == 0) {
+                        if (LOG.isDebugEnabled()) {
+                            LOG.debug("get empty file {}, skip it", splits[i].toString());
+                        }
+                        continue;
+                    }
+                    FileSplit fileSplit = (FileSplit) splits[i];
+                    hiveSplits.add(new HiveSplit(fileSplit.getPath(), fileSplit.getStart(), fileSplit.getLength(),
+                            fileSplit.getLength(), null, pValues));
+                }
+                return ImmutableList.copyOf(hiveSplits);
+            } catch (Exception e) {
+                throw new CacheException("failed to get input splits for %s in catalog %s", e, key, catalog.getName());
             }
-            return ImmutableList.copyOf(splits);
-        } catch (Exception e) {
-            throw new CacheException("failed to get input splits for %s in catalog %s", e, key, catalog.getName());
+        } finally {
+            Thread.currentThread().setContextClassLoader(classLoader);
         }
     }
 
     // convert oss:// to s3://
     private String convertToS3IfNecessary(String location) {
         LOG.debug("try convert location to s3 prefix: " + location);
-        if (location.startsWith(FeConstants.FS_PREFIX_COS)
-                || location.startsWith(FeConstants.FS_PREFIX_BOS)
-                || location.startsWith(FeConstants.FS_PREFIX_BOS)
-                || location.startsWith(FeConstants.FS_PREFIX_OSS)
-                || location.startsWith(FeConstants.FS_PREFIX_S3A)
-                || location.startsWith(FeConstants.FS_PREFIX_S3N)) {
+        if ((location.startsWith(FeConstants.FS_PREFIX_COS)) && !(location.startsWith(FeConstants.FS_PREFIX_COSN))
+            || location.startsWith(FeConstants.FS_PREFIX_BOS)
+            || location.startsWith(FeConstants.FS_PREFIX_BOS)
+            || location.startsWith(FeConstants.FS_PREFIX_OSS)
+            || location.startsWith(FeConstants.FS_PREFIX_S3A)
+            || location.startsWith(FeConstants.FS_PREFIX_S3N)) {
             int pos = location.indexOf("://");
             if (pos == -1) {
                 throw new RuntimeException("No '://' found in location: " + location);
@@ -258,20 +339,20 @@ public class HiveMetaStoreCache {
         return location;
     }
 
-    private Configuration getConfiguration() {
+    private JobConf getJobConf() {
         Configuration configuration = new HdfsConfiguration();
-        for (Map.Entry<String, String> entry : catalog.getCatalogProperty().getProperties().entrySet()) {
+        for (Map.Entry<String, String> entry : catalog.getCatalogProperty().getHadoopProperties().entrySet()) {
             configuration.set(entry.getKey(), entry.getValue());
         }
-        Map<String, String> s3Properties = catalog.getCatalogProperty().getS3Properties();
-        for (Map.Entry<String, String> entry : s3Properties.entrySet()) {
-            configuration.set(entry.getKey(), entry.getValue());
-        }
-        return configuration;
+        return new JobConf(configuration);
     }
 
     public HivePartitionValues getPartitionValues(String dbName, String tblName, List<Type> types) {
         PartitionValueCacheKey key = new PartitionValueCacheKey(dbName, tblName, types);
+        return getPartitionValues(key);
+    }
+
+    public HivePartitionValues getPartitionValues(PartitionValueCacheKey key) {
         try {
             return partitionValuesCache.get(key);
         } catch (ExecutionException e) {
@@ -282,7 +363,13 @@ public class HiveMetaStoreCache {
     public List<InputSplit> getFilesByPartitions(List<HivePartition> partitions) {
         long start = System.currentTimeMillis();
         List<FileCacheKey> keys = Lists.newArrayListWithExpectedSize(partitions.size());
-        partitions.stream().forEach(p -> keys.add(new FileCacheKey(p.getPath(), p.getInputFormat())));
+        partitions.stream().forEach(p -> {
+            FileCacheKey fileCacheKey = p.isDummyPartition()
+                    ? FileCacheKey.createDummyCacheKey(p.getDbName(), p.getTblName(), p.getPath(),
+                    p.getInputFormat())
+                    : new FileCacheKey(p.getPath(), p.getInputFormat(), p.getPartitionValues());
+            keys.add(fileCacheKey);
+        });
 
         Stream<FileCacheKey> stream;
         if (partitions.size() < MIN_BATCH_FETCH_PARTITION_NUM) {
@@ -337,7 +424,7 @@ public class HiveMetaStoreCache {
                 PartitionCacheKey partKey = new PartitionCacheKey(dbName, tblName, values);
                 HivePartition partition = partitionCache.getIfPresent(partKey);
                 if (partition != null) {
-                    fileCache.invalidate(new FileCacheKey(partition.getPath(), null));
+                    fileCache.invalidate(new FileCacheKey(partition.getPath(), null, partition.getPartitionValues()));
                     partitionCache.invalidate(partKey);
                 }
             }
@@ -345,6 +432,33 @@ public class HiveMetaStoreCache {
             LOG.debug("invalid table cache for {}.{} in catalog {}, cache num: {}, cost: {} ms",
                     dbName, tblName, catalog.getName(), partitionValues.partitionValuesMap.size(),
                     (System.currentTimeMillis() - start));
+        } else {
+            /**
+             * A file cache entry can be created reference to
+             * {@link org.apache.doris.planner.external.HiveSplitter#getSplits},
+             * so we need to invalidate it if this is a non-partitioned table.
+             * We use {@link org.apache.doris.datasource.hive.HiveMetaStoreCache.FileCacheKey#createDummyCacheKey}
+             * to avoid invocation by Hms Client, because this method may be invoked when salve FE replay journal logs,
+             * and FE will exit if some network problems occur.
+             * */
+            FileCacheKey fileCacheKey = FileCacheKey.createDummyCacheKey(
+                    dbName, tblName, null, null);
+            fileCache.invalidate(fileCacheKey);
+        }
+    }
+
+    public void invalidatePartitionCache(String dbName, String tblName, String partitionName) {
+        PartitionValueCacheKey key = new PartitionValueCacheKey(dbName, tblName, null);
+        HivePartitionValues partitionValues = partitionValuesCache.getIfPresent(key);
+        if (partitionValues != null) {
+            Long partitionId = partitionValues.partitionNameToIdMap.get(partitionName);
+            List<String> values = partitionValues.partitionValuesMap.get(partitionId);
+            PartitionCacheKey partKey = new PartitionCacheKey(dbName, tblName, values);
+            HivePartition partition = partitionCache.getIfPresent(partKey);
+            if (partition != null) {
+                fileCache.invalidate(new FileCacheKey(partition.getPath(), null, partition.getPartitionValues()));
+                partitionCache.invalidate(partKey);
+            }
         }
     }
 
@@ -365,6 +479,118 @@ public class HiveMetaStoreCache {
         partitionCache.invalidateAll();
         fileCache.invalidateAll();
         LOG.debug("invalid all meta cache in catalog {}", catalog.getName());
+    }
+
+    // partition name format: nation=cn/city=beijing
+    public void addPartitionsCache(String dbName, String tblName, List<String> partitionNames,
+            List<Type> partitionColumnTypes) {
+        PartitionValueCacheKey key = new PartitionValueCacheKey(dbName, tblName, partitionColumnTypes);
+        HivePartitionValues partitionValues = partitionValuesCache.getIfPresent(key);
+        if (partitionValues == null) {
+            return;
+        }
+        HivePartitionValues copy = partitionValues.copy();
+        Map<Long, PartitionItem> idToPartitionItemBefore = copy.getIdToPartitionItem();
+        Map<String, Long> partitionNameToIdMapBefore = copy.getPartitionNameToIdMap();
+        Map<Long, List<UniqueId>> idToUniqueIdsMap = copy.getIdToUniqueIdsMap();
+        Map<Long, PartitionItem> idToPartitionItem = new HashMap<>();
+        long idx = copy.getNextPartitionId();
+        for (String partitionName : partitionNames) {
+            if (partitionNameToIdMapBefore.containsKey(partitionName)) {
+                LOG.info("addPartitionsCache partitionName:[{}] has exist in table:[{}]", partitionName, tblName);
+                continue;
+            }
+            long partitionId = idx++;
+            ListPartitionItem listPartitionItem = toListPartitionItem(partitionName, key.types);
+            idToPartitionItemBefore.put(partitionId, listPartitionItem);
+            idToPartitionItem.put(partitionId, listPartitionItem);
+            partitionNameToIdMapBefore.put(partitionName, partitionId);
+        }
+        Map<Long, List<String>> partitionValuesMapBefore = copy.getPartitionValuesMap();
+        Map<Long, List<String>> partitionValuesMap = ListPartitionPrunerV2.getPartitionValuesMap(idToPartitionItem);
+        partitionValuesMapBefore.putAll(partitionValuesMap);
+        copy.setNextPartitionId(idx);
+        if (key.types.size() > 1) {
+            Map<UniqueId, Range<PartitionKey>> uidToPartitionRangeBefore = copy.getUidToPartitionRange();
+            // uidToPartitionRange and rangeToId are only used for multi-column partition
+            Map<UniqueId, Range<PartitionKey>> uidToPartitionRange = ListPartitionPrunerV2
+                    .genUidToPartitionRange(idToPartitionItem, idToUniqueIdsMap);
+            uidToPartitionRangeBefore.putAll(uidToPartitionRange);
+            Map<Range<PartitionKey>, UniqueId> rangeToIdBefore = copy.getRangeToId();
+            Map<Range<PartitionKey>, UniqueId> rangeToId = ListPartitionPrunerV2.genRangeToId(uidToPartitionRange);
+            rangeToIdBefore.putAll(rangeToId);
+        } else {
+            Preconditions.checkState(key.types.size() == 1, key.types);
+            // singleColumnRangeMap is only used for single-column partition
+            RangeMap<ColumnBound, UniqueId> singleColumnRangeMapBefore = copy.getSingleColumnRangeMap();
+            RangeMap<ColumnBound, UniqueId> singleColumnRangeMap = ListPartitionPrunerV2
+                    .genSingleColumnRangeMap(idToPartitionItem, idToUniqueIdsMap);
+            singleColumnRangeMapBefore.putAll(singleColumnRangeMap);
+            Map<UniqueId, Range<ColumnBound>> singleUidToColumnRangeMapBefore = copy
+                    .getSingleUidToColumnRangeMap();
+            Map<UniqueId, Range<ColumnBound>> singleUidToColumnRangeMap = ListPartitionPrunerV2
+                    .genSingleUidToColumnRange(singleColumnRangeMap);
+            singleUidToColumnRangeMapBefore.putAll(singleUidToColumnRangeMap);
+        }
+        HivePartitionValues partitionValuesCur = partitionValuesCache.getIfPresent(key);
+        if (partitionValuesCur == partitionValues) {
+            partitionValuesCache.put(key, copy);
+        }
+    }
+
+    public void dropPartitionsCache(String dbName, String tblName, List<String> partitionNames,
+                                    boolean invalidPartitionCache) {
+        PartitionValueCacheKey key = new PartitionValueCacheKey(dbName, tblName, null);
+        HivePartitionValues partitionValues = partitionValuesCache.getIfPresent(key);
+        if (partitionValues == null) {
+            return;
+        }
+        HivePartitionValues copy = partitionValues.copy();
+        Map<String, Long> partitionNameToIdMapBefore = copy.getPartitionNameToIdMap();
+        Map<Long, PartitionItem> idToPartitionItemBefore = copy.getIdToPartitionItem();
+        Map<Long, List<UniqueId>> idToUniqueIdsMapBefore = copy.getIdToUniqueIdsMap();
+        Map<UniqueId, Range<PartitionKey>> uidToPartitionRangeBefore = copy.getUidToPartitionRange();
+        Map<Range<PartitionKey>, UniqueId> rangeToIdBefore = copy.getRangeToId();
+        RangeMap<ColumnBound, UniqueId> singleColumnRangeMapBefore = copy.getSingleColumnRangeMap();
+        Map<UniqueId, Range<ColumnBound>> singleUidToColumnRangeMapBefore = copy.getSingleUidToColumnRangeMap();
+        Map<Long, List<String>> partitionValuesMap = copy.getPartitionValuesMap();
+        for (String partitionName : partitionNames) {
+            if (!partitionNameToIdMapBefore.containsKey(partitionName)) {
+                LOG.info("dropPartitionsCache partitionName:[{}] not exist in table:[{}]", partitionName, tblName);
+                continue;
+            }
+            Long partitionId = partitionNameToIdMapBefore.remove(partitionName);
+            idToPartitionItemBefore.remove(partitionId);
+            partitionValuesMap.remove(partitionId);
+            List<UniqueId> uniqueIds = idToUniqueIdsMapBefore.remove(partitionId);
+            for (UniqueId uniqueId : uniqueIds) {
+                if (uidToPartitionRangeBefore != null) {
+                    Range<PartitionKey> range = uidToPartitionRangeBefore.remove(uniqueId);
+                    if (range != null) {
+                        rangeToIdBefore.remove(range);
+                    }
+                }
+
+                if (singleUidToColumnRangeMapBefore != null) {
+                    Range<ColumnBound> range = singleUidToColumnRangeMapBefore.remove(uniqueId);
+                    if (range != null) {
+                        singleColumnRangeMapBefore.remove(range);
+                    }
+                }
+            }
+
+            if (invalidPartitionCache) {
+                invalidatePartitionCache(dbName, tblName, partitionName);
+            }
+        }
+        HivePartitionValues partitionValuesCur = partitionValuesCache.getIfPresent(key);
+        if (partitionValuesCur == partitionValues) {
+            partitionValuesCache.put(key, copy);
+        }
+    }
+
+    public void putPartitionValuesCacheForTest(PartitionValueCacheKey key, HivePartitionValues values) {
+        partitionValuesCache.put(key, values);
     }
 
     /**
@@ -445,13 +671,35 @@ public class HiveMetaStoreCache {
 
     @Data
     public static class FileCacheKey {
+        private String dummyKey;
         private String location;
         // not in key
         private String inputFormat;
+        // The values of partitions.
+        // e.g for file : hdfs://path/to/table/part1=a/part2=b/datafile
+        // partitionValues would be ["part1", "part2"]
+        protected List<String> partitionValues;
+        // Set to true if the partition values include a HIVE_DEFAULT_PARTITION.
+        private boolean hasDefaultPartitionValue = false;
 
-        public FileCacheKey(String location, String inputFormat) {
+        public FileCacheKey(String location, String inputFormat, List<String> partitionValues) {
             this.location = location;
             this.inputFormat = inputFormat;
+            this.partitionValues = partitionValues == null ? Lists.newArrayList() : partitionValues;
+            // Set hasDefaultPartitionValue to true if partition values include default partition.
+            for (String value : this.partitionValues) {
+                if (HIVE_DEFAULT_PARTITION.equals(value)) {
+                    hasDefaultPartitionValue = true;
+                    break;
+                }
+            }
+        }
+
+        public static FileCacheKey createDummyCacheKey(String dbName, String tblName, String location,
+                String inputFormat) {
+            FileCacheKey fileCacheKey = new FileCacheKey(location, inputFormat, null);
+            fileCacheKey.dummyKey = dbName + "." + tblName;
+            return fileCacheKey;
         }
 
         @Override
@@ -462,12 +710,19 @@ public class HiveMetaStoreCache {
             if (!(obj instanceof FileCacheKey)) {
                 return false;
             }
-            return location.equals(((FileCacheKey) obj).location);
+            if (dummyKey != null) {
+                return dummyKey.equals(((FileCacheKey) obj).dummyKey);
+            }
+            return location.equals(((FileCacheKey) obj).location)
+                && Objects.equals(partitionValues, ((FileCacheKey) obj).partitionValues);
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(location);
+            if (dummyKey != null) {
+                return Objects.hash(dummyKey);
+            }
+            return Objects.hash(location, partitionValues);
         }
 
         @Override
@@ -478,24 +733,59 @@ public class HiveMetaStoreCache {
 
     @Data
     public static class HivePartitionValues {
+        private long nextPartitionId;
+        private Map<String, Long> partitionNameToIdMap;
+        private Map<Long, List<UniqueId>> idToUniqueIdsMap;
         private Map<Long, PartitionItem> idToPartitionItem;
-        private Map<Long, List<String>> partitionValuesMap = Maps.newHashMap();
+        private Map<Long, List<String>> partitionValuesMap;
+        //multi pair
         private Map<UniqueId, Range<PartitionKey>> uidToPartitionRange;
         private Map<Range<PartitionKey>, UniqueId> rangeToId;
+        //single pair
         private RangeMap<ColumnBound, UniqueId> singleColumnRangeMap;
+        private Map<UniqueId, Range<ColumnBound>> singleUidToColumnRangeMap;
+
+        public HivePartitionValues() {
+        }
 
         public HivePartitionValues(Map<Long, PartitionItem> idToPartitionItem,
                 Map<UniqueId, Range<PartitionKey>> uidToPartitionRange,
                 Map<Range<PartitionKey>, UniqueId> rangeToId,
-                RangeMap<ColumnBound, UniqueId> singleColumnRangeMap) {
+                RangeMap<ColumnBound, UniqueId> singleColumnRangeMap,
+                long nextPartitionId,
+                Map<String, Long> partitionNameToIdMap,
+                Map<Long, List<UniqueId>> idToUniqueIdsMap,
+                Map<UniqueId, Range<ColumnBound>> singleUidToColumnRangeMap,
+                Map<Long, List<String>> partitionValuesMap) {
             this.idToPartitionItem = idToPartitionItem;
-            for (Map.Entry<Long, PartitionItem> entry : this.idToPartitionItem.entrySet()) {
-                partitionValuesMap.put(entry.getKey(),
-                        ((ListPartitionItem) entry.getValue()).getItems().get(0).getPartitionValuesAsStringList());
-            }
             this.uidToPartitionRange = uidToPartitionRange;
             this.rangeToId = rangeToId;
             this.singleColumnRangeMap = singleColumnRangeMap;
+            this.nextPartitionId = nextPartitionId;
+            this.partitionNameToIdMap = partitionNameToIdMap;
+            this.idToUniqueIdsMap = idToUniqueIdsMap;
+            this.singleUidToColumnRangeMap = singleUidToColumnRangeMap;
+            this.partitionValuesMap = partitionValuesMap;
+        }
+
+        public HivePartitionValues copy() {
+            HivePartitionValues copy = new HivePartitionValues();
+            copy.setNextPartitionId(nextPartitionId);
+            copy.setPartitionNameToIdMap(partitionNameToIdMap == null ? null : Maps.newHashMap(partitionNameToIdMap));
+            copy.setIdToUniqueIdsMap(idToUniqueIdsMap == null ? null : Maps.newHashMap(idToUniqueIdsMap));
+            copy.setIdToPartitionItem(idToPartitionItem == null ? null : Maps.newHashMap(idToPartitionItem));
+            copy.setPartitionValuesMap(partitionValuesMap == null ? null : Maps.newHashMap(partitionValuesMap));
+            copy.setUidToPartitionRange(uidToPartitionRange == null ? null : Maps.newHashMap(uidToPartitionRange));
+            copy.setRangeToId(rangeToId == null ? null : Maps.newHashMap(rangeToId));
+            copy.setSingleUidToColumnRangeMap(
+                    singleUidToColumnRangeMap == null ? null : Maps.newHashMap(singleUidToColumnRangeMap));
+            if (singleColumnRangeMap != null) {
+                RangeMap<ColumnBound, UniqueId> copySingleColumnRangeMap = TreeRangeMap.create();
+                copySingleColumnRangeMap.putAll(singleColumnRangeMap);
+                copy.setSingleColumnRangeMap(copySingleColumnRangeMap);
+            }
+            return copy;
         }
     }
 }
+

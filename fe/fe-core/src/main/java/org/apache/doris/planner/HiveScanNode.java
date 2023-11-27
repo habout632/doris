@@ -22,8 +22,10 @@ import org.apache.doris.analysis.BrokerDesc;
 import org.apache.doris.analysis.ImportColumnDesc;
 import org.apache.doris.analysis.StorageBackend;
 import org.apache.doris.analysis.TupleDescriptor;
+import org.apache.doris.catalog.HMSResource;
 import org.apache.doris.catalog.HiveMetaStoreClientHelper;
 import org.apache.doris.catalog.HiveTable;
+import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.util.Util;
 import org.apache.doris.load.BrokerFileGroup;
@@ -131,6 +133,10 @@ public class HiveScanNode extends BrokerScanNode {
             this.storageType = StorageBackend.StorageType.S3;
         } else if (storagePrefix.equalsIgnoreCase("hdfs")) {
             this.storageType = StorageBackend.StorageType.HDFS;
+        } else if (storagePrefix.equalsIgnoreCase(FeConstants.FS_PREFIX_OFS)) {
+            this.storageType = StorageBackend.StorageType.OFS;
+        } else if (storagePrefix.equalsIgnoreCase(FeConstants.FS_PREFIX_JFS)) {
+            this.storageType = StorageBackend.StorageType.JFS;
         } else {
             throw new UserException("Not supported storage type: " + storagePrefix);
         }
@@ -155,8 +161,9 @@ public class HiveScanNode extends BrokerScanNode {
     @Override
     protected void getFileStatus() throws UserException {
         if (partitionKeys.size() > 0) {
-            hivePartitionPredicate = HiveMetaStoreClientHelper.convertToHivePartitionExpr(
-                    conjuncts, partitionKeys, hiveTable.getName());
+            // Hive Table is no longer supported.
+            // So there we just create an empty predicate
+            hivePartitionPredicate = new ExprNodeGenericFuncDesc();
         }
         List<TBrokerFileStatus> fileStatuses = new ArrayList<>();
         this.hdfsUri = HiveMetaStoreClientHelper.getHiveDataFiles(hiveTable, hivePartitionPredicate,
@@ -174,7 +181,7 @@ public class HiveScanNode extends BrokerScanNode {
         if (!isLoad()) {
             output.append(prefix).append("TABLE: ").append(hiveTable.getName()).append("\n");
             output.append(prefix).append("PATH: ")
-                    .append(hiveTable.getHiveProperties().get(HiveTable.HIVE_METASTORE_URIS)).append("\n");
+                    .append(hiveTable.getHiveProperties().get(HMSResource.HIVE_METASTORE_URIS)).append("\n");
         }
         return output.toString();
     }

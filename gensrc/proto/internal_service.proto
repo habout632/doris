@@ -65,6 +65,8 @@ message PTabletInfo {
     // Delta Writer will write data to local disk and then check if there are new raw values not in global dict
     // if appears, then it should add the column name to this vector
     repeated string invalid_dict_cols = 3; 
+    // total rows num received by DeltaWriter
+    optional int64 received_rows = 4;
 }
 
 // open a tablet writer
@@ -241,6 +243,7 @@ enum PCacheStatus {
     INVALID_KEY_RANGE = 6;
     DATA_OVERDUE = 7;
     EMPTY_DATA = 8;
+    CANCELED = 9;
 };
 
 enum CacheType {
@@ -349,6 +352,7 @@ message PDataRow {
 message PSendDataRequest {
     required PUniqueId fragment_instance_id = 1;
     repeated PDataRow data = 2;
+    optional PUniqueId load_id = 3; // load_id == query_id in fragment exec
 }
 
 message PSendDataResult {
@@ -357,6 +361,7 @@ message PSendDataResult {
 
 message PCommitRequest {
     required PUniqueId fragment_instance_id = 1;
+    optional PUniqueId load_id = 2;
 }
 
 message PCommitResult {
@@ -365,6 +370,7 @@ message PCommitResult {
 
 message PRollbackRequest {
     required PUniqueId fragment_instance_id = 1;
+    optional PUniqueId load_id = 2;
 }
 
 message PRollbackResult {

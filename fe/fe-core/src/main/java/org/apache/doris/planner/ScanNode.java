@@ -24,14 +24,17 @@ import org.apache.doris.analysis.Analyzer;
 import org.apache.doris.analysis.BinaryPredicate;
 import org.apache.doris.analysis.CompoundPredicate;
 import org.apache.doris.analysis.Expr;
+import org.apache.doris.analysis.ExprSubstitutionMap;
 import org.apache.doris.analysis.InPredicate;
 import org.apache.doris.analysis.IsNullPredicate;
 import org.apache.doris.analysis.LiteralExpr;
 import org.apache.doris.analysis.NullLiteral;
 import org.apache.doris.analysis.PredicateUtils;
 import org.apache.doris.analysis.SlotDescriptor;
+import org.apache.doris.analysis.SlotId;
 import org.apache.doris.analysis.SlotRef;
 import org.apache.doris.analysis.TupleDescriptor;
+import org.apache.doris.analysis.TupleId;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.PrimitiveType;
 import org.apache.doris.common.UserException;
@@ -43,13 +46,16 @@ import com.google.common.base.MoreObjects;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Range;
+import com.google.common.collect.RangeSet;
 import com.google.common.collect.Sets;
+import com.google.common.collect.TreeRangeSet;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * Representation of the common elements of all scan nodes.
@@ -103,7 +109,10 @@ public abstract class ScanNode extends PlanNode {
     protected Expr castToSlot(SlotDescriptor slotDesc, Expr expr) throws UserException {
         PrimitiveType dstType = slotDesc.getType().getPrimitiveType();
         PrimitiveType srcType = expr.getType().getPrimitiveType();
-        if (dstType != srcType) {
+        if (PrimitiveType.typeWithPrecision.contains(dstType) && PrimitiveType.typeWithPrecision.contains(srcType)
+                && !slotDesc.getType().equals(expr.getType())) {
+            return expr.castTo(slotDesc.getType());
+        } else if (dstType != srcType) {
             return expr.castTo(slotDesc.getType());
         } else {
             return expr;
@@ -260,6 +269,26 @@ public abstract class ScanNode extends PlanNode {
                 ColumnBound bound = ColumnBound.of((LiteralExpr) inPredicate.getChild(i));
                 result.add(Range.closed(bound, bound));
             }
+        } else if (expr instanceof CompoundPredicate) {
+            CompoundPredicate compoundPredicate = (CompoundPredicate) expr;
+            ColumnRanges leftChildRange = null;
+            ColumnRanges rightChildRange = null;
+            switch (compoundPredicate.getOp()) {
+                case AND:
+                    leftChildRange = expressionToRanges(compoundPredicate.getChild(0), desc);
+                    rightChildRange = expressionToRanges(compoundPredicate.getChild(1), desc);
+                    return leftChildRange.intersectRanges(rightChildRange);
+                case OR:
+                    leftChildRange = expressionToRanges(compoundPredicate.getChild(0), desc);
+                    rightChildRange = expressionToRanges(compoundPredicate.getChild(1), desc);
+                    return leftChildRange.unionRanges(rightChildRange);
+                case NOT:
+                    leftChildRange = expressionToRanges(compoundPredicate.getChild(0), desc);
+                    return leftChildRange.complementOfRanges();
+                default:
+                    throw new RuntimeException("unknown OP in compound predicate: "
+                        + compoundPredicate.getOp().toString());
+            }
         }
 
         if (result.isEmpty()) {
@@ -377,6 +406,67 @@ public abstract class ScanNode extends PlanNode {
             return IS_NULL;
         }
 
+        public ColumnRanges complementOfRanges() {
+            if (type == Type.CONVERT_SUCCESS) {
+                RangeSet<ColumnBound> rangeSet = TreeRangeSet.create();
+                rangeSet.addAll(ranges);
+                return create(Lists.newArrayList(rangeSet.complement().asRanges()));
+            }
+            return CONVERT_FAILURE;
+        }
+
+        public ColumnRanges intersectRanges(ColumnRanges other) {
+            // intersect ranges can handle isnull
+            switch (this.type) {
+                case IS_NULL:
+                    return createIsNull();
+                case CONVERT_FAILURE:
+                    return createFailure();
+                case CONVERT_SUCCESS:
+                    switch (other.type) {
+                        case IS_NULL:
+                            return createIsNull();
+                        case CONVERT_FAILURE:
+                            return createFailure();
+                        case CONVERT_SUCCESS:
+                            RangeSet<ColumnBound> rangeSet = TreeRangeSet.create();
+                            rangeSet.addAll(this.ranges);
+                            RangeSet<ColumnBound> intersectSet = TreeRangeSet.create();
+
+                            other.ranges.forEach(range -> intersectSet.addAll(rangeSet.subRangeSet(range)));
+                            return create(Lists.newArrayList(intersectSet.asRanges()));
+                        default:
+                            return createFailure();
+                    }
+                default:
+                    return createFailure();
+            }
+        }
+
+        public ColumnRanges unionRanges(ColumnRanges other) {
+            switch (this.type) {
+                case IS_NULL:
+                case CONVERT_FAILURE:
+                    return createFailure();
+                case CONVERT_SUCCESS:
+                    switch (other.type) {
+                        case IS_NULL:
+                        case CONVERT_FAILURE:
+                            return createFailure();
+                        case CONVERT_SUCCESS:
+                            RangeSet<ColumnBound> rangeSet = TreeRangeSet.create();
+                            rangeSet.addAll(this.ranges);
+                            rangeSet.addAll(other.ranges);
+                            List<Range<ColumnBound>> unionRangeList = Lists.newArrayList(rangeSet.asRanges());
+                            return create(unionRangeList);
+                        default:
+                            return createFailure();
+                    }
+                default:
+                    return createFailure();
+            }
+        }
+
         public static ColumnRanges createFailure() {
             return CONVERT_FAILURE;
         }
@@ -391,5 +481,64 @@ public abstract class ScanNode extends PlanNode {
         return MoreObjects.toStringHelper(this).add("tid", desc.getId().asInt()).add("tblName",
                 desc.getTable().getName()).add("keyRanges", "").addValue(
                 super.debugString()).toString();
+    }
+
+    public void setOutputSmap(ExprSubstitutionMap smap, Analyzer analyzer) {
+        outputSmap = smap;
+        if (smap.getRhs().stream().anyMatch(expr -> !(expr instanceof SlotRef))) {
+            if (outputTupleDesc == null) {
+                outputTupleDesc = analyzer.getDescTbl().createTupleDescriptor("OlapScanNode");
+            }
+            if (projectList == null) {
+                projectList = Lists.newArrayList();
+            }
+            // setOutputSmap may be called multiple times
+            // this happens if the olap table is in the most inner sub-query block in the cascades sub-queries
+            // create a tmpSmap for the later setOutputSmap call
+            ExprSubstitutionMap tmpSmap = new ExprSubstitutionMap(
+                    Lists.newArrayList(outputTupleDesc.getSlots().stream()
+                            .filter(slot -> slot.isMaterialized())
+                            .map(slot -> new SlotRef(slot))
+                            .collect(Collectors.toList())),
+                    Lists.newArrayList(projectList));
+            Set<SlotId> allOutputSlotIds = outputTupleDesc.getSlots().stream().map(slot -> slot.getId())
+                    .collect(Collectors.toSet());
+            List<Expr> newRhs = Lists.newArrayList();
+            List<Expr> rhs = smap.getRhs();
+            for (int i = 0; i < smap.size(); ++i) {
+                Expr rhsExpr = rhs.get(i);
+                if (!(rhsExpr instanceof SlotRef) || !(allOutputSlotIds.contains(((SlotRef) rhsExpr).getSlotId()))) {
+                    rhsExpr = rhsExpr.substitute(tmpSmap);
+                    if (rhsExpr.isBound(desc.getId())) {
+                        SlotDescriptor slotDesc = analyzer.addSlotDescriptor(outputTupleDesc);
+                        slotDesc.initFromExpr(rhsExpr);
+                        if (rhsExpr instanceof SlotRef) {
+                            slotDesc.setSrcColumn(((SlotRef) rhsExpr).getColumn());
+                            slotDesc.setIsMaterialized(((SlotRef) rhsExpr).getDesc().isMaterialized());
+                        } else {
+                            slotDesc.setIsMaterialized(true);
+                        }
+                        if (slotDesc.isMaterialized()) {
+                            slotDesc.materializeSrcExpr();
+                            projectList.add(rhsExpr);
+                        }
+                        newRhs.add(new SlotRef(slotDesc));
+                        allOutputSlotIds.add(slotDesc.getId());
+                    } else {
+                        newRhs.add(rhs.get(i));
+                    }
+                } else {
+                    newRhs.add(rhsExpr);
+                }
+            }
+            outputSmap.updateRhsExprs(newRhs);
+        }
+    }
+
+    public List<TupleId> getOutputTupleIds() {
+        if (outputTupleDesc != null) {
+            return Lists.newArrayList(outputTupleDesc.getId());
+        }
+        return tupleIds;
     }
 }

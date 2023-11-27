@@ -17,21 +17,30 @@
 
 package org.apache.doris.datasource;
 
-import org.apache.doris.catalog.Column;
+import org.apache.doris.catalog.AuthType;
 import org.apache.doris.catalog.Env;
-import org.apache.doris.catalog.HiveMetaStoreClientHelper;
+import org.apache.doris.catalog.HMSResource;
+import org.apache.doris.catalog.HdfsResource;
 import org.apache.doris.catalog.external.ExternalDatabase;
 import org.apache.doris.catalog.external.HMSExternalDatabase;
-import org.apache.doris.cluster.ClusterNamespace;
+import org.apache.doris.common.Config;
+import org.apache.doris.common.DdlException;
+import org.apache.doris.datasource.hive.PooledHiveMetaStoreClient;
+import org.apache.doris.datasource.hive.event.MetastoreNotificationFetchException;
 
+import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hive.conf.HiveConf;
-import org.apache.hadoop.hive.metastore.api.FieldSchema;
+import org.apache.hadoop.hive.metastore.HiveMetaStoreClient;
+import org.apache.hadoop.hive.metastore.api.CurrentNotificationEventId;
+import org.apache.hadoop.hive.metastore.api.NotificationEventResponse;
+import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.jetbrains.annotations.Nullable;
 
+import java.io.IOException;
 import java.util.List;
 import java.util.Map;
 
@@ -43,20 +52,58 @@ public class HMSExternalCatalog extends ExternalCatalog {
 
     private static final int MAX_CLIENT_POOL_SIZE = 8;
     protected PooledHiveMetaStoreClient client;
+    // Record the latest synced event id when processing hive events
+    // Must set to -1 otherwise client.getNextNotification will throw exception
+    // Reference to https://github.com/apache/doris/issues/18251
+    private long lastSyncedEventId = -1L;
 
     /**
      * Default constructor for HMSExternalCatalog.
      */
-    public HMSExternalCatalog(long catalogId, String name, Map<String, String> props) {
-        this.id = catalogId;
-        this.name = name;
+    public HMSExternalCatalog(long catalogId, String name, String resource, Map<String, String> props) {
+        super(catalogId, name);
         this.type = "hms";
-        this.catalogProperty = new CatalogProperty();
-        this.catalogProperty.setProperties(props);
+        props = HMSResource.getPropertiesFromDLF(props);
+        props = HMSResource.getPropertiesFromGlue(props);
+        catalogProperty = new CatalogProperty(resource, props);
+    }
+
+    @Override
+    public void checkProperties() throws DdlException {
+        super.checkProperties();
+        // check the dfs.ha properties
+        // 'dfs.nameservices'='your-nameservice',
+        // 'dfs.ha.namenodes.your-nameservice'='nn1,nn2',
+        // 'dfs.namenode.rpc-address.your-nameservice.nn1'='172.21.0.2:4007',
+        // 'dfs.namenode.rpc-address.your-nameservice.nn2'='172.21.0.3:4007',
+        // 'dfs.client.failover.proxy.provider.your-nameservice'='xxx'
+        String dfsNameservices = catalogProperty.getOrDefault(HdfsResource.DSF_NAMESERVICES, "");
+        if (Strings.isNullOrEmpty(dfsNameservices)) {
+            return;
+        }
+        String namenodes = catalogProperty.getOrDefault("dfs.ha.namenodes." + dfsNameservices, "");
+        if (Strings.isNullOrEmpty(namenodes)) {
+            throw new DdlException("Missing dfs.ha.namenodes." + dfsNameservices + " property");
+        }
+        String[] names = namenodes.split(",");
+        for (String name : names) {
+            String address = catalogProperty.getOrDefault("dfs.namenode.rpc-address." + dfsNameservices + "." + name,
+                    "");
+            if (Strings.isNullOrEmpty(address)) {
+                throw new DdlException(
+                        "Missing dfs.namenode.rpc-address." + dfsNameservices + "." + name + " property");
+            }
+        }
+        String failoverProvider = catalogProperty.getOrDefault("dfs.client.failover.proxy.provider." + dfsNameservices,
+                "");
+        if (Strings.isNullOrEmpty(failoverProvider)) {
+            throw new DdlException(
+                    "Missing dfs.client.failover.proxy.provider." + dfsNameservices + " property");
+        }
     }
 
     public String getHiveMetastoreUris() {
-        return catalogProperty.getOrDefault("hive.metastore.uris", "");
+        return catalogProperty.getOrDefault(HMSResource.HIVE_METASTORE_URIS, "");
     }
 
     @Override
@@ -74,7 +121,7 @@ public class HMSExternalCatalog extends ExternalCatalog {
                 dbId = dbNameToId.get(dbName);
                 tmpDbNameToId.put(dbName, dbId);
                 ExternalDatabase db = idToDb.get(dbId);
-                db.setUnInitialized();
+                db.setUnInitialized(invalidCacheInInit);
                 tmpIdToDb.put(dbId, db);
                 initCatalogLog.addRefreshDb(dbId);
             } else {
@@ -93,15 +140,30 @@ public class HMSExternalCatalog extends ExternalCatalog {
     @Override
     protected void initLocalObjectsImpl() {
         HiveConf hiveConf = new HiveConf();
-        hiveConf.setVar(HiveConf.ConfVars.METASTOREURIS, getHiveMetastoreUris());
+        for (Map.Entry<String, String> kv : catalogProperty.getHadoopProperties().entrySet()) {
+            hiveConf.set(kv.getKey(), kv.getValue());
+        }
 
-        // 1. read properties from hive-site.xml.
-        // and then use properties in CatalogProperty to override properties got from hive-site.xml
-        Map<String, String> properties = HiveMetaStoreClientHelper.getPropertiesForDLF(name, hiveConf);
-        properties.putAll(catalogProperty.getProperties());
-        catalogProperty.setProperties(properties);
+        String authentication = catalogProperty.getOrDefault(
+                HdfsResource.HADOOP_SECURITY_AUTHENTICATION, "");
+        if (AuthType.KERBEROS.getDesc().equals(authentication)) {
+            Configuration conf = new Configuration();
+            conf.set(HdfsResource.HADOOP_SECURITY_AUTHENTICATION, authentication);
+            UserGroupInformation.setConfiguration(conf);
+            try {
+                /**
+                 * Because metastore client is created by using
+                 * {@link org.apache.hadoop.hive.metastore.RetryingMetaStoreClient#getProxy}
+                 * it will relogin when TGT is expired, so we don't need to relogin manually.
+                 */
+                UserGroupInformation.loginUserFromKeytab(
+                        catalogProperty.getOrDefault(HdfsResource.HADOOP_KERBEROS_PRINCIPAL, ""),
+                        catalogProperty.getOrDefault(HdfsResource.HADOOP_KERBEROS_KEYTAB, ""));
+            } catch (IOException e) {
+                throw new HMSClientException("login with kerberos auth failed for catalog %s", e, this.getName());
+            }
+        }
 
-        // 2. init hms client
         client = new PooledHiveMetaStoreClient(hiveConf, MAX_CLIENT_POOL_SIZE);
     }
 
@@ -129,32 +191,14 @@ public class HMSExternalCatalog extends ExternalCatalog {
         return client.tableExists(getRealTableName(dbName), tblName);
     }
 
-    @Nullable
     @Override
-    public ExternalDatabase getDbNullable(String dbName) {
+    public boolean tableExistInLocal(String dbName, String tblName) {
         makeSureInitialized();
-        String realDbName = ClusterNamespace.getNameFromFullName(dbName);
-        if (!dbNameToId.containsKey(realDbName)) {
-            return null;
+        HMSExternalDatabase hmsExternalDatabase = (HMSExternalDatabase) idToDb.get(dbNameToId.get(dbName));
+        if (hmsExternalDatabase == null) {
+            return false;
         }
-        return idToDb.get(dbNameToId.get(realDbName));
-    }
-
-    @Nullable
-    @Override
-    public ExternalDatabase getDbNullable(long dbId) {
-        makeSureInitialized();
-        return idToDb.get(dbId);
-    }
-
-    @Override
-    public List<Long> getDbIds() {
-        makeSureInitialized();
-        return Lists.newArrayList(dbNameToId.values());
-    }
-
-    public ExternalDatabase getDbForReplay(long dbId) {
-        return idToDb.get(dbId);
+        return hmsExternalDatabase.getTable(getRealTableName(tblName)).isPresent();
     }
 
     public PooledHiveMetaStoreClient getClient() {
@@ -162,16 +206,80 @@ public class HMSExternalCatalog extends ExternalCatalog {
         return client;
     }
 
-    @Override
-    public List<Column> getSchema(String dbName, String tblName) {
+    public void setLastSyncedEventId(long lastSyncedEventId) {
+        this.lastSyncedEventId = lastSyncedEventId;
+    }
+
+    public NotificationEventResponse getNextEventResponse(HMSExternalCatalog hmsExternalCatalog)
+            throws MetastoreNotificationFetchException {
         makeSureInitialized();
-        List<FieldSchema> schema = getClient().getSchema(dbName, tblName);
-        List<Column> tmpSchema = Lists.newArrayListWithCapacity(schema.size());
-        for (FieldSchema field : schema) {
-            tmpSchema.add(new Column(field.getName(),
-                    HiveMetaStoreClientHelper.hiveTypeToDorisType(field.getType()), true, null,
-                    true, null, field.getComment(), true, null, -1));
+        if (lastSyncedEventId < 0) {
+            lastSyncedEventId = getCurrentEventId();
+            refreshCatalog(hmsExternalCatalog);
+            LOG.info(
+                    "First pulling events on catalog [{}],refreshCatalog and init lastSyncedEventId,"
+                            + "lastSyncedEventId is [{}]",
+                    hmsExternalCatalog.getName(), lastSyncedEventId);
+            return null;
         }
-        return tmpSchema;
+
+        long currentEventId = getCurrentEventId();
+        LOG.debug("Catalog [{}] getNextEventResponse, currentEventId is {},lastSyncedEventId is {}",
+                hmsExternalCatalog.getName(), currentEventId, lastSyncedEventId);
+        if (currentEventId == lastSyncedEventId) {
+            LOG.info("Event id not updated when pulling events on catalog [{}]", hmsExternalCatalog.getName());
+            return null;
+        }
+
+        try {
+            return client.getNextNotification(lastSyncedEventId, Config.hms_events_batch_size_per_rpc, null);
+        } catch (IllegalStateException e) {
+            // Need a fallback to handle this because this error state can not be recovered until restarting FE
+            if (HiveMetaStoreClient.REPL_EVENTS_MISSING_IN_METASTORE.equals(e.getMessage())) {
+                lastSyncedEventId = getCurrentEventId();
+                refreshCatalog(hmsExternalCatalog);
+                LOG.warn("Notification events are missing, maybe an event can not be handled "
+                        + "or processing rate is too low, fallback to refresh the catalog");
+                return null;
+            }
+            throw e;
+        }
+    }
+
+    private void refreshCatalog(HMSExternalCatalog hmsExternalCatalog) {
+        CatalogLog log = new CatalogLog();
+        log.setCatalogId(hmsExternalCatalog.getId());
+        log.setInvalidCache(true);
+        Env.getCurrentEnv().getCatalogMgr().refreshCatalog(log);
+    }
+
+    private long getCurrentEventId() {
+        makeSureInitialized();
+        CurrentNotificationEventId currentNotificationEventId = client.getCurrentNotificationEventId();
+        if (currentNotificationEventId == null) {
+            LOG.warn("Get currentNotificationEventId is null");
+            return -1;
+        }
+        return currentNotificationEventId.getEventId();
+    }
+
+    @Override
+    public void dropDatabase(String dbName) {
+        LOG.debug("drop database [{}]", dbName);
+        makeSureInitialized();
+        Long dbId = dbNameToId.remove(dbName);
+        if (dbId == null) {
+            LOG.warn("drop database [{}] failed", dbName);
+        }
+        idToDb.remove(dbId);
+    }
+
+    @Override
+    public void createDatabase(long dbId, String dbName) {
+        makeSureInitialized();
+        LOG.debug("create database [{}]", dbName);
+        dbNameToId.put(dbName, dbId);
+        HMSExternalDatabase db = new HMSExternalDatabase(this, dbId, dbName);
+        idToDb.put(dbId, db);
     }
 }

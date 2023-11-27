@@ -555,8 +555,10 @@ public final class AggregateInfo extends AggregateInfoBase {
             Preconditions.checkState(inputExpr.isAggregateFunction());
             Expr aggExprParam =
                     new SlotRef(inputDesc.getSlots().get(i + getGroupingExprs().size()));
-            FunctionCallExpr aggExpr = FunctionCallExpr.createMergeAggCall(
-                    inputExpr, Lists.newArrayList(aggExprParam), inputExpr.getFnParams().exprs());
+            FunctionParams fnParams = inputExpr.getAggFnParams();
+            FunctionCallExpr aggExpr =
+                    FunctionCallExpr.createMergeAggCall(inputExpr, Lists.newArrayList(aggExprParam),
+                            fnParams != null ? fnParams.exprs() : inputExpr.getFnParams().exprs());
             aggExpr.analyzeNoThrow(analyzer);
             // do not need analyze in merge stage, just do mark for BE get right function
             aggExpr.setOrderByElements(inputExpr.getOrderByElements());
@@ -688,6 +690,7 @@ public final class AggregateInfo extends AggregateInfoBase {
                     new SlotRef(inputDesc.getSlots().get(i + getGroupingExprs().size()));
             FunctionCallExpr aggExpr = FunctionCallExpr.createMergeAggCall(
                     inputExpr, Lists.newArrayList(aggExprParam), inputExpr.getFnParams().exprs());
+            aggExpr.setOrderByElements(inputExpr.getOrderByElements());
             secondPhaseAggExprs.add(aggExpr);
         }
         Preconditions.checkState(
@@ -885,13 +888,14 @@ public final class AggregateInfo extends AggregateInfoBase {
         int aggregateExprsSize = aggregateExprs.size();
         int groupExprsSize = groupingExprs.size();
         boolean isDistinctAgg = isDistinctAgg();
+        boolean hasVirtualSlot = groupingExprs.stream().anyMatch(expr -> expr instanceof VirtualSlotRef);
         for (int i = 0; i < aggregateExprsSize; ++i) {
             FunctionCallExpr functionCallExpr = aggregateExprs.get(i);
             SlotDescriptor slotDesc =
                     outputTupleDesc.getSlots().get(groupExprsSize + i);
             SlotDescriptor intermediateSlotDesc =
                     intermediateTupleDesc.getSlots().get(groupExprsSize + i);
-            if (isDistinctAgg || isUsingSetForDistinct) {
+            if (isDistinctAgg || isUsingSetForDistinct || hasVirtualSlot) {
                 slotDesc.setIsMaterialized(true);
                 intermediateSlotDesc.setIsMaterialized(true);
             }

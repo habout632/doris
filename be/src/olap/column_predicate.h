@@ -166,13 +166,26 @@ public:
     }
     uint32_t column_id() const { return _column_id; }
 
-    virtual std::string debug_string() {
+    virtual std::string debug_string() const {
         return _debug_string() + ", column_id=" + std::to_string(_column_id) +
                ", opposite=" + (_opposite ? "true" : "false");
     }
 
+    /// Some predicates need to be cloned for each segment.
+    virtual bool need_to_clone() const { return false; }
+
+    virtual void clone(ColumnPredicate** to) const { LOG(FATAL) << "clone not supported"; }
+
 protected:
-    virtual std::string _debug_string() = 0;
+    // Just prevent access not align memory address coredump
+    template <class T>
+    T _get_zone_map_value(void* data_ptr) const {
+        T res;
+        memcpy(&res, data_ptr, sizeof(T));
+        return res;
+    }
+
+    virtual std::string _debug_string() const = 0;
 
     uint32_t _column_id;
     // TODO: the value is only in delete condition, better be template value

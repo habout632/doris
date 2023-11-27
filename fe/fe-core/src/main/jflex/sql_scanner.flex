@@ -315,6 +315,7 @@ import org.apache.doris.qe.SqlModeHelper;
         keywordMap.put("null", new Integer(SqlParserSymbols.KW_NULL));
         keywordMap.put("nulls", new Integer(SqlParserSymbols.KW_NULLS));
         keywordMap.put("observer", new Integer(SqlParserSymbols.KW_OBSERVER));
+        keywordMap.put("of", new Integer(SqlParserSymbols.KW_OF));
         keywordMap.put("offset", new Integer(SqlParserSymbols.KW_OFFSET));
         keywordMap.put("on", new Integer(SqlParserSymbols.KW_ON));
         keywordMap.put("only", new Integer(SqlParserSymbols.KW_ONLY));
@@ -453,6 +454,7 @@ import org.apache.doris.qe.SqlModeHelper;
         keywordMap.put("varchar", new Integer(SqlParserSymbols.KW_VARCHAR));
         keywordMap.put("variables", new Integer(SqlParserSymbols.KW_VARIABLES));
         keywordMap.put("verbose", new Integer(SqlParserSymbols.KW_VERBOSE));
+        keywordMap.put("version", new Integer(SqlParserSymbols.KW_VERSION));
         keywordMap.put("view", new Integer(SqlParserSymbols.KW_VIEW));
         keywordMap.put("warnings", new Integer(SqlParserSymbols.KW_WARNINGS));
         keywordMap.put("week", new Integer(SqlParserSymbols.KW_WEEK));
@@ -465,6 +467,7 @@ import org.apache.doris.qe.SqlModeHelper;
         keywordMap.put("write", new Integer(SqlParserSymbols.KW_WRITE));
         keywordMap.put("year", new Integer(SqlParserSymbols.KW_YEAR));
         keywordMap.put("mtmv", new Integer(SqlParserSymbols.KW_MTMV));
+        keywordMap.put("auto", new Integer(SqlParserSymbols.KW_AUTO));
    }
     
   // map from token id to token description
@@ -522,6 +525,9 @@ import org.apache.doris.qe.SqlModeHelper;
   }
 
   public static boolean isKeyword(String str) {
+        if (str == null) {
+            return false;
+        }
 	    return keywordMap.containsKey(str.toLowerCase());
   }
 
@@ -591,7 +597,8 @@ FLit1 = [0-9]+ \. [0-9]*
 FLit2 = \. [0-9]+
 FLit3 = [0-9]+
 Exponent = [eE] [+-]? [0-9]+
-DoubleLiteral = ({FLit1}|{FLit2}|{FLit3}) {Exponent}?
+DoubleLiteral = ({FLit1}|{FLit2}|{FLit3})
+ExponentLiteral = ({FLit1}|{FLit2}|{FLit3}) {Exponent}
 
 EolHintBegin = "--" " "* "+"
 CommentedHintBegin = "/*" " "* "+"
@@ -649,6 +656,17 @@ EndOfLineComment = "--" !({HintContent}|{ContainsLineTerminator}) {LineTerminato
 "\"" { return newToken(SqlParserSymbols.UNMATCHED_STRING_LITERAL, null); }
 "'" { return newToken(SqlParserSymbols.UNMATCHED_STRING_LITERAL, null); }
 "`" { return newToken(SqlParserSymbols.UNMATCHED_STRING_LITERAL, null); }
+
+{ExponentLiteral} {
+   BigDecimal decimal_val;
+   try {
+     decimal_val = new BigDecimal(yytext());
+   } catch (NumberFormatException e) {
+     return newToken(SqlParserSymbols.NUMERIC_OVERFLOW, yytext());
+   }
+
+   return newToken(SqlParserSymbols.DECIMAL_LITERAL, decimal_val);
+ }
 
 {QuotedIdentifier} {
     // Remove the quotes

@@ -50,6 +50,7 @@ Usage: $0 <options>
      --clean            clean and build ut
      --run              build and run all ut
      --run --filter=xx  build and run specified ut
+     --coverage         coverage after run ut
      -j                 build parallel
      -h                 print this help message
 
@@ -64,11 +65,12 @@ Usage: $0 <options>
     $0 --run --filter=FooTest.*:BarTest.*-FooTest.Bar:BarTest.Foo   runs everything in test suite FooTest except FooTest.Bar and everything in test suite BarTest except BarTest.Foo
     $0 --clean                                                      clean and build tests
     $0 --clean --run                                                clean, build and run all tests
+    $0 --clean --run --coverage                                     clean, build, run all tests and coverage
   "
     exit 1
 }
 
-if ! OPTS="$(getopt -n "$0" -o vhj:f: -l benchmark,run,clean,filter: -- "$@")"; then
+if ! OPTS="$(getopt -n "$0" -o vhj:f: -l coverage,benchmark,run,clean,filter: -- "$@")"; then
     usage
 fi
 
@@ -77,6 +79,7 @@ eval set -- "${OPTS}"
 CLEAN=0
 RUN=0
 BUILD_BENCHMARK_TOOL='OFF'
+DENABLE_CLANG_COVERAGE='OFF'
 FILTER=""
 if [[ "$#" != 1 ]]; then
     while true; do
@@ -93,6 +96,10 @@ if [[ "$#" != 1 ]]; then
             BUILD_BENCHMARK_TOOL='ON'
             shift
             ;;
+        --coverage)
+            DENABLE_CLANG_COVERAGE='ON'
+            shift
+            ;;
         -f | --filter)
             FILTER="--gtest_filter=$2"
             shift 2
@@ -107,7 +114,6 @@ if [[ "$#" != 1 ]]; then
             ;;
         *)
             usage
-            exit 0
             ;;
         esac
     done
@@ -126,8 +132,16 @@ echo "Get params:
 "
 echo "Build Backend UT"
 
+if [[ "_${DENABLE_CLANG_COVERAGE}" == "_ON" ]]; then
+    echo "export DORIS_TOOLCHAIN=clang" >>custom_env.sh
+fi
+
 CMAKE_BUILD_DIR="${DORIS_HOME}/be/ut_build_${CMAKE_BUILD_TYPE}"
 if [[ "${CLEAN}" -eq 1 ]]; then
+    pushd "${DORIS_HOME}/gensrc"
+    make clean
+    popd
+
     rm -rf "${CMAKE_BUILD_DIR}"
     rm -rf "${DORIS_HOME}/be/output"
 fi
@@ -184,6 +198,7 @@ cd "${CMAKE_BUILD_DIR}"
     -DUSE_JEMALLOC=OFF \
     -DSTRICT_MEMORY_USE=OFF \
     -DEXTRA_CXX_FLAGS="${EXTRA_CXX_FLAGS}" \
+    -DENABLE_CLANG_COVERAGE="${DENABLE_CLANG_COVERAGE}" \
     ${CMAKE_USE_CCACHE:+${CMAKE_USE_CCACHE}} \
     "${DORIS_HOME}/be"
 "${BUILD_SYSTEM}" -j "${PARALLEL}"
@@ -259,14 +274,20 @@ mkdir "${UT_TMP_DIR}"
 touch "${UT_TMP_DIR}/tmp_file"
 
 # set asan and ubsan env to generate core file
-export ASAN_OPTIONS=symbolize=1:abort_on_error=1:disable_coredump=0:unmap_shadow_on_exit=1
+export ASAN_OPTIONS=symbolize=1:abort_on_error=1:disable_coredump=0:unmap_shadow_on_exit=1:detect_container_overflow=0
 export UBSAN_OPTIONS=print_stacktrace=1
 
 # find all executable test files
 test="${DORIS_TEST_BINARY_DIR}/doris_be_test"
+profraw=${DORIS_TEST_BINARY_DIR}/doris_be_test.profraw
+
 file_name="${test##*/}"
 if [[ -f "${test}" ]]; then
-    "${test}" --gtest_output="xml:${GTEST_OUTPUT_DIR}/${file_name}.xml" --gtest_print_time=true "${FILTER}"
+    if [[ "_${DENABLE_CLANG_COVERAGE}" == "_ON" ]]; then
+        LLVM_PROFILE_FILE="${profraw}" "${test}" --gtest_output="xml:${GTEST_OUTPUT_DIR}/${file_name}.xml" --gtest_print_time=true "${FILTER}"
+    else
+        "${test}" --gtest_output="xml:${GTEST_OUTPUT_DIR}/${file_name}.xml" --gtest_print_time=true "${FILTER}"
+    fi
     echo "=== Finished. Gtest output: ${GTEST_OUTPUT_DIR}"
 else
     echo "unit test file: ${test} does not exist."

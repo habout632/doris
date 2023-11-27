@@ -21,17 +21,19 @@ import org.apache.doris.alter.AlterCancelException;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.TableIf;
+import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.MetaNotFoundException;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
+import org.apache.doris.common.util.Util;
 import org.apache.doris.datasource.ExternalCatalog;
 import org.apache.doris.datasource.ExternalSchemaCache;
 import org.apache.doris.persist.gson.GsonPostProcessable;
 import org.apache.doris.persist.gson.GsonUtils;
-import org.apache.doris.statistics.AnalysisJob;
-import org.apache.doris.statistics.AnalysisJobInfo;
-import org.apache.doris.statistics.AnalysisJobScheduler;
+import org.apache.doris.statistics.AnalysisTaskInfo;
+import org.apache.doris.statistics.AnalysisTaskScheduler;
+import org.apache.doris.statistics.BaseAnalysisTask;
 import org.apache.doris.thrift.TTableDescriptor;
 
 import com.google.gson.annotations.SerializedName;
@@ -104,7 +106,13 @@ public class ExternalTable implements TableIf, Writable, GsonPostProcessable {
     }
 
     protected void makeSureInitialized() {
-        throw new NotImplementedException();
+        try {
+            // getDbOrAnalysisException will call makeSureInitialized in ExternalCatalog.
+            ExternalDatabase db = catalog.getDbOrAnalysisException(dbName);
+            db.makeSureInitialized();
+        } catch (AnalysisException e) {
+            Util.logAndThrowRuntimeException(LOG, String.format("Exception to get db %s", dbName), e);
+        }
     }
 
     @Override
@@ -230,7 +238,6 @@ public class ExternalTable implements TableIf, Writable, GsonPostProcessable {
         return getFullSchema();
     }
 
-
     @Override
     public void setNewFullSchema(List<Column> newSchema) {
     }
@@ -239,7 +246,7 @@ public class ExternalTable implements TableIf, Writable, GsonPostProcessable {
     public Column getColumn(String name) {
         List<Column> schema = getFullSchema();
         for (Column column : schema) {
-            if (name.equals(column.getName())) {
+            if (name.equalsIgnoreCase(column.getName())) {
                 return column;
             }
         }
@@ -301,8 +308,23 @@ public class ExternalTable implements TableIf, Writable, GsonPostProcessable {
     }
 
     @Override
-    public AnalysisJob createAnalysisJob(AnalysisJobScheduler scheduler, AnalysisJobInfo info) {
+    public BaseAnalysisTask createAnalysisTask(AnalysisTaskScheduler scheduler, AnalysisTaskInfo info) {
         throw new NotImplementedException();
+    }
+
+    /**
+     * Should only be called in ExternalCatalog's getSchema(),
+     * which is called from schema cache.
+     * If you want to get schema of this table, use getFullSchema()
+     *
+     * @return
+     */
+    public List<Column> initSchema() {
+        throw new NotImplementedException("implement in sub class");
+    }
+
+    public void unsetObjectCreated() {
+        this.objectCreated = false;
     }
 
     @Override

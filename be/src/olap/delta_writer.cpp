@@ -17,11 +17,15 @@
 
 #include "olap/delta_writer.h"
 
+#include "exec/tablet_info.h"
 #include "olap/base_compaction.h"
 #include "olap/cumulative_compaction.h"
 #include "olap/data_dir.h"
 #include "olap/memtable.h"
 #include "olap/memtable_flush_executor.h"
+#include "olap/rowset/beta_rowset.h"
+#include "olap/rowset/beta_rowset_writer.h"
+#include "olap/rowset/rowset_writer_context.h"
 #include "olap/schema.h"
 #include "olap/schema_change.h"
 #include "olap/storage_engine.h"
@@ -30,9 +34,11 @@
 #include "runtime/tuple_row.h"
 #include "service/backend_options.h"
 #include "util/brpc_client_cache.h"
+#include "util/mem_info.h"
 #include "util/ref_count_closure.h"
 
 namespace doris {
+using namespace ErrorCode;
 
 Status DeltaWriter::open(WriteRequest* req, DeltaWriter** writer, const UniqueId& load_id,
                          bool is_vec) {
@@ -100,18 +106,25 @@ Status DeltaWriter::init() {
     if (_tablet == nullptr) {
         LOG(WARNING) << "fail to find tablet. tablet_id=" << _req.tablet_id
                      << ", schema_hash=" << _req.schema_hash;
-        return Status::OLAPInternalError(OLAP_ERR_TABLE_NOT_FOUND);
+        return Status::Error<TABLE_NOT_FOUND>();
     }
 
     // get rowset ids snapshot
     if (_tablet->enable_unique_key_merge_on_write()) {
         std::lock_guard<std::shared_mutex> lck(_tablet->get_header_lock());
         _cur_max_version = _tablet->max_version_unlocked().second;
-        _rowset_ids = _tablet->all_rs_id(_cur_max_version);
+        // tablet is under alter process. The delete bitmap will be calculated after conversion.
+        if (_tablet->tablet_state() == TABLET_NOTREADY &&
+            SchemaChangeHandler::tablet_in_converting(_tablet->tablet_id())) {
+            _rowset_ids.clear();
+        } else {
+            _rowset_ids = _tablet->all_rs_id(_cur_max_version);
+        }
     }
 
     // check tablet version number
-    if (_tablet->version_count() > config::max_tablet_version_num) {
+    if (_tablet->version_count() > config::max_tablet_version_num &&
+        !MemInfo::is_exceed_soft_mem_limit(GB_EXCHANGE_BYTE)) {
         //trigger quick compaction
         if (config::enable_quick_compaction) {
             StorageEngine::instance()->submit_quick_compaction_task(_tablet);
@@ -119,21 +132,20 @@ Status DeltaWriter::init() {
         LOG(WARNING) << "failed to init delta writer. version count: " << _tablet->version_count()
                      << ", exceed limit: " << config::max_tablet_version_num
                      << ". tablet: " << _tablet->full_name();
-        return Status::OLAPInternalError(OLAP_ERR_TOO_MANY_VERSION);
+        return Status::Error<TOO_MANY_VERSION>();
     }
 
     {
         std::shared_lock base_migration_rlock(_tablet->get_migration_lock(), std::try_to_lock);
         if (!base_migration_rlock.owns_lock()) {
-            return Status::OLAPInternalError(OLAP_ERR_RWLOCK_ERROR);
+            return Status::Error<TRY_LOCK_FAILED>();
         }
         std::lock_guard<std::mutex> push_lock(_tablet->get_push_lock());
         RETURN_NOT_OK(_storage_engine->txn_manager()->prepare_txn(_req.partition_id, _tablet,
                                                                   _req.txn_id, _req.load_id));
     }
     // build tablet schema in request level
-    _build_current_tablet_schema(_req.index_id, _req.ptable_schema_param,
-                                 *_tablet->tablet_schema());
+    _build_current_tablet_schema(_req.index_id, _req.table_schema_param, *_tablet->tablet_schema());
 
     RETURN_NOT_OK(_tablet->create_rowset_writer(_req.txn_id, _req.load_id, PREPARED, OVERLAPPING,
                                                 _tablet_schema, &_rowset_writer));
@@ -141,9 +153,9 @@ Status DeltaWriter::init() {
     _reset_mem_table();
 
     // create flush handler
-    // unique key merge on write should flush serial cause calc delete bitmap should load segment serial
-    bool should_serial = (_tablet->keys_type() == KeysType::UNIQUE_KEYS &&
-                          _tablet->enable_unique_key_merge_on_write());
+    // unique key should flush serial because we need to make sure same key should sort
+    // in the same order in all replica.
+    bool should_serial = _tablet->keys_type() == KeysType::UNIQUE_KEYS;
     RETURN_NOT_OK(_storage_engine->memtable_flush_executor()->create_flush_token(
             &_flush_token, _rowset_writer->type(), should_serial, _req.is_high_priority));
 
@@ -163,6 +175,7 @@ Status DeltaWriter::write(Tuple* tuple) {
         return _cancel_status;
     }
 
+    _total_received_rows++;
     _mem_table->insert(tuple);
 
     // if memtable is full, push it to the flush executor,
@@ -188,6 +201,7 @@ Status DeltaWriter::write(const RowBatch* row_batch, const std::vector<int>& row
         return _cancel_status;
     }
 
+    _total_received_rows += row_idxs.size();
     for (const auto& row_idx : row_idxs) {
         _mem_table->insert(row_batch->get_row(row_idx)->get_tuple(0));
     }
@@ -216,14 +230,23 @@ Status DeltaWriter::write(const vectorized::Block* block, const std::vector<int>
         return _cancel_status;
     }
 
+    if (_is_closed) {
+        LOG(WARNING) << "write block after closed tablet_id=" << _req.tablet_id
+                     << " load_id=" << _req.load_id << " txn_id=" << _req.txn_id;
+        return Status::InternalError("already closed");
+    }
+
+    _total_received_rows += row_idxs.size();
     _mem_table->insert(block, row_idxs);
 
     if (_mem_table->need_to_agg()) {
-        _mem_table->shrink_memtable_by_agg();
+        if (config::enable_shrink_memory) {
+            _mem_table->shrink_memtable_by_agg();
+        }
         if (_mem_table->is_flush()) {
             auto s = _flush_memtable_async();
             _reset_mem_table();
-            if (OLAP_UNLIKELY(!s.ok())) {
+            if (UNLIKELY(!s.ok())) {
                 return s;
             }
         }
@@ -233,6 +256,7 @@ Status DeltaWriter::write(const vectorized::Block* block, const std::vector<int>
 }
 
 Status DeltaWriter::_flush_memtable_async() {
+    _merged_rows += _mem_table->merged_rows();
     return _flush_token->submit(std::move(_mem_table));
 }
 
@@ -240,7 +264,7 @@ Status DeltaWriter::flush_memtable_and_wait(bool need_wait) {
     std::lock_guard<std::mutex> l(_lock);
     if (!_is_init) {
         // This writer is not initialized before flushing. Do nothing
-        // But we return OLAP_SUCCESS instead of Status::OLAPInternalError(OLAP_ERR_ALREADY_CANCELLED),
+        // But we return OK instead of Status::Error<ALREADY_CANCELLED>(),
         // Because this method maybe called when trying to reduce mem consumption,
         // and at that time, the writer may not be initialized yet and that is a normal case.
         return Status::OK();
@@ -255,7 +279,7 @@ Status DeltaWriter::flush_memtable_and_wait(bool need_wait) {
                 << ", load id: " << print_id(_req.load_id);
     auto s = _flush_memtable_async();
     _reset_mem_table();
-    if (OLAP_UNLIKELY(!s.ok())) {
+    if (UNLIKELY(!s.ok())) {
         return s;
     }
 
@@ -269,7 +293,7 @@ Status DeltaWriter::flush_memtable_and_wait(bool need_wait) {
 Status DeltaWriter::wait_flush() {
     std::lock_guard<std::mutex> l(_lock);
     if (!_is_init) {
-        // return OLAP_SUCCESS instead of Status::OLAPInternalError(OLAP_ERR_ALREADY_CANCELLED) for same reason
+        // return OK instead of Status::Error<ALREADY_CANCELLED>() for same reason
         // as described in flush_memtable_and_wait()
         return Status::OK();
     }
@@ -288,11 +312,11 @@ void DeltaWriter::_reset_mem_table() {
     auto mem_table_insert_tracker = std::make_shared<MemTracker>(
             fmt::format("MemTableManualInsert:TabletId={}:MemTableNum={}#loadID={}",
                         std::to_string(tablet_id()), _mem_table_num, _load_id.to_string()),
-            nullptr, ExecEnv::GetInstance()->load_channel_mgr()->mem_tracker_set());
+            ExecEnv::GetInstance()->load_channel_mgr()->mem_tracker());
     auto mem_table_flush_tracker = std::make_shared<MemTracker>(
             fmt::format("MemTableHookFlush:TabletId={}:MemTableNum={}#loadID={}",
                         std::to_string(tablet_id()), _mem_table_num++, _load_id.to_string()),
-            nullptr, ExecEnv::GetInstance()->load_channel_mgr()->mem_tracker_set());
+            ExecEnv::GetInstance()->load_channel_mgr()->mem_tracker());
 #else
     auto mem_table_insert_tracker = std::make_shared<MemTracker>(
             fmt::format("MemTableManualInsert:TabletId={}:MemTableNum={}#loadID={}",
@@ -318,7 +342,7 @@ Status DeltaWriter::close() {
         // if this delta writer is not initialized, but close() is called.
         // which means this tablet has no data loaded, but at least one tablet
         // in same partition has data loaded.
-        // so we have to also init this DeltaWriter, so that it can create a empty rowset
+        // so we have to also init this DeltaWriter, so that it can create an empty rowset
         // for this tablet when being closed.
         RETURN_NOT_OK(init());
     }
@@ -327,8 +351,15 @@ Status DeltaWriter::close() {
         return _cancel_status;
     }
 
+    if (_is_closed) {
+        LOG(WARNING) << "close after closed tablet_id=" << _req.tablet_id
+                     << " load_id=" << _req.load_id << " txn_id=" << _req.txn_id;
+        return Status::OK();
+    }
+
     auto s = _flush_memtable_async();
     _mem_table.reset();
+    _is_closed = true;
     if (OLAP_UNLIKELY(!s.ok())) {
         return s;
     } else {
@@ -346,24 +377,50 @@ Status DeltaWriter::close_wait(const PSlaveTabletNodes& slave_tablet_nodes,
         return _cancel_status;
     }
     // return error if previous flush failed
-    RETURN_NOT_OK(_flush_token->wait());
+    auto st = _flush_token->wait();
+    if (UNLIKELY(!st.ok())) {
+        LOG(WARNING) << "previous flush failed tablet " << _tablet->tablet_id();
+        return st;
+    }
 
     _mem_table.reset();
 
+    if (_rowset_writer->num_rows() + _merged_rows != _total_received_rows) {
+        LOG(WARNING) << "the rows number written doesn't match, rowset num rows written to file: "
+                     << _rowset_writer->num_rows() << ", merged_rows: " << _merged_rows
+                     << ", total received rows: " << _total_received_rows;
+        return Status::InternalError("rows number written by delta writer dosen't match");
+    }
     // use rowset meta manager to save meta
     _cur_rowset = _rowset_writer->build();
     if (_cur_rowset == nullptr) {
         LOG(WARNING) << "fail to build rowset";
-        return Status::OLAPInternalError(OLAP_ERR_MALLOC_ERROR);
+        return Status::Error<MEM_ALLOC_FAILED>();
     }
     Status res = _storage_engine->txn_manager()->commit_txn(_req.partition_id, _tablet, _req.txn_id,
                                                             _req.load_id, _cur_rowset, false);
-    if (!res && res != Status::OLAPInternalError(OLAP_ERR_PUSH_TRANSACTION_ALREADY_EXIST)) {
+    if (!res && !res.is<PUSH_TRANSACTION_ALREADY_EXIST>()) {
         LOG(WARNING) << "Failed to commit txn: " << _req.txn_id
                      << " for rowset: " << _cur_rowset->rowset_id();
         return res;
     }
     if (_tablet->enable_unique_key_merge_on_write()) {
+        // tablet is under alter process. The delete bitmap will be calculated after conversion.
+        if (_tablet->tablet_state() == TABLET_NOTREADY &&
+            SchemaChangeHandler::tablet_in_converting(_tablet->tablet_id())) {
+            LOG(INFO) << "tablet is under alter process, delete bitmap will be calculated later, "
+                         "tablet_id: "
+                      << _tablet->tablet_id() << " txn_id: " << _req.txn_id;
+        } else {
+            auto beta_rowset = reinterpret_cast<BetaRowset*>(_cur_rowset.get());
+            std::vector<segment_v2::SegmentSharedPtr> segments;
+            RETURN_IF_ERROR(beta_rowset->load_segments(&segments));
+            if (segments.size() > 1) {
+                RETURN_IF_ERROR(_tablet->calc_delete_bitmap(beta_rowset->rowset_id(), segments,
+                                                            nullptr, _delete_bitmap,
+                                                            _cur_max_version, true));
+            }
+        }
         _storage_engine->txn_manager()->set_txn_related_delete_bitmap(
                 _req.partition_id, _req.txn_id, _tablet->tablet_id(), _tablet->schema_hash(),
                 _tablet->tablet_uid(), true, _delete_bitmap, _rowset_ids);
@@ -405,7 +462,7 @@ Status DeltaWriter::cancel() {
 
 Status DeltaWriter::cancel_with_status(const Status& st) {
     std::lock_guard<std::mutex> l(_lock);
-    if (!_is_init || _is_cancelled) {
+    if (_is_cancelled) {
         return Status::OK();
     }
     _mem_table.reset();
@@ -458,22 +515,22 @@ int64_t DeltaWriter::partition_id() const {
 }
 
 void DeltaWriter::_build_current_tablet_schema(int64_t index_id,
-                                               const POlapTableSchemaParam& ptable_schema_param,
+                                               const OlapTableSchemaParam* table_schema_param,
                                                const TabletSchema& ori_tablet_schema) {
     _tablet_schema->copy_from(ori_tablet_schema);
-
     // find the right index id
     int i = 0;
-    for (; i < ptable_schema_param.indexes_size(); i++) {
-        if (ptable_schema_param.indexes(i).id() == index_id) break;
+    auto indexes = table_schema_param->indexes();
+    for (; i < indexes.size(); i++) {
+        if (indexes[i]->index_id == index_id) {
+            break;
+        }
     }
 
-    if (ptable_schema_param.indexes_size() > 0 &&
-        ptable_schema_param.indexes(i).columns_desc_size() != 0 &&
-        ptable_schema_param.indexes(i).columns_desc(0).unique_id() >= 0) {
-        _tablet_schema->build_current_tablet_schema(index_id, ptable_schema_param.version(),
-                                                    ptable_schema_param.indexes(i),
-                                                    ori_tablet_schema);
+    if (indexes.size() > 0 && indexes[i]->columns.size() != 0 &&
+        indexes[i]->columns[0]->unique_id() >= 0) {
+        _tablet_schema->build_current_tablet_schema(index_id, table_schema_param->version(),
+                                                    indexes[i], ori_tablet_schema);
     }
     if (_tablet_schema->schema_version() > ori_tablet_schema.schema_version()) {
         _tablet->update_max_version_schema(_tablet_schema);

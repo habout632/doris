@@ -48,7 +48,7 @@ void HeartbeatServer::heartbeat(THeartbeatResult& heartbeat_result,
                           << "host:" << master_info.network_address.hostname
                           << ", port:" << master_info.network_address.port
                           << ", cluster id:" << master_info.cluster_id
-                          << ", counter:" << google::COUNTER;
+                          << ", counter:" << google::COUNTER << ", BE start time: " << _be_epoch;
 
     // do heartbeat
     Status st = _heartbeat(master_info);
@@ -84,7 +84,7 @@ Status HeartbeatServer::_heartbeat(const TMasterInfo& master_info) {
         // write and update cluster id
         auto st = _olap_engine->set_cluster_id(master_info.cluster_id);
         if (!st.ok()) {
-            LOG(WARNING) << "fail to set cluster id. status=" << st.get_error_msg();
+            LOG(WARNING) << "fail to set cluster id. status=" << st;
             return Status::InternalError("fail to set cluster id.");
         } else {
             _master_info->cluster_id = master_info.cluster_id;

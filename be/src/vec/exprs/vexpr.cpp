@@ -21,6 +21,7 @@
 #include <thrift/protocol/TDebugProtocol.h>
 
 #include <memory>
+#include <stack>
 
 #include "exprs/anyval_util.h"
 #include "gen_cpp/Exprs_types.h"
@@ -79,9 +80,17 @@ VExpr::VExpr(const TypeDescriptor& type, bool is_slotref, bool is_nullable)
 }
 
 Status VExpr::prepare(RuntimeState* state, const RowDescriptor& row_desc, VExprContext* context) {
+    ++context->_depth_num;
+    if (context->_depth_num > config::max_depth_of_expr_tree) {
+        return Status::InternalError(
+                "The depth of the expression tree is too big, make it less than {}",
+                config::max_depth_of_expr_tree);
+    }
+
     for (int i = 0; i < _children.size(); ++i) {
         RETURN_IF_ERROR(_children[i]->prepare(state, row_desc, context));
     }
+    --context->_depth_num;
     return Status::OK();
 }
 
@@ -102,93 +111,118 @@ void VExpr::close(doris::RuntimeState* state, VExprContext* context,
 
 Status VExpr::create_expr(doris::ObjectPool* pool, const doris::TExprNode& texpr_node,
                           VExpr** expr) {
-    switch (texpr_node.node_type) {
-    case TExprNodeType::BOOL_LITERAL:
-    case TExprNodeType::INT_LITERAL:
-    case TExprNodeType::LARGE_INT_LITERAL:
-    case TExprNodeType::FLOAT_LITERAL:
-    case TExprNodeType::DECIMAL_LITERAL:
-    case TExprNodeType::DATE_LITERAL:
-    case TExprNodeType::STRING_LITERAL:
-    case TExprNodeType::JSON_LITERAL:
-    case TExprNodeType::NULL_LITERAL: {
-        *expr = pool->add(new VLiteral(texpr_node));
-        return Status::OK();
-    }
-    case TExprNodeType::ARRAY_LITERAL: {
-        *expr = pool->add(new VArrayLiteral(texpr_node));
-        return Status::OK();
-    }
-    case doris::TExprNodeType::SLOT_REF: {
-        *expr = pool->add(new VSlotRef(texpr_node));
-        break;
-    }
-    case doris::TExprNodeType::COMPOUND_PRED: {
-        *expr = pool->add(new VcompoundPred(texpr_node));
-        break;
-    }
-    case doris::TExprNodeType::ARITHMETIC_EXPR:
-    case doris::TExprNodeType::BINARY_PRED:
-    case doris::TExprNodeType::FUNCTION_CALL:
-    case doris::TExprNodeType::COMPUTE_FUNCTION_CALL: {
-        *expr = pool->add(new VectorizedFnCall(texpr_node));
-        break;
-    }
-    case doris::TExprNodeType::CAST_EXPR: {
-        *expr = pool->add(new VCastExpr(texpr_node));
-        break;
-    }
-    case doris::TExprNodeType::IN_PRED: {
-        *expr = pool->add(new VInPredicate(texpr_node));
-        break;
-    }
-    case doris::TExprNodeType::CASE_EXPR: {
-        if (!texpr_node.__isset.case_expr) {
-            return Status::InternalError("Case expression not set in thrift node");
+    try {
+        switch (texpr_node.node_type) {
+        case TExprNodeType::BOOL_LITERAL:
+        case TExprNodeType::INT_LITERAL:
+        case TExprNodeType::LARGE_INT_LITERAL:
+        case TExprNodeType::FLOAT_LITERAL:
+        case TExprNodeType::DECIMAL_LITERAL:
+        case TExprNodeType::DATE_LITERAL:
+        case TExprNodeType::STRING_LITERAL:
+        case TExprNodeType::JSON_LITERAL:
+        case TExprNodeType::NULL_LITERAL: {
+            *expr = pool->add(new VLiteral(texpr_node));
+            return Status::OK();
         }
-        *expr = pool->add(new VCaseExpr(texpr_node));
-        break;
+        case TExprNodeType::ARRAY_LITERAL: {
+            *expr = pool->add(new VArrayLiteral(texpr_node));
+            return Status::OK();
+        }
+        case doris::TExprNodeType::SLOT_REF: {
+            *expr = pool->add(new VSlotRef(texpr_node));
+            break;
+        }
+        case doris::TExprNodeType::COMPOUND_PRED: {
+            *expr = pool->add(new VcompoundPred(texpr_node));
+            break;
+        }
+        case doris::TExprNodeType::ARITHMETIC_EXPR:
+        case doris::TExprNodeType::BINARY_PRED:
+        case doris::TExprNodeType::FUNCTION_CALL:
+        case doris::TExprNodeType::COMPUTE_FUNCTION_CALL: {
+            *expr = pool->add(new VectorizedFnCall(texpr_node));
+            break;
+        }
+        case doris::TExprNodeType::CAST_EXPR: {
+            *expr = pool->add(new VCastExpr(texpr_node));
+            break;
+        }
+        case doris::TExprNodeType::IN_PRED: {
+            *expr = pool->add(new VInPredicate(texpr_node));
+            break;
+        }
+        case doris::TExprNodeType::CASE_EXPR: {
+            if (!texpr_node.__isset.case_expr) {
+                return Status::InternalError("Case expression not set in thrift node");
+            }
+            *expr = pool->add(new VCaseExpr(texpr_node));
+            break;
+        }
+        case TExprNodeType::INFO_FUNC: {
+            *expr = pool->add(new VInfoFunc(texpr_node));
+            break;
+        }
+        case TExprNodeType::TUPLE_IS_NULL_PRED: {
+            *expr = pool->add(new VTupleIsNullPredicate(texpr_node));
+            break;
+        }
+        default:
+            return Status::InternalError("Unknown expr node type: {}", texpr_node.node_type);
+        }
+    } catch (const Exception& e) {
+        return Status::Error(e.code());
     }
-    case TExprNodeType::INFO_FUNC: {
-        *expr = pool->add(new VInfoFunc(texpr_node));
-        break;
-    }
-    case TExprNodeType::TUPLE_IS_NULL_PRED: {
-        *expr = pool->add(new VTupleIsNullPredicate(texpr_node));
-        break;
-    }
-    default:
-        return Status::InternalError("Unknown expr node type: {}", texpr_node.node_type);
+    if (!(*expr)->data_type()) {
+        return Status::InvalidArgument("Unknown expr type: {}", texpr_node.node_type);
     }
     return Status::OK();
 }
 
 Status VExpr::create_tree_from_thrift(doris::ObjectPool* pool,
-                                      const std::vector<doris::TExprNode>& nodes, VExpr* parent,
-                                      int* node_idx, VExpr** root_expr, VExprContext** ctx) {
+                                      const std::vector<doris::TExprNode>& nodes, int* node_idx,
+                                      VExpr** root_expr, VExprContext** ctx) {
     // propagate error case
     if (*node_idx >= nodes.size()) {
         return Status::InternalError("Failed to reconstruct expression tree from thrift.");
     }
-    int num_children = nodes[*node_idx].num_children;
-    VExpr* expr = nullptr;
-    RETURN_IF_ERROR(create_expr(pool, nodes[*node_idx], &expr));
-    DCHECK(expr != nullptr);
-    if (parent != nullptr) {
-        parent->add_child(expr);
-    } else {
-        DCHECK(root_expr != nullptr);
-        DCHECK(ctx != nullptr);
-        *root_expr = expr;
-        *ctx = pool->add(new VExprContext(expr));
+
+    // create root expr
+    int root_children = nodes[*node_idx].num_children;
+    VExpr* root = nullptr;
+    RETURN_IF_ERROR(create_expr(pool, nodes[*node_idx], &root));
+    DCHECK(root != nullptr);
+
+    DCHECK(root_expr != nullptr);
+    DCHECK(ctx != nullptr);
+    *root_expr = root;
+    *ctx = pool->add(new VExprContext(root));
+    // short path for leaf node
+    if (root_children <= 0) {
+        return Status::OK();
     }
-    for (int i = 0; i < num_children; i++) {
-        *node_idx += 1;
-        RETURN_IF_ERROR(create_tree_from_thrift(pool, nodes, expr, node_idx, nullptr, nullptr));
-        // we are expecting a child, but have used all nodes
-        // this means we have been given a bad tree and must fail
-        if (*node_idx >= nodes.size()) {
+
+    // non-recursive traversal
+    std::stack<std::pair<VExpr*, int>> s;
+    s.push({root, root_children});
+    while (!s.empty()) {
+        auto& parent = s.top();
+        if (parent.second > 1) {
+            parent.second -= 1;
+        } else {
+            s.pop();
+        }
+
+        if (++*node_idx >= nodes.size()) {
             return Status::InternalError("Failed to reconstruct expression tree from thrift.");
+        }
+        VExpr* expr = nullptr;
+        RETURN_IF_ERROR(create_expr(pool, nodes[*node_idx], &expr));
+        DCHECK(expr != nullptr);
+        parent.first->add_child(expr);
+        int num_children = nodes[*node_idx].num_children;
+        if (num_children > 0) {
+            s.push({expr, num_children});
         }
     }
     return Status::OK();
@@ -202,14 +236,14 @@ Status VExpr::create_expr_tree(doris::ObjectPool* pool, const doris::TExpr& texp
     }
     int node_idx = 0;
     VExpr* e = nullptr;
-    Status status = create_tree_from_thrift(pool, texpr.nodes, nullptr, &node_idx, &e, ctx);
+    Status status = create_tree_from_thrift(pool, texpr.nodes, &node_idx, &e, ctx);
     if (status.ok() && node_idx + 1 != texpr.nodes.size()) {
         status = Status::InternalError(
                 "Expression tree only partially reconstructed. Not all thrift nodes were used.");
     }
     if (!status.ok()) {
         LOG(ERROR) << "Could not construct expr tree.\n"
-                   << status.get_error_msg() << "\n"
+                   << status << "\n"
                    << apache::thrift::ThriftDebugString(texpr);
     }
     return status;
@@ -308,13 +342,15 @@ bool VExpr::is_constant() const {
     return true;
 }
 
-ColumnPtrWrapper* VExpr::get_const_col(VExprContext* context) {
+Status VExpr::get_const_col(VExprContext* context, ColumnPtrWrapper** output) {
+    *output = nullptr;
     if (!is_constant()) {
-        return nullptr;
+        return Status::OK();
     }
 
     if (_constant_col != nullptr) {
-        return _constant_col.get();
+        *output = _constant_col.get();
+        return Status::OK();
     }
 
     int result = -1;
@@ -322,13 +358,12 @@ ColumnPtrWrapper* VExpr::get_const_col(VExprContext* context) {
     // If block is empty, some functions will produce no result. So we insert a column with
     // single value here.
     block.insert({ColumnUInt8::create(1), std::make_shared<DataTypeUInt8>(), ""});
-    if (!execute(context, &block, &result).ok()) {
-        return nullptr;
-    }
+    RETURN_IF_ERROR(execute(context, &block, &result));
     DCHECK(result != -1);
     const auto& column = block.get_by_position(result).column;
     _constant_col = std::make_shared<ColumnPtrWrapper>(column);
-    return _constant_col.get();
+    *output = _constant_col.get();
+    return Status::OK();
 }
 
 void VExpr::register_function_context(doris::RuntimeState* state, VExprContext* context) {
@@ -348,7 +383,9 @@ Status VExpr::init_function_context(VExprContext* context,
     if (scope == FunctionContext::FRAGMENT_LOCAL) {
         std::vector<ColumnPtrWrapper*> constant_cols;
         for (auto c : _children) {
-            constant_cols.push_back(c->get_const_col(context));
+            ColumnPtrWrapper* const_col_wrapper = nullptr;
+            RETURN_IF_ERROR(c->get_const_col(context, &const_col_wrapper));
+            constant_cols.push_back(const_col_wrapper);
         }
         fn_ctx->impl()->set_constant_cols(constant_cols);
     }
@@ -362,10 +399,17 @@ Status VExpr::init_function_context(VExprContext* context,
 
 void VExpr::close_function_context(VExprContext* context, FunctionContext::FunctionStateScope scope,
                                    const FunctionBasePtr& function) const {
-    if (_fn_context_index != -1 && !context->_stale) {
+    if (_fn_context_index != -1) {
         FunctionContext* fn_ctx = context->fn_context(_fn_context_index);
         function->close(fn_ctx, FunctionContext::THREAD_LOCAL);
-        if (scope == FunctionContext::FRAGMENT_LOCAL) {
+        // In doris 1.2-lts, the function state is managed by raw ptr, in master, it is already using shared ptr
+        // During runtime filter, scan node will clone function context and mark the expr context as stale.
+        // During clone function context, the clone function does not clone thread local state, so thread local state
+        // is not managed by the aim expr context.
+        // So we has to close the stale function context's thread local state here.
+        // Should not close stale's fragment local state, because the fragment local state is cloned during function
+        // context's clone method.
+        if (scope == FunctionContext::FRAGMENT_LOCAL && !context->_stale) {
             function->close(fn_ctx, FunctionContext::FRAGMENT_LOCAL);
         }
     }

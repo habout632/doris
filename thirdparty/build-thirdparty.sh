@@ -46,19 +46,19 @@ fi
 # Check args
 usage() {
     echo "
-Usage: $0 <options>
+Usage: $0 [options...] [packages...]
   Optional options:
-     -j                 build thirdparty parallel
+     -j <num>               build thirdparty parallel
+     --clean                clean the extracted data
+     --continue <package>   continue to build the remaining packages (starts from the specified package)
   "
     exit 1
 }
 
 if ! OPTS="$(getopt \
     -n "$0" \
-    -o '' \
-    -o 'h' \
-    -l 'help' \
-    -o 'j:' \
+    -o 'hj:' \
+    -l 'help,clean,continue:' \
     -- "$@")"; then
     usage
 fi
@@ -73,40 +73,57 @@ else
     PARALLEL="$(($(nproc) / 4 + 1))"
 fi
 
-if [[ "$#" -ne 1 ]]; then
-    while true; do
-        case "$1" in
-        -j)
-            PARALLEL="$2"
-            shift 2
-            ;;
-        -h)
-            HELP=1
-            shift
-            ;;
-        --help)
-            HELP=1
-            shift
-            ;;
-        --)
-            shift
-            break
-            ;;
-        *)
-            echo "Internal error"
-            exit 1
-            ;;
-        esac
-    done
+while true; do
+    case "$1" in
+    -j)
+        PARALLEL="$2"
+        shift 2
+        ;;
+    -h)
+        HELP=1
+        shift
+        ;;
+    --help)
+        HELP=1
+        shift
+        ;;
+    --clean)
+        CLEAN=1
+        shift
+        ;;
+    --continue)
+        CONTINUE=1
+        start_package="${2}"
+        shift 2
+        ;;
+    --)
+        shift
+        break
+        ;;
+    *)
+        echo "Internal error"
+        exit 1
+        ;;
+    esac
+done
+
+if [[ "${CONTINUE}" -eq 1 ]]; then
+    if [[ -z "${start_package}" ]] || [[ "${#}" -ne 0 ]]; then
+        usage
+    fi
 fi
+
+read -r -a packages <<<"${@}"
 
 if [[ "${HELP}" -eq 1 ]]; then
     usage
-    exit
 fi
 
 echo "Get params:
     PARALLEL            -- ${PARALLEL}
+    CLEAN               -- ${CLEAN}
+    PACKAGES            -- ${packages[*]}
+    CONTINUE            -- ${start_package}
 "
 
 if [[ ! -f "${TP_DIR}/download-thirdparty.sh" ]]; then
@@ -122,6 +139,12 @@ fi
 . "${TP_DIR}/vars.sh"
 
 cd "${TP_DIR}"
+
+if [[ "${CLEAN}" -eq 1 ]] && [[ -d "${TP_SOURCE_DIR}" ]]; then
+    echo 'Clean the extracted data ...'
+    find "${TP_SOURCE_DIR}" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} \;
+    echo 'Success!'
+fi
 
 # Download thirdparties.
 "${TP_DIR}/download-thirdparty.sh"
@@ -147,7 +170,8 @@ elif [[ "${CC}" == *clang ]]; then
     boost_toolset='clang'
     libhdfs_cxx17='-std=c++1z'
 
-    if "${CC}" -xc++ "${warning_unused_but_set_variable}" /dev/null 2>&1 | grep 'unknown warning option'; then
+    test_warning_result="$("${CC}" -xc++ "${warning_unused_but_set_variable}" /dev/null 2>&1 || true)"
+    if echo "${test_warning_result}" | grep 'unknown warning option' >/dev/null; then
         warning_unused_but_set_variable=''
     fi
 fi
@@ -157,6 +181,13 @@ mkdir -p "${TP_DIR}/installed/lib64"
 pushd "${TP_DIR}/installed"/
 ln -sf lib64 lib
 popd
+
+# Configure the search paths for pkg-config and cmake
+export PKG_CONFIG_PATH="${TP_DIR}/installed/lib64/pkgconfig"
+export CMAKE_PREFIX_PATH="${TP_DIR}/installed"
+
+echo "PKG_CONFIG_PATH: ${PKG_CONFIG_PATH}"
+echo "CMAKE_PREFIX_PATH: ${CMAKE_PREFIX_PATH}"
 
 check_prerequest() {
     local CMD="$1"
@@ -544,7 +575,7 @@ build_zlib() {
     check_if_source_exist "${ZLIB_SOURCE}"
     cd "${TP_SOURCE_DIR}/${ZLIB_SOURCE}"
 
-    CFLAGS="-fPIC" \
+    CFLAGS="-O3 -fPIC" \
         CPPFLAGS="-I${TP_INCLUDE_DIR}" \
         LDFLAGS="-L${TP_LIB_DIR}" \
         ./configure --prefix="${TP_INSTALL_DIR}" --static
@@ -768,6 +799,10 @@ build_brpc() {
         ldflags="-L${TP_LIB_DIR} -static-libstdc++ -static-libgcc"
     else
         ldflags="-L${TP_LIB_DIR}"
+
+        # Don't set OPENSSL_ROOT_DIR
+        sed '/set(OPENSSL_ROOT_DIR/,/)/ d' ../CMakeLists.txt >../CMakeLists.txt.bak
+        mv ../CMakeLists.txt.bak ../CMakeLists.txt
     fi
 
     # Currently, BRPC can't be built for static libraries only (without .so). Therefore, we should add `-fPIC`
@@ -817,7 +852,7 @@ build_cyrus_sasl() {
     check_if_source_exist "${CYRUS_SASL_SOURCE}"
     cd "${TP_SOURCE_DIR}/${CYRUS_SASL_SOURCE}"
 
-    CFLAGS="-fPIC" \
+    CFLAGS="-fPIC -Wno-implicit-function-declaration" \
         CPPFLAGS="-I${TP_INCLUDE_DIR}" \
         LDFLAGS="-L${TP_LIB_DIR}" \
         LIBS="-lcrypto" \
@@ -843,7 +878,8 @@ build_librdkafka() {
     # PKG_CONFIG="pkg-config --static"
 
     CPPFLAGS="-I${TP_INCLUDE_DIR}" \
-        LDFLAGS="-L${TP_LIB_DIR} -lssl -lcrypto -lzstd -lz -lsasl2" \
+        LDFLAGS="-L${TP_LIB_DIR} -lssl -lcrypto -lzstd -lz -lsasl2 \
+        -lgssapi_krb5 -lkrb5 -lkrb5support -lk5crypto -lcom_err -lresolv" \
         ./configure --prefix="${TP_INSTALL_DIR}" --enable-static --enable-sasl --disable-c11threads
 
     make -j "${PARALLEL}"
@@ -1046,7 +1082,7 @@ build_bitshuffle() {
             if [[ ! -f "${nm}" ]]; then nm="$(command -v nm)"; fi
             if [[ ! -f "${objcopy}" ]]; then
                 if ! objcopy="$(command -v objcopy)"; then
-                    objcopy="${TP_INSTALL_DIR}/bin/objcopy"
+                    objcopy="${TP_INSTALL_DIR}/binutils/bin/objcopy"
                 fi
             fi
 
@@ -1320,7 +1356,9 @@ build_gsasl() {
         cflags='-Wno-implicit-function-declaration'
     fi
 
-    CFLAGS="${cflags}" ../configure --prefix="${TP_INSTALL_DIR}" --with-gssapi-impl=mit --enable-shared=no --with-pic --with-libidn-prefix="${TP_INSTALL_DIR}"
+    KRB5_CONFIG="${TP_INSTALL_DIR}/bin/krb5-config" \
+        CFLAGS="${cflags} -I${TP_INCLUDE_DIR}" \
+        ../configure --prefix="${TP_INSTALL_DIR}" --with-gssapi-impl=mit --enable-shared=no --with-pic --with-libidn-prefix="${TP_INSTALL_DIR}"
 
     make -j "${PARALLEL}"
     make install
@@ -1339,7 +1377,8 @@ build_krb5() {
     fi
 
     CFLAGS="-fcommon -fPIC -I${TP_INSTALL_DIR}/include" LDFLAGS="-L${TP_INSTALL_DIR}/lib" \
-        ../configure --prefix="${TP_INSTALL_DIR}" --disable-shared --enable-static ${with_crypto_impl:+${with_crypto_impl}}
+        ../configure --prefix="${TP_INSTALL_DIR}" --disable-shared --enable-static \
+        --without-keyutils ${with_crypto_impl:+${with_crypto_impl}}
 
     make -j "${PARALLEL}"
     make install
@@ -1494,9 +1533,10 @@ build_binutils() {
     mkdir -p "${BUILD_DIR}"
     cd "${BUILD_DIR}"
 
-    ../configure --prefix="${TP_INSTALL_DIR}" --enable-install-libiberty
+    ../configure --prefix="${TP_INSTALL_DIR}/binutils" --includedir="${TP_INCLUDE_DIR}" --libdir="${TP_LIB_DIR}" \
+        --enable-install-libiberty --without-msgpack
     make -j "${PARALLEL}"
-    make install
+    make install-bfd install-libiberty install-binutils
 }
 
 build_gettext() {
@@ -1507,7 +1547,8 @@ build_gettext() {
     mkdir -p "${BUILD_DIR}"
     cd "${BUILD_DIR}"
 
-    ../configure --prefix="${TP_INSTALL_DIR}" --disable-java
+    ../gettext-runtime/configure --prefix="${TP_INSTALL_DIR}" --disable-java
+    cd intl
     make -j "${PARALLEL}"
     make install
 
@@ -1521,66 +1562,104 @@ build_concurrentqueue() {
     cp ./*.h "${TP_INSTALL_DIR}/include/"
 }
 
-if [[ "$(uname -s)" == 'Darwin' ]]; then
-    echo 'build for Darwin'
-    build_binutils
-    build_gettext
+# fast_float
+build_fast_float() {
+    check_if_source_exist "${FAST_FLOAT_SOURCE}"
+    cd "${TP_SOURCE_DIR}/${FAST_FLOAT_SOURCE}"
+    cp -r ./include/fast_float "${TP_INSTALL_DIR}/include/"
+}
+
+# hadoop_libs
+build_hadoop_libs() {
+    check_if_source_exist "${HADOOP_LIBS_SOURCE}"
+    cd "${TP_SOURCE_DIR}/${HADOOP_LIBS_SOURCE}"
+    echo "THIRDPARTY_INSTALLED=${TP_INSTALL_DIR}" >env.sh
+    ./build.sh
+
+    mkdir -p "${TP_INSTALL_DIR}/include/hadoop_hdfs/"
+    mkdir -p "${TP_INSTALL_DIR}/lib/hadoop_hdfs/"
+    cp -r ./hadoop-dist/target/hadoop-libhdfs-3.3.4/* "${TP_INSTALL_DIR}/lib/hadoop_hdfs/"
+    cp -r ./hadoop-dist/target/hadoop-libhdfs-3.3.4/include/hdfs.h "${TP_INSTALL_DIR}/include/hadoop_hdfs/"
+    rm -rf "${TP_INSTALL_DIR}/lib/hadoop_hdfs/native/*.a"
+    find ./hadoop-dist/target/hadoop-3.3.4/lib/native/ -type f ! -name '*.a' -exec cp {} "${TP_INSTALL_DIR}/lib/hadoop_hdfs/native/" \;
+    find ./hadoop-dist/target/hadoop-3.3.4/lib/native/ -type l -exec cp -P {} "${TP_INSTALL_DIR}/lib/hadoop_hdfs/native/" \;
+}
+
+if [[ "${#packages[@]}" -eq 0 ]]; then
+    packages=(
+        libunixodbc
+        openssl
+        libevent
+        zlib
+        lz4
+        bzip
+        lzo2
+        zstd
+        boost # must before thrift
+        protobuf
+        gflags
+        gtest
+        glog
+        rapidjson
+        snappy
+        gperftools
+        curl
+        re2
+        hyperscan
+        thrift
+        leveldb
+        brpc
+        jemalloc
+        rocksdb
+        krb5 # before cyrus_sasl
+        cyrus_sasl
+        librdkafka
+        flatbuffers
+        orc
+        arrow
+        s2
+        bitshuffle
+        croaringbitmap
+        fmt
+        parallel_hashmap
+        pdqsort
+        libdivide
+        cctz
+        tsan_header
+        mysql
+        aws_sdk
+        js_and_css
+        lzma
+        xml2
+        idn
+        gsasl
+        hdfs3
+        benchmark
+        simdjson
+        nlohmann_json
+        opentelemetry
+        libbacktrace
+        sse2neon
+        xxhash
+        concurrentqueue
+        fast_float
+    )
+
+    if [[ "$(uname -s)" == 'Darwin' ]]; then
+        read -r -a packages <<<"binutils gettext ${packages[*]}"
+    elif [[ "$(uname -s)" == 'Linux' ]]; then
+        read -r -a packages <<<"${packages[*]} hadoop_libs"
+    fi
 fi
 
-build_libunixodbc
-build_openssl
-build_libevent
-build_zlib
-build_lz4
-build_bzip
-build_lzo2
-build_zstd
-build_boost # must before thrift
-build_protobuf
-build_gflags
-build_gtest
-build_glog
-build_rapidjson
-build_snappy
-build_gperftools
-build_curl
-build_re2
-build_hyperscan
-build_thrift
-build_leveldb
-build_brpc
-build_jemalloc
-build_rocksdb
-build_krb5 # before cyrus_sasl
-build_cyrus_sasl
-build_librdkafka
-build_flatbuffers
-build_orc
-build_arrow
-build_s2
-build_bitshuffle
-build_croaringbitmap
-build_fmt
-build_parallel_hashmap
-build_pdqsort
-build_libdivide
-build_cctz
-build_tsan_header
-build_mysql
-build_aws_sdk
-build_js_and_css
-build_lzma
-build_xml2
-build_idn
-build_gsasl
-build_hdfs3
-build_benchmark
-build_simdjson
-build_nlohmann_json
-build_opentelemetry
-build_libbacktrace
-build_sse2neon
-build_xxhash
-build_concurrentqueue
+for package in "${packages[@]}"; do
+    if [[ "${package}" == "${start_package}" ]]; then
+        PACKAGE_FOUND=1
+    fi
+    if [[ "${CONTINUE}" -eq 0 ]] || [[ "${PACKAGE_FOUND}" -eq 1 ]]; then
+        command="build_${package}"
+        ${command}
+    fi
+done
 
 echo "Finished to build all thirdparties"

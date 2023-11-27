@@ -23,6 +23,7 @@
 #include "exprs/function_filter.h"
 #include "io/file_factory.h"
 #include "runtime/tuple.h"
+#include "vec/exec/format/format_common.h"
 #include "vec/exec/format/generic_reader.h"
 #include "vec/exec/scan/vscanner.h"
 
@@ -33,7 +34,8 @@ class NewFileScanNode;
 class VFileScanner : public VScanner {
 public:
     VFileScanner(RuntimeState* state, NewFileScanNode* parent, int64_t limit,
-                 const TFileScanRange& scan_range, RuntimeProfile* profile);
+                 const TFileScanRange& scan_range, RuntimeProfile* profile,
+                 KVCache<string>& kv_cache);
 
     Status open(RuntimeState* state) override;
 
@@ -62,12 +64,11 @@ protected:
     std::unordered_map<std::string, ColumnValueRangeType>* _colname_to_value_range;
     // File source slot descriptors
     std::vector<SlotDescriptor*> _file_slot_descs;
-    // File slot id to index in _file_slot_descs
-    std::unordered_map<SlotId, int> _file_slot_index_map;
-    // file col name to index in _file_slot_descs
-    std::map<std::string, int> _file_slot_name_map;
     // col names from _file_slot_descs
     std::vector<std::string> _file_col_names;
+    // column id to name map. Collect from FE slot descriptor.
+    std::unordered_map<int, std::string> _col_id_name_map;
+
     // Partition source slot descriptors
     std::vector<SlotDescriptor*> _partition_slot_descs;
     // Partition slot id to index in _partition_slot_descs
@@ -103,14 +104,12 @@ protected:
     // Mem pool used to allocate _src_tuple and _src_tuple_row
     std::unique_ptr<MemPool> _mem_pool;
 
-    // Profile
-    RuntimeProfile* _profile;
+    KVCache<std::string>& _kv_cache;
 
     bool _scanner_eof = false;
     int _rows = 0;
     int _num_of_columns_from_file;
 
-    bool _src_block_mem_reuse = false;
     bool _strict_mode;
 
     bool _src_block_init = false;
@@ -126,6 +125,14 @@ private:
     RuntimeProfile::Counter* _fill_missing_columns_timer = nullptr;
     RuntimeProfile::Counter* _pre_filter_timer = nullptr;
     RuntimeProfile::Counter* _convert_to_output_block_timer = nullptr;
+    RuntimeProfile::Counter* _file_counter = nullptr;
+
+    // Only for load scan node.
+    const TupleDescriptor* _input_tuple_desc = nullptr;
+    // If _input_tuple_desc is set,
+    // the _real_tuple_desc will point to _input_tuple_desc,
+    // otherwise, point to _output_tuple_desc
+    const TupleDescriptor* _real_tuple_desc = nullptr;
 
 private:
     Status _init_expr_ctxes();

@@ -42,13 +42,16 @@ public:
     // TODO(zc): Now we use file name(std::string) as a part of
     // key, which is not efficient. We should make it better later
     struct CacheKey {
-        CacheKey(std::string fname_, int64_t offset_) : fname(std::move(fname_)), offset(offset_) {}
+        CacheKey(std::string fname_, size_t fsize_, int64_t offset_)
+                : fname(std::move(fname_)), fsize(fsize_), offset(offset_) {}
         std::string fname;
+        size_t fsize;
         int64_t offset;
 
         // Encode to a flat binary which can be used as LRUCache's key
         std::string encode() const {
             std::string key_buf(fname);
+            key_buf.append((char*)&fsize, sizeof(fsize));
             key_buf.append((char*)&offset, sizeof(offset));
             return key_buf;
         }
@@ -89,6 +92,12 @@ public:
     // When percentage is set to 0 or 100, the index or data cache will not be allocated.
     bool is_cache_available(segment_v2::PageTypePB page_type) {
         return _get_page_cache(page_type) != nullptr;
+    }
+
+    void prune(segment_v2::PageTypePB page_type);
+
+    int64_t get_page_cache_mem_consumption(segment_v2::PageTypePB page_type) {
+        return _get_page_cache(page_type)->mem_consumption();
     }
 
 private:

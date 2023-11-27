@@ -109,7 +109,7 @@ public class SetVar {
             throw new AnalysisException("Set statement does't support non-constant expr.");
         }
 
-        final Expr literalExpr = value.getResultValue();
+        final Expr literalExpr = value.getResultValue(false);
         if (!(literalExpr instanceof LiteralExpr)) {
             throw new AnalysisException("Set statement does't support computing expr:" + literalExpr.toSql());
         }
@@ -144,6 +144,10 @@ public class SetVar {
         }
 
         if (getVariable().equalsIgnoreCase(SessionVariable.EXEC_MEM_LIMIT)) {
+            this.value = new StringLiteral(Long.toString(ParseUtil.analyzeDataVolumn(getValue().getStringValue())));
+            this.result = (LiteralExpr) this.value;
+        }
+        if (getVariable().equalsIgnoreCase(SessionVariable.SCAN_QUEUE_MEM_LIMIT)) {
             this.value = new StringLiteral(Long.toString(ParseUtil.analyzeDataVolumn(getValue().getStringValue())));
             this.result = (LiteralExpr) this.value;
         }

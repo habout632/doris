@@ -19,6 +19,7 @@ package org.apache.doris.catalog;
 
 import org.apache.doris.analysis.FunctionName;
 import org.apache.doris.common.AnalysisException;
+import org.apache.doris.common.UserException;
 import org.apache.doris.common.io.IOUtils;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
@@ -29,13 +30,17 @@ import org.apache.doris.thrift.TFunctionBinaryType;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
+import org.apache.commons.io.output.NullOutputStream;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.io.DataInput;
 import java.io.DataOutput;
+import java.io.DataOutputStream;
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.List;
+import java.util.Objects;
 
 /**
  * Base class for all functions.
@@ -160,6 +165,26 @@ public class Function implements Writable {
         this(id, name, argTypes, retType, hasVarArgs, TFunctionBinaryType.BUILTIN, true, vectorized, mode);
     }
 
+    public Function(Function other) {
+        if (other == null) {
+            return;
+        }
+        this.id = other.id;
+        this.name = new FunctionName(other.name.getDb(), other.name.getFunction());
+        this.hasVarArgs = other.hasVarArgs;
+        this.retType = other.retType;
+        this.userVisible = other.userVisible;
+        this.nullableMode = other.nullableMode;
+        this.vectorized = other.vectorized;
+        this.binaryType = other.binaryType;
+        this.location = other.location;
+        if (other.argTypes != null) {
+            this.argTypes = new Type[other.argTypes.length];
+            System.arraycopy(other.argTypes, 0, this.argTypes, 0, other.argTypes.length);
+        }
+        this.checksum = other.checksum;
+    }
+
     public FunctionName getFunctionName() {
         return name;
     }
@@ -178,10 +203,6 @@ public class Function implements Writable {
 
     public void setReturnType(Type type) {
         this.retType = type;
-    }
-
-    public void setArgType(Type type, int i) {
-        argTypes[i] = type;
     }
 
     public Type[] getArgs() {
@@ -802,5 +823,34 @@ public class Function implements Writable {
 
     public NullableMode getNullableMode() {
         return nullableMode;
+    }
+
+    // Try to serialize this function and write to nowhere.
+    // Just for checking if we forget to implement write() method for some Exprs.
+    // To avoid FE exist when writing edit log.
+    public void checkWritable() throws UserException {
+        try {
+            DataOutputStream out = new DataOutputStream(new NullOutputStream());
+            write(out);
+        } catch (Throwable t) {
+            throw new UserException("failed to serialize function: " + functionName(), t);
+        }
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) {
+            return true;
+        }
+        if (o == null || getClass() != o.getClass()) {
+            return false;
+        }
+        Function function = (Function) o;
+        return id == function.id && hasVarArgs == function.hasVarArgs && userVisible == function.userVisible
+            && vectorized == function.vectorized && Objects.equals(name, function.name)
+            && Objects.equals(retType, function.retType) && Arrays.equals(argTypes,
+            function.argTypes) && Objects.equals(location, function.location)
+            && binaryType == function.binaryType && nullableMode == function.nullableMode && Objects.equals(
+            checksum, function.checksum);
     }
 }

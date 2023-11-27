@@ -18,6 +18,7 @@
 #include "runtime/user_function_cache.h"
 
 #include <atomic>
+#include <cstdint>
 #include <regex>
 #include <vector>
 
@@ -48,6 +49,15 @@ struct UserFunctionCacheEntry {
 
     // If unref() returns true, this object should be delete
     bool unref() { return _refs.fetch_sub(1) == 1; }
+
+    std::string debug_string() {
+        fmt::memory_buffer error_msg;
+        fmt::format_to(error_msg,
+                       " the info of UserFunctionCacheEntry save in BE, function_id:{}, "
+                       "checksum:{}, lib_file:{}, is_downloaded:{}. ",
+                       function_id, checksum, lib_file, is_downloaded);
+        return fmt::to_string(error_msg);
+    }
 
     int64_t function_id = 0;
     // used to check if this library is valid.
@@ -136,12 +146,17 @@ Status UserFunctionCache::_load_entry_from_lib(const std::string& dir, const std
     } else if (ends_with(file, ".jar")) {
         lib_type = LibType::JAR;
     } else {
-        return Status::InternalError("unknown library file format: " + file);
+        return Status::InternalError(
+                "unknown library file format. the file type is not end with xxx.jar or xxx.so : " +
+                file);
     }
 
     std::vector<std::string> split_parts = strings::Split(file, ".");
     if (split_parts.size() != 3) {
-        return Status::InternalError("user function's name should be function_id.checksum.so");
+        return Status::InternalError(
+                "user function's name should be function_id.checksum[.file_name].file_type, now "
+                "the all split parts are by delimiter(.): " +
+                file);
     }
     int64_t function_id = std::stol(split_parts[0]);
     std::string checksum = split_parts[1];
@@ -149,7 +164,7 @@ Status UserFunctionCache::_load_entry_from_lib(const std::string& dir, const std
     if (it != _entry_map.end()) {
         LOG(WARNING) << "meet a same function id user function library, function_id=" << function_id
                      << ", one_checksum=" << checksum
-                     << ", other_checksum=" << it->second->checksum;
+                     << ", other_checksum info: = " << it->second->debug_string();
         return Status::InternalError("duplicate function id");
     }
     // create a cache entry and put it into entry map
@@ -252,14 +267,15 @@ Status UserFunctionCache::_get_cache_entry(int64_t fid, const std::string& url,
                                            const std::string& checksum,
                                            UserFunctionCacheEntry** output_entry, LibType type) {
     UserFunctionCacheEntry* entry = nullptr;
+    std::string file_name = _get_file_name_from_url(url);
     {
         std::lock_guard<std::mutex> l(_cache_lock);
         auto it = _entry_map.find(fid);
         if (it != _entry_map.end()) {
             entry = it->second;
         } else {
-            entry = new UserFunctionCacheEntry(fid, checksum, _make_lib_file(fid, checksum, type),
-                                               type);
+            entry = new UserFunctionCacheEntry(
+                    fid, checksum, _make_lib_file(fid, checksum, type, file_name), type);
             entry->ref();
             _entry_map.emplace(fid, entry);
         }
@@ -267,7 +283,7 @@ Status UserFunctionCache::_get_cache_entry(int64_t fid, const std::string& url,
     }
     auto st = _load_cache_entry(url, entry);
     if (!st.ok()) {
-        LOG(WARNING) << "fail to load cache entry, fid=" << fid;
+        LOG(WARNING) << "fail to load cache entry, fid=" << fid << " " << file_name << " " << url;
         // if we load a cache entry failed, I think we should delete this entry cache
         // even if this cache was valid before.
         _destroy_cache_entry(entry);
@@ -327,12 +343,17 @@ Status UserFunctionCache::_download_lib(const std::string& url, UserFunctionCach
         return Status::InternalError("fail to open file");
     }
 
+    std::string real_url = _get_real_url(url);
+
     Md5Digest digest;
     HttpClient client;
-    RETURN_IF_ERROR(client.init(url));
+    int64_t file_size = 0;
+    RETURN_IF_ERROR(client.init(real_url));
     Status status;
-    auto download_cb = [&status, &tmp_file, &fp, &digest](const void* data, size_t length) {
+    auto download_cb = [&status, &tmp_file, &fp, &digest, &file_size](const void* data,
+                                                                      size_t length) {
         digest.update(data, length);
+        file_size = file_size + length;
         auto res = fwrite(data, length, 1, fp.get());
         if (res != 1) {
             LOG(WARNING) << "fail to write data to file, file=" << tmp_file
@@ -346,9 +367,15 @@ Status UserFunctionCache::_download_lib(const std::string& url, UserFunctionCach
     RETURN_IF_ERROR(status);
     digest.digest();
     if (!iequal(digest.hex(), entry->checksum)) {
-        LOG(WARNING) << "UDF's checksum is not equal, one=" << digest.hex()
-                     << ", other=" << entry->checksum;
-        return Status::InternalError("UDF's library checksum is not match");
+        fmt::memory_buffer error_msg;
+        fmt::format_to(
+                error_msg,
+                " The checksum is not equal of {} ({}). The init info of first create entry is:"
+                "{} But download file check_sum is: {}, file_size is: {}.",
+                url, real_url, entry->debug_string(), digest.hex(), file_size);
+        std::string error(fmt::to_string(error_msg));
+        LOG(WARNING) << error;
+        return Status::InternalError(error);
     }
     // close this file
     fp.reset();
@@ -367,6 +394,24 @@ Status UserFunctionCache::_download_lib(const std::string& url, UserFunctionCach
     return Status::OK();
 }
 
+std::string UserFunctionCache::_get_real_url(const std::string& url) {
+    if (url.find(":/") == std::string::npos) {
+        return "file://" + config::jdbc_drivers_dir + "/" + url;
+    }
+    return url;
+}
+
+std::string UserFunctionCache::_get_file_name_from_url(const std::string& url) const {
+    std::string file_name;
+    size_t last_slash_pos = url.find_last_of('/');
+    if (last_slash_pos != std::string::npos) {
+        file_name = url.substr(last_slash_pos + 1, url.size());
+    } else {
+        file_name = url;
+    }
+    return file_name;
+}
+
 // entry's lock must be held
 Status UserFunctionCache::_load_cache_entry_internal(UserFunctionCacheEntry* entry) {
     RETURN_IF_ERROR(dynamic_open(entry->lib_file.c_str(), &entry->lib_handle));
@@ -375,12 +420,12 @@ Status UserFunctionCache::_load_cache_entry_internal(UserFunctionCacheEntry* ent
 }
 
 std::string UserFunctionCache::_make_lib_file(int64_t function_id, const std::string& checksum,
-                                              LibType type) {
+                                              LibType type, const std::string& file_name) {
     int shard = function_id % kLibShardNum;
     std::stringstream ss;
     ss << _lib_dir << '/' << shard << '/' << function_id << '.' << checksum;
     if (type == LibType::JAR) {
-        ss << ".jar";
+        ss << '.' << file_name;
     } else {
         ss << ".so";
     }
@@ -408,6 +453,7 @@ Status UserFunctionCache::check_jar(int64_t fid, const std::string& url,
                                     const std::string& checksum) {
     UserFunctionCacheEntry* entry = nullptr;
     Status st = Status::OK();
+    std::string file_name = _get_file_name_from_url(url);
     {
         std::lock_guard<std::mutex> l(_cache_lock);
         auto it = _entry_map.find(fid);
@@ -415,7 +461,8 @@ Status UserFunctionCache::check_jar(int64_t fid, const std::string& url,
             entry = it->second;
         } else {
             entry = new UserFunctionCacheEntry(
-                    fid, checksum, _make_lib_file(fid, checksum, LibType::JAR), LibType::JAR);
+                    fid, checksum, _make_lib_file(fid, checksum, LibType::JAR, file_name),
+                    LibType::JAR);
             entry->ref();
             _entry_map.emplace(fid, entry);
         }
@@ -436,7 +483,7 @@ Status UserFunctionCache::check_jar(int64_t fid, const std::string& url,
         return Status::InternalError(
                 "Java UDAF has error, maybe you should check the path about java impl jar, because "
                 "{}",
-                st.get_error_msg());
+                st.to_string());
     }
     return Status::OK();
 }

@@ -433,7 +433,7 @@ public:
         // we should assure that *len is not 0
         *len = _slices[_cur_slice].size - _slice_off;
         DCHECK(*len != 0);
-        return _slices[_cur_slice].data;
+        return _slices[_cur_slice].data + _slice_off;
     }
 
     // Skip the next n bytes.  Invalidates any buffer returned by
@@ -817,7 +817,7 @@ public:
     ~GzipBlockCompression() override = default;
 
     Status decompress(const Slice& input, Slice* output) override {
-        z_stream z_strm = {nullptr};
+        z_stream z_strm = {};
         z_strm.zalloc = Z_NULL;
         z_strm.zfree = Z_NULL;
         z_strm.opaque = Z_NULL;

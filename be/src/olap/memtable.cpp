@@ -23,6 +23,7 @@
 #include "olap/rowset/rowset_writer.h"
 #include "olap/schema.h"
 #include "olap/schema_change.h"
+#include "runtime/load_channel_mgr.h"
 #include "runtime/tuple.h"
 #include "util/doris_metrics.h"
 #include "vec/aggregate_functions/aggregate_function_reader.h"
@@ -30,6 +31,7 @@
 #include "vec/core/field.h"
 
 namespace doris {
+using namespace ErrorCode;
 
 MemTable::MemTable(TabletSharedPtr tablet, Schema* schema, const TabletSchema* tablet_schema,
                    const std::vector<SlotDescriptor*>* slot_descs, TupleDescriptor* tuple_desc,
@@ -53,8 +55,14 @@ MemTable::MemTable(TabletSharedPtr tablet, Schema* schema, const TabletSchema* t
           _delete_bitmap(delete_bitmap),
           _rowset_ids(rowset_ids),
           _cur_max_version(cur_max_version) {
+#ifndef BE_TEST
+    _insert_mem_tracker_use_hook = std::make_unique<MemTracker>(
+            fmt::format("MemTableHookInsert:TabletId={}", std::to_string(tablet_id())),
+            ExecEnv::GetInstance()->load_channel_mgr()->mem_tracker());
+#else
     _insert_mem_tracker_use_hook = std::make_unique<MemTracker>(
             fmt::format("MemTableHookInsert:TabletId={}", std::to_string(tablet_id())));
+#endif
     _buffer_mem_pool = std::make_unique<MemPool>(_insert_mem_tracker.get());
     _table_mem_pool = std::make_unique<MemPool>(_insert_mem_tracker.get());
     if (support_vec) {
@@ -212,6 +220,7 @@ void MemTable::_insert_one_row_from_block(RowInBlock* row_in_block) {
 
     bool is_exist = _vec_skip_list->Find(row_in_block, &_vec_hint);
     if (is_exist) {
+        _merged_rows++;
         _aggregate_two_row_in_block(row_in_block, _vec_hint.curr->key);
     } else {
         row_in_block->init_agg_places(
@@ -241,6 +250,7 @@ void MemTable::_insert_agg(const Tuple* tuple) {
 
     bool is_exist = _skip_list->Find((TableKey)tuple_buf, &_hint);
     if (is_exist) {
+        _merged_rows++;
         (this->*_aggregate_two_row_fn)(src_row, _hint.curr->key);
     } else {
         tuple_buf = _table_mem_pool->allocate(_schema_size);
@@ -312,12 +322,16 @@ void MemTable::_replace_row(const ContiguousRow& src_row, TableKey row_in_skipli
 void MemTable::_aggregate_two_row_in_block(RowInBlock* new_row, RowInBlock* row_in_skiplist) {
     if (_tablet_schema->has_sequence_col()) {
         auto sequence_idx = _tablet_schema->sequence_col_idx();
-        auto res = _input_mutable_block.compare_at(row_in_skiplist->_row_pos, new_row->_row_pos,
-                                                   sequence_idx, _input_mutable_block, -1);
+        DCHECK_LT(sequence_idx, _input_mutable_block.columns());
+        auto col_ptr = _input_mutable_block.mutable_columns()[sequence_idx].get();
+        auto res = col_ptr->compare_at(row_in_skiplist->_row_pos, new_row->_row_pos, *col_ptr, -1);
         // dst sequence column larger than src, don't need to update
         if (res > 0) {
             return;
         }
+        // need to update the row pos in skiplist to the new row pos when has
+        // sequence column
+        row_in_skiplist->_row_pos = new_row->_row_pos;
     }
     // dst is non-sequence row, or dst sequence is smaller
     for (uint32_t cid = _schema->num_key_columns(); cid < _schema->num_columns(); ++cid) {
@@ -408,7 +422,8 @@ bool MemTable::need_to_agg() {
                                              : memory_usage() >= config::memtable_max_buffer_size;
 }
 
-Status MemTable::_generate_delete_bitmap() {
+Status MemTable::_generate_delete_bitmap(int64_t atomic_num_segments_before_flush,
+                                         int64_t atomic_num_segments_after_flush) {
     // generate delete bitmap, build a tmp rowset and load recent segment
     if (!_tablet->enable_unique_key_merge_on_write()) {
         return Status::OK();
@@ -416,12 +431,11 @@ Status MemTable::_generate_delete_bitmap() {
     auto rowset = _rowset_writer->build_tmp();
     auto beta_rowset = reinterpret_cast<BetaRowset*>(rowset.get());
     std::vector<segment_v2::SegmentSharedPtr> segments;
-    segment_v2::SegmentSharedPtr segment;
-    if (beta_rowset->num_segments() == 0) {
+    if (atomic_num_segments_before_flush >= atomic_num_segments_after_flush) {
         return Status::OK();
     }
-    RETURN_IF_ERROR(beta_rowset->load_segment(beta_rowset->num_segments() - 1, &segment));
-    segments.push_back(segment);
+    RETURN_IF_ERROR(beta_rowset->load_segments(atomic_num_segments_before_flush,
+                                               atomic_num_segments_after_flush, &segments));
     std::shared_lock meta_rlock(_tablet->get_header_lock());
     // tablet is under alter process. The delete bitmap will be calculated after conversion.
     if (_tablet->tablet_state() == TABLET_NOTREADY &&
@@ -434,12 +448,18 @@ Status MemTable::_generate_delete_bitmap() {
 }
 
 Status MemTable::flush() {
-    SCOPED_CONSUME_MEM_TRACKER(_flush_mem_tracker);
     VLOG_CRITICAL << "begin to flush memtable for tablet: " << tablet_id()
                   << ", memsize: " << memory_usage() << ", rows: " << _rows;
     int64_t duration_ns = 0;
+    // For merge_on_write table, it must get all segments in this flush.
+    // The id of new segment is set by the _num_segment of beta_rowset_writer,
+    // and new segment ids is between [atomic_num_segments_before_flush, atomic_num_segments_after_flush),
+    // and use the ids to load segment data file for calc delete bitmap.
+    int64_t atomic_num_segments_before_flush = _rowset_writer->get_atomic_num_segment();
     RETURN_NOT_OK(_do_flush(duration_ns));
-    RETURN_NOT_OK(_generate_delete_bitmap());
+    int64_t atomic_num_segments_after_flush = _rowset_writer->get_atomic_num_segment();
+    RETURN_NOT_OK(_generate_delete_bitmap(atomic_num_segments_before_flush,
+                                          atomic_num_segments_after_flush));
     DorisMetrics::instance()->memtable_flush_total->increment(1);
     DorisMetrics::instance()->memtable_flush_duration_us->increment(duration_ns / 1000);
     VLOG_CRITICAL << "after flush memtable for tablet: " << tablet_id()
@@ -449,10 +469,11 @@ Status MemTable::flush() {
 }
 
 Status MemTable::_do_flush(int64_t& duration_ns) {
+    SCOPED_CONSUME_MEM_TRACKER(_flush_mem_tracker);
     SCOPED_RAW_TIMER(&duration_ns);
     if (_skip_list) {
         Status st = _rowset_writer->flush_single_memtable(this, &_flush_size);
-        if (st.precise_code() == OLAP_ERR_FUNC_NOT_IMPLEMENTED) {
+        if (st.is<NOT_IMPLEMENTED_ERROR>()) {
             // For alpha rowset, we do not implement "flush_single_memtable".
             // Flush the memtable like the old way.
             Table::Iterator it(_skip_list.get());
@@ -469,7 +490,7 @@ Status MemTable::_do_flush(int64_t& duration_ns) {
     } else {
         _collect_vskiplist_results<true>();
         vectorized::Block block = _output_mutable_block.to_block();
-        RETURN_NOT_OK(_rowset_writer->flush_single_memtable(&block));
+        RETURN_NOT_OK(_rowset_writer->flush_single_memtable(&block, &_flush_size));
         _flush_size = block.allocated_bytes();
     }
     return Status::OK();

@@ -286,6 +286,7 @@ struct OlapReaderStatistics {
     // block_load_ns
     //      block_init_ns
     //          block_init_seek_ns
+    //          block_conditions_filtered_ns
     //      first_read_ns
     //          block_first_read_seek_ns
     //      lazy_read_ns
@@ -293,6 +294,8 @@ struct OlapReaderStatistics {
     int64_t block_init_ns = 0;
     int64_t block_init_seek_num = 0;
     int64_t block_init_seek_ns = 0;
+    int64_t block_init_get_row_range_by_keys_ns = 0;
+    int64_t block_init_get_row_range_by_conditions_ns = 0;
     int64_t first_read_ns = 0;
     int64_t block_first_read_seek_num = 0;
     int64_t block_first_read_seek_ns = 0;
@@ -305,6 +308,9 @@ struct OlapReaderStatistics {
     int64_t raw_rows_read = 0;
 
     int64_t rows_vec_cond_filtered = 0;
+    int64_t rows_short_circuit_cond_filtered = 0;
+    int64_t vec_cond_input_rows = 0;
+    int64_t short_circuit_cond_input_rows = 0;
     int64_t rows_vec_del_cond_filtered = 0;
     int64_t vec_cond_ns = 0;
     int64_t short_cond_ns = 0;
@@ -322,6 +328,7 @@ struct OlapReaderStatistics {
     int64_t rows_del_by_bitmap = 0;
     // the number of rows filtered by various column indexes.
     int64_t rows_conditions_filtered = 0;
+    int64_t block_conditions_filtered_ns = 0;
 
     int64_t index_load_ns = 0;
 

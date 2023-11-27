@@ -27,6 +27,7 @@ import org.apache.doris.analysis.UserIdentity;
 import org.apache.doris.catalog.AccessPrivilege;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.common.AnalysisException;
+import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.ExceptionChecker;
 import org.apache.doris.common.FeConstants;
@@ -51,6 +52,7 @@ public class PolicyTest extends TestWithFeService {
 
     @Override
     protected void runBeforeAll() throws Exception {
+        Config.enable_storage_policy = true;
         FeConstants.runningUnitTest = true;
         createDatabase("test");
         useDatabase("test");
@@ -100,6 +102,33 @@ public class PolicyTest extends TestWithFeService {
         String explainString = getSQLPlanOrErrorMsg(queryStr);
         Assertions.assertTrue(explainString.contains("`k1` = 1"));
         dropPolicy("DROP ROW POLICY test_row_policy ON test.table1 FOR test_policy");
+    }
+
+    @Test
+    public void testAliasSql() throws Exception {
+        createPolicy("CREATE ROW POLICY test_row_policy ON test.table1 AS PERMISSIVE TO test_policy USING (k1 = 1)");
+        String queryStr = "EXPLAIN select * from test.table1 a";
+        String explainString = getSQLPlanOrErrorMsg(queryStr);
+        Assertions.assertTrue(explainString.contains("`a`.`k1` = 1"));
+        queryStr = "EXPLAIN select * from test.table1 b";
+        explainString = getSQLPlanOrErrorMsg(queryStr);
+        Assertions.assertTrue(explainString.contains("`b`.`k1` = 1"));
+        dropPolicy("DROP ROW POLICY test_row_policy ON test.table1 FOR test_policy");
+    }
+
+    @Test
+    public void testAliasSqlNereidsPlanner() throws Exception {
+        boolean beforeConfig = connectContext.getSessionVariable().isEnableNereidsPlanner();
+        connectContext.getSessionVariable().setEnableNereidsPlanner(true);
+        createPolicy("CREATE ROW POLICY test_row_policy ON test.table1 AS PERMISSIVE TO test_policy USING (k1 = 1)");
+        String queryStr = "EXPLAIN select * from test.table1 a";
+        String explainString = getSQLPlanOrErrorMsg(queryStr);
+        Assertions.assertTrue(explainString.contains("`a`.`k1` = 1"));
+        queryStr = "EXPLAIN select * from test.table1 b";
+        explainString = getSQLPlanOrErrorMsg(queryStr);
+        Assertions.assertTrue(explainString.contains("`b`.`k1` = 1"));
+        dropPolicy("DROP ROW POLICY test_row_policy ON test.table1 FOR test_policy");
+        connectContext.getSessionVariable().setEnableNereidsPlanner(beforeConfig);
     }
 
     @Test

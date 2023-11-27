@@ -63,6 +63,7 @@ Usage: $0 <options>
     $0 --spark-dpp                          build Spark DPP application alone
     $0 --broker                             build Broker
     $0 --be --fe                            build Backend, Frontend, Spark Dpp application and Java UDF library
+    $0 --be --coverage                      build Backend with coverage enabled
 
     USE_AVX2=0 $0 --be                      build Backend and not using AVX2 instruction.
     USE_AVX2=0 STRIP_DEBUG_INFO=ON $0       build all and not using AVX2 instruction, and strip the debug info for Backend
@@ -115,6 +116,7 @@ if ! OPTS="$(getopt \
     -l 'spark-dpp' \
     -l 'hive-udf' \
     -l 'clean' \
+    -l 'coverage' \
     -l 'help' \
     -o 'hj:' \
     -- "$@")"; then
@@ -130,12 +132,13 @@ BUILD_BROKER=0
 BUILD_AUDIT=0
 BUILD_META_TOOL='OFF'
 BUILD_SPARK_DPP=0
-BUILD_JAVA_UDF=1
+BUILD_JAVA_UDF=0
 BUILD_HIVE_UDF=0
 CLEAN=0
 HELP=0
 PARAMETER_COUNT="$#"
 PARAMETER_FLAG=0
+DENABLE_CLANG_COVERAGE='OFF'
 if [[ "$#" == 1 ]]; then
     # default
     BUILD_FE=1
@@ -145,6 +148,7 @@ if [[ "$#" == 1 ]]; then
     BUILD_META_TOOL='OFF'
     BUILD_SPARK_DPP=1
     BUILD_HIVE_UDF=1
+    BUILD_JAVA_UDF=1
     CLEAN=0
 else
     while true; do
@@ -153,10 +157,12 @@ else
             BUILD_FE=1
             BUILD_SPARK_DPP=1
             BUILD_HIVE_UDF=1
+            BUILD_JAVA_UDF=1
             shift
             ;;
         --be)
             BUILD_BE=1
+            BUILD_JAVA_UDF=1
             shift
             ;;
         --broker)
@@ -181,6 +187,10 @@ else
             ;;
         --clean)
             CLEAN=1
+            shift
+            ;;
+        --coverage)
+            DENABLE_CLANG_COVERAGE='ON'
             shift
             ;;
         -h)
@@ -215,6 +225,7 @@ else
         BUILD_META_TOOL='ON'
         BUILD_SPARK_DPP=1
         BUILD_HIVE_UDF=1
+        BUILD_JAVA_UDF=1
         CLEAN=0
     fi
 fi
@@ -228,7 +239,12 @@ if [[ ! -f "${DORIS_THIRDPARTY}/installed/lib/libbacktrace.a" ]]; then
     echo "Thirdparty libraries need to be build ..."
     # need remove all installed pkgs because some lib like lz4 will throw error if its lib alreay exists
     rm -rf "${DORIS_THIRDPARTY}/installed"
-    "${DORIS_THIRDPARTY}/build-thirdparty.sh" -j "${PARALLEL}"
+
+    if [[ "${CLEAN}" -eq 0 ]]; then
+        "${DORIS_THIRDPARTY}/build-thirdparty.sh" -j "${PARALLEL}"
+    else
+        "${DORIS_THIRDPARTY}/build-thirdparty.sh" -j "${PARALLEL}" --clean
+    fi
 fi
 
 if [[ "${CLEAN}" -eq 1 && "${BUILD_BE}" -eq 0 && "${BUILD_FE}" -eq 0 && "${BUILD_SPARK_DPP}" -eq 0 ]]; then
@@ -274,6 +290,9 @@ fi
 if [[ -z "${USE_JEMALLOC}" ]]; then
     USE_JEMALLOC='ON'
 fi
+if [[ -z "${ENABLE_STACKTRACE}" ]]; then
+    ENABLE_STACKTRACE='ON'
+fi
 if [[ -z "${STRICT_MEMORY_USE}" ]]; then
     STRICT_MEMORY_USE='OFF'
 fi
@@ -307,7 +326,7 @@ if [[ "${BUILD_JAVA_UDF}" -eq 1 && "$(uname -s)" == 'Darwin' ]]; then
     fi
 
     if [[ -n "${CAUSE}" ]]; then
-        echo -e "\033[33;1mWARNNING: \033[37;1mSkip building with JAVA UDF due to ${CAUSE}.\033[0m"
+        echo -e "\033[33;1mWARNNING: \033[37;1mSkip building with Java UDF due to ${CAUSE}.\033[0m"
         BUILD_JAVA_UDF=0
     fi
 fi
@@ -337,6 +356,8 @@ echo "Get params:
     USE_MEM_TRACKER     -- ${USE_MEM_TRACKER}
     USE_JEMALLOC        -- ${USE_JEMALLOC}
     STRICT_MEMORY_USE   -- ${STRICT_MEMORY_USE}
+    ENABLE_STACKTRACE   -- ${ENABLE_STACKTRACE}
+    DENABLE_CLANG_COVERAGE -- ${DENABLE_CLANG_COVERAGE}
 "
 
 # Clean and build generated code
@@ -407,9 +428,11 @@ if [[ "${BUILD_BE}" -eq 1 ]]; then
         -DUSE_MEM_TRACKER="${USE_MEM_TRACKER}" \
         -DUSE_JEMALLOC="${USE_JEMALLOC}" \
         -DSTRICT_MEMORY_USE="${STRICT_MEMORY_USE}" \
+        -DENABLE_STACKTRACE="${ENABLE_STACKTRACE}" \
         -DUSE_AVX2="${USE_AVX2}" \
         -DGLIBC_COMPATIBILITY="${GLIBC_COMPATIBILITY}" \
         -DEXTRA_CXX_FLAGS="${EXTRA_CXX_FLAGS}" \
+        -DENABLE_CLANG_COVERAGE="${DENABLE_CLANG_COVERAGE}" \
         "${DORIS_HOME}/be"
     "${BUILD_SYSTEM}" -j "${PARALLEL}"
     "${BUILD_SYSTEM}" install
@@ -484,7 +507,7 @@ if [[ "${BUILD_FE}" -eq 1 ]]; then
     cp -r -p "${DORIS_HOME}/bin"/*_fe.sh "${DORIS_OUTPUT}/fe/bin"/
     cp -r -p "${DORIS_HOME}/conf/fe.conf" "${DORIS_OUTPUT}/fe/conf"/
     cp -r -p "${DORIS_HOME}/conf/ldap.conf" "${DORIS_OUTPUT}/fe/conf"/
-    cp -r -p "${DORIS_HOME}/conf"/*.xml "${DORIS_OUTPUT}/fe/conf"/
+    cp -r -p "${DORIS_HOME}/conf/mysql_ssl_default_certificate" "${DORIS_OUTPUT}/fe/"/
     rm -rf "${DORIS_OUTPUT}/fe/lib"/*
     cp -r -p "${DORIS_HOME}/fe/fe-core/target/lib"/* "${DORIS_OUTPUT}/fe/lib"/
     rm -f "${DORIS_OUTPUT}/fe/lib/palo-fe.jar"
@@ -514,6 +537,19 @@ if [[ "${BUILD_BE}" -eq 1 ]]; then
 
     cp -r -p "${DORIS_HOME}/be/output/bin"/* "${DORIS_OUTPUT}/be/bin"/
     cp -r -p "${DORIS_HOME}/be/output/conf"/* "${DORIS_OUTPUT}/be/conf"/
+
+    if [[ -d "${DORIS_THIRDPARTY}/installed/lib/hadoop_hdfs/" ]]; then
+        cp -r -p "${DORIS_THIRDPARTY}/installed/lib/hadoop_hdfs/" "${DORIS_OUTPUT}/be/lib/"
+    fi
+
+    if [[ "${BUILD_JAVA_UDF}" -eq 0 ]]; then
+        echo -e "\033[33;1mWARNNING: \033[37;1mDisable Java UDF support in be.conf due to the BE was built without Java UDF.\033[0m"
+        cat >>"${DORIS_OUTPUT}/be/conf/be.conf" <<EOF
+
+# Java UDF support
+enable_java_support = false
+EOF
+    fi
 
     # Fix Killed: 9 error on MacOS (arm64).
     # See: https://stackoverflow.com/questions/67378106/mac-m1-cping-binary-over-another-results-in-crash

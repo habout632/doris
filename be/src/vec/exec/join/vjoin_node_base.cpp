@@ -48,8 +48,21 @@ VJoinNodeBase::VJoinNodeBase(ObjectPool* pool, const TPlanNode& tnode, const Des
                              _join_op == TJoinOp::LEFT_SEMI_JOIN ||
                              _join_op == TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN),
           _is_outer_join(_match_all_build || _match_all_probe),
+          _is_mark_join(tnode.__isset.nested_loop_join_node
+                                ? (tnode.nested_loop_join_node.__isset.is_mark
+                                           ? tnode.nested_loop_join_node.is_mark
+                                           : false)
+                        : tnode.hash_join_node.__isset.is_mark ? tnode.hash_join_node.is_mark
+                                                               : false),
           _short_circuit_for_null_in_build_side(_join_op == TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN) {
     _init_join_op();
+    if (_is_mark_join) {
+        DCHECK(_join_op == TJoinOp::LEFT_ANTI_JOIN || _join_op == TJoinOp::LEFT_SEMI_JOIN ||
+               _join_op == TJoinOp::CROSS_JOIN || _join_op == TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN)
+                << "Mark join is only supported for null aware left semi/anti join and cross join "
+                   "but this is "
+                << _join_op;
+    }
     if (tnode.__isset.hash_join_node) {
         _output_row_desc.reset(
                 new RowDescriptor(descs, {tnode.hash_join_node.voutput_tuple_id}, {false}));
@@ -82,6 +95,11 @@ void VJoinNodeBase::_construct_mutable_join_block() {
             auto type_ptr = slot_desc->get_data_type_ptr();
             _join_block.insert({type_ptr->create_column(), type_ptr, slot_desc->col_name()});
         }
+    }
+    if (_is_mark_join) {
+        _join_block.replace_by_position(
+                _join_block.columns() - 1,
+                remove_nullable(_join_block.get_by_position(_join_block.columns() - 1).column));
     }
 }
 
@@ -120,6 +138,11 @@ Status VJoinNodeBase::_build_output_block(Block* origin_block, Block* output_blo
                 RETURN_IF_ERROR(_output_expr_ctxs[i]->execute(origin_block, &result_column_id));
                 auto column_ptr = origin_block->get_by_position(result_column_id)
                                           .column->convert_to_full_column_if_const();
+                // check nullable here, and print more info about plan
+                if (!mutable_columns[i]->is_nullable() && column_ptr->is_nullable()) {
+                    LOG(FATAL) << "to is not nullable while from is nullable, could not copy. i = "
+                               << i << ", exec_node_id = " << _id;
+                }
                 insert_column_datas(mutable_columns[i], *column_ptr, rows);
             }
         }
@@ -144,21 +167,31 @@ Status VJoinNodeBase::init(const TPlanNode& tnode, RuntimeState* state) {
             _output_expr_ctxs.push_back(ctx);
         }
     }
+    // only use in outer join as the bool column to mark for function of `tuple_is_null`
+    if (_is_outer_join) {
+        _tuple_is_null_left_flag_column = ColumnUInt8::create();
+        _tuple_is_null_right_flag_column = ColumnUInt8::create();
+    }
     return ExecNode::init(tnode, state);
 }
 
 Status VJoinNodeBase::open(RuntimeState* state) {
     START_AND_SCOPE_SPAN(state->get_tracer(), span, "VJoinNodeBase::open");
     RETURN_IF_ERROR(ExecNode::open(state));
-    SCOPED_CONSUME_MEM_TRACKER(mem_tracker());
     RETURN_IF_CANCELLED(state);
 
     std::promise<Status> thread_status;
-    std::thread([this, state, thread_status_p = &thread_status,
+    try {
+        state->exec_env()->join_node_thread_pool()->submit_func(
+                [this, state, thread_status_p = &thread_status,
                  parent_span = opentelemetry::trace::Tracer::GetCurrentSpan()] {
-        OpentelemetryScope scope {parent_span};
-        this->_probe_side_open_thread(state, thread_status_p);
-    }).detach();
+                    OpentelemetryScope scope {parent_span};
+                    this->_probe_side_open_thread(state, thread_status_p);
+                });
+    } catch (const std::system_error& e) {
+        LOG(WARNING) << "In VJoinNodeBase::open create thread fail, " << e.what();
+        return Status::InternalError(e.what());
+    }
 
     // Open the probe-side child so that it may perform any initialisation in parallel.
     // Don't exit even if we see an error, we still need to wait for the build thread
@@ -173,10 +206,16 @@ Status VJoinNodeBase::open(RuntimeState* state) {
     return status;
 }
 
+void VJoinNodeBase::_reset_tuple_is_null_column() {
+    if (_is_outer_join) {
+        reinterpret_cast<ColumnUInt8&>(*_tuple_is_null_left_flag_column).clear();
+        reinterpret_cast<ColumnUInt8&>(*_tuple_is_null_right_flag_column).clear();
+    }
+}
+
 void VJoinNodeBase::_probe_side_open_thread(RuntimeState* state, std::promise<Status>* status) {
     START_AND_SCOPE_SPAN(state->get_tracer(), span, "VJoinNodeBase::_hash_table_build_thread");
     SCOPED_ATTACH_TASK(state);
-    SCOPED_CONSUME_MEM_TRACKER(mem_tracker_shared());
     status->set_value(child(0)->open(state));
 }
 

@@ -33,6 +33,7 @@ import org.apache.doris.common.DdlException;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.MetaNotFoundException;
 import org.apache.doris.common.UserException;
+import org.apache.doris.common.util.Util;
 import org.apache.doris.datasource.HMSExternalCatalog;
 import org.apache.doris.datasource.hive.HiveMetaStoreCache;
 import org.apache.doris.datasource.hive.HiveMetaStoreCache.HivePartitionValues;
@@ -51,8 +52,6 @@ import org.apache.doris.thrift.TFileType;
 import com.google.common.base.Joiner;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.hdfs.HdfsConfiguration;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.hadoop.hive.metastore.api.Table;
 import org.apache.hadoop.mapred.FileSplit;
@@ -113,18 +112,25 @@ public class HiveScanProvider extends HMSTableScanProvider {
     public TFileType getLocationType() throws DdlException, MetaNotFoundException {
         String location = hmsTable.getRemoteTable().getSd().getLocation();
         if (location != null && !location.isEmpty()) {
-            if (location.startsWith(FeConstants.FS_PREFIX_S3)
-                    || location.startsWith(FeConstants.FS_PREFIX_S3A)
-                    || location.startsWith(FeConstants.FS_PREFIX_S3N)
-                    || location.startsWith(FeConstants.FS_PREFIX_BOS)
-                    || location.startsWith(FeConstants.FS_PREFIX_COS)
-                    || location.startsWith(FeConstants.FS_PREFIX_OSS)
-                    || location.startsWith(FeConstants.FS_PREFIX_OBS)) {
-                return TFileType.FILE_S3;
-            } else if (location.startsWith(FeConstants.FS_PREFIX_HDFS)) {
+            if (location.startsWith(FeConstants.FS_PREFIX_HDFS)
+                || location.startsWith(FeConstants.FS_PREFIX_COSN)) {
                 return TFileType.FILE_HDFS;
+            } else if (location.startsWith(FeConstants.FS_PREFIX_S3)
+                || location.startsWith(FeConstants.FS_PREFIX_S3A)
+                || location.startsWith(FeConstants.FS_PREFIX_S3N)
+                || location.startsWith(FeConstants.FS_PREFIX_BOS)
+                || location.startsWith(FeConstants.FS_PREFIX_COS)
+                || location.startsWith(FeConstants.FS_PREFIX_OSS)
+                || location.startsWith(FeConstants.FS_PREFIX_OBS)) {
+                return TFileType.FILE_S3;
             } else if (location.startsWith(FeConstants.FS_PREFIX_FILE)) {
                 return TFileType.FILE_LOCAL;
+            } else if (location.startsWith(FeConstants.FS_PREFIX_OFS)) {
+                return TFileType.FILE_HDFS;
+            } else if (location.startsWith(FeConstants.FS_PREFIX_GFS)) {
+                return TFileType.FILE_HDFS;
+            } else if (location.startsWith(FeConstants.FS_PREFIX_JFS)) {
+                return TFileType.FILE_BROKER;
             }
         }
         throw new DdlException("Unknown file location " + location + " for hms table " + hmsTable.getName());
@@ -158,7 +164,8 @@ public class HiveScanProvider extends HMSTableScanProvider {
                         hmsTable.getPartitionColumns(), columnNameToRange,
                         hivePartitionValues.getUidToPartitionRange(),
                         hivePartitionValues.getRangeToId(),
-                        hivePartitionValues.getSingleColumnRangeMap());
+                        hivePartitionValues.getSingleColumnRangeMap(),
+                        true);
                 Collection<Long> filteredPartitionIds = pruner.prune();
                 this.readPartitionNum = filteredPartitionIds.size();
                 LOG.debug("hive partition fetch and prune for table {}.{} cost: {} ms",
@@ -177,7 +184,8 @@ public class HiveScanProvider extends HMSTableScanProvider {
             } else {
                 // unpartitioned table, create a dummy partition to save location and inputformat,
                 // so that we can unify the interface.
-                HivePartition dummyPartition = new HivePartition(hmsTable.getRemoteTable().getSd().getInputFormat(),
+                HivePartition dummyPartition = new HivePartition(hmsTable.getDbName(), hmsTable.getName(), true,
+                        hmsTable.getRemoteTable().getSd().getInputFormat(),
                         hmsTable.getRemoteTable().getSd().getLocation(), null);
                 getFileSplitByPartitions(cache, Lists.newArrayList(dummyPartition), allFiles);
                 this.totalPartitionNum = 1;
@@ -188,7 +196,9 @@ public class HiveScanProvider extends HMSTableScanProvider {
             return allFiles;
         } catch (Throwable t) {
             LOG.warn("get file split failed for table: {}", hmsTable.getName(), t);
-            throw new UserException("get file split failed for table: " + hmsTable.getName(), t);
+            throw new UserException(
+                    "get file split failed for table: " + hmsTable.getName() + ", err: " + Util.getRootCauseMessage(t),
+                    t);
         }
     }
 
@@ -196,24 +206,12 @@ public class HiveScanProvider extends HMSTableScanProvider {
             List<InputSplit> allFiles) {
         List<InputSplit> files = cache.getFilesByPartitions(partitions);
         if (LOG.isDebugEnabled()) {
-            LOG.debug("get #{} files from #{} partitions: {}: {}", files.size(), partitions.size(),
+            LOG.debug("get #{} files from #{} partitions: {}", files.size(), partitions.size(),
                     Joiner.on(",")
                             .join(files.stream().limit(10).map(f -> ((FileSplit) f).getPath())
                                     .collect(Collectors.toList())));
         }
         allFiles.addAll(files);
-    }
-
-    protected Configuration setConfiguration() {
-        Configuration conf = new HdfsConfiguration();
-        for (Map.Entry<String, String> entry : hmsTable.getCatalog().getCatalogProperty().getProperties().entrySet()) {
-            conf.set(entry.getKey(), entry.getValue());
-        }
-        Map<String, String> s3Properties = hmsTable.getS3Properties();
-        for (Map.Entry<String, String> entry : s3Properties.entrySet()) {
-            conf.set(entry.getKey(), entry.getValue());
-        }
-        return conf;
     }
 
     public int getTotalPartitionNum() {
@@ -237,14 +235,7 @@ public class HiveScanProvider extends HMSTableScanProvider {
 
     @Override
     public Map<String, String> getLocationProperties() throws MetaNotFoundException, DdlException {
-        TFileType locationType = getLocationType();
-        if (locationType == TFileType.FILE_S3) {
-            return hmsTable.getS3Properties();
-        } else if (locationType == TFileType.FILE_HDFS) {
-            return hmsTable.getDfsProperties();
-        } else {
-            return Maps.newHashMap();
-        }
+        return hmsTable.getCatalogProperties();
     }
 
     @Override
@@ -267,6 +258,19 @@ public class HiveScanProvider extends HMSTableScanProvider {
         List<String> partitionKeys = getPathPartitionKeys();
         List<Column> columns = hmsTable.getBaseSchema(false);
         context.params.setNumOfColumnsFromFile(columns.size() - partitionKeys.size());
+        updateRequiredSlots(context);
+        return context;
+    }
+
+    public void updateRequiredSlots(ParamCreateContext context) throws UserException {
+        updateRequiredSlots(context, null);
+    }
+
+    public void updateRequiredSlots(ParamCreateContext context, List<String> partitionKeys) throws UserException {
+        context.params.unsetRequiredSlots();
+        if (partitionKeys == null) {
+            partitionKeys = getPathPartitionKeys();
+        }
         for (SlotDescriptor slot : desc.getSlots()) {
             if (!slot.isMaterialized()) {
                 continue;
@@ -277,8 +281,8 @@ public class HiveScanProvider extends HMSTableScanProvider {
             slotInfo.setIsFileSlot(!partitionKeys.contains(slot.getColumn().getName()));
             context.params.addToRequiredSlots(slotInfo);
         }
-        return context;
     }
+
 
     @Override
     public TFileAttributes getFileAttributes() throws UserException {

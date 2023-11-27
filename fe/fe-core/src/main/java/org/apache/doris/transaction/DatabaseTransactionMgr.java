@@ -18,6 +18,7 @@
 package org.apache.doris.transaction;
 
 import org.apache.doris.catalog.Database;
+import org.apache.doris.catalog.DatabaseIf;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.MaterializedIndex;
 import org.apache.doris.catalog.OlapTable;
@@ -128,7 +129,6 @@ public class DatabaseTransactionMgr {
 
     // count the number of running txns of database, except for the routine load txn
     private volatile int runningTxnNums = 0;
-    private volatile int runningTxnReplicaNums = 0;
 
     // count only the number of running routine load txns of database
     private volatile int runningRoutineLoadTxnNums = 0;
@@ -339,13 +339,6 @@ public class DatabaseTransactionMgr {
             }
 
             return tid;
-        } catch (DuplicatedRequestException e) {
-            throw e;
-        } catch (Exception e) {
-            if (MetricRepo.isInit) {
-                MetricRepo.COUNTER_TXN_REJECT.increase(1L);
-            }
-            throw e;
         } finally {
             writeUnlock();
         }
@@ -664,7 +657,7 @@ public class DatabaseTransactionMgr {
         LOG.info("transaction:[{}] successfully committed", transactionState);
     }
 
-    public boolean waitForTransactionFinished(Database db, long transactionId, long timeoutMillis)
+    public boolean waitForTransactionFinished(DatabaseIf db, long transactionId, long timeoutMillis)
             throws TransactionCommitFailedException {
         TransactionState transactionState = null;
         readLock();
@@ -1114,20 +1107,6 @@ public class DatabaseTransactionMgr {
         updateTxnLabels(transactionState);
     }
 
-    public void registerTxnReplicas(long txnId, int replicaNum) throws UserException {
-        writeLock();
-        try {
-            TransactionState transactionState = idToRunningTransactionState.get(txnId);
-            if (transactionState == null) {
-                throw new UserException("running transaction not found, txnId=" + txnId);
-            }
-            transactionState.setReplicaNum(replicaNum);
-            runningTxnReplicaNums += replicaNum;
-        } finally {
-            writeUnlock();
-        }
-    }
-
     public int getRunningTxnNum() {
         readLock();
         try {
@@ -1137,21 +1116,8 @@ public class DatabaseTransactionMgr {
         }
     }
 
-    public int getRunningTxnReplicaNum() {
-        readLock();
-        try {
-            return runningTxnReplicaNums;
-        } finally {
-            readUnlock();
-        }
-    }
-
     private void updateTxnLabels(TransactionState transactionState) {
-        Set<Long> txnIds = labelToTxnIds.get(transactionState.getLabel());
-        if (txnIds == null) {
-            txnIds = Sets.newHashSet();
-            labelToTxnIds.put(transactionState.getLabel(), txnIds);
-        }
+        Set<Long> txnIds = labelToTxnIds.computeIfAbsent(transactionState.getLabel(), k -> Sets.newHashSet());
         txnIds.add(transactionState.getTransactionId());
     }
 
@@ -1384,7 +1350,9 @@ public class DatabaseTransactionMgr {
                 dbExpiredTxnIds.put(dbId, expiredTxnIds);
                 BatchRemoveTransactionsOperation op = new BatchRemoveTransactionsOperation(dbExpiredTxnIds);
                 editLog.logBatchRemoveTransactions(op);
-                LOG.info("Remove {} expired transactions", MAX_REMOVE_TXN_PER_ROUND - leftNum);
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("Remove {} expired transactions", MAX_REMOVE_TXN_PER_ROUND - leftNum);
+                }
             }
         } finally {
             writeUnlock();
@@ -1417,7 +1385,9 @@ public class DatabaseTransactionMgr {
             if (txnIds.isEmpty()) {
                 labelToTxnIds.remove(transactionState.getLabel());
             }
-            LOG.info("transaction [" + txnId + "] is expired, remove it from transaction manager");
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("transaction [" + txnId + "] is expired, remove it from transaction manager");
+            }
         } else {
             // should not happen, add a warn log to observer
             LOG.warn("transaction state is not found when clear transaction: " + txnId);

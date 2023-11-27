@@ -23,6 +23,7 @@
 #include "exprs/create_predicate_function.h"
 #include "vec/columns/column_nullable.h"
 #include "vec/columns/columns_number.h"
+#include "vec/data_types/data_type.h"
 #include "vec/data_types/data_type_nullable.h"
 #include "vec/data_types/data_type_number.h"
 #include "vec/functions/function.h"
@@ -108,7 +109,7 @@ public:
         vec_res.resize(input_rows_count);
 
         ColumnUInt8::MutablePtr col_null_map_to;
-        col_null_map_to = ColumnUInt8::create(input_rows_count);
+        col_null_map_to = ColumnUInt8::create(input_rows_count, false);
         auto& vec_null_map_to = col_null_map_to->get_data();
 
         /// First argument may be a single column.
@@ -150,7 +151,7 @@ public:
                     }
                 } else {
                     for (size_t i = 0; i < input_rows_count; ++i) {
-                        vec_null_map_to[i] = null_bitmap[i] || (negative == vec_res[i]);
+                        vec_null_map_to[i] = null_bitmap[i] || negative == vec_res[i];
                     }
                 }
 
@@ -175,14 +176,9 @@ public:
                 } else {
                     search_hash_set(materialized_column.get());
                 }
-
                 if (in_state->null_in_set) {
                     for (size_t i = 0; i < input_rows_count; ++i) {
                         vec_null_map_to[i] = negative == vec_res[i];
-                    }
-                } else {
-                    for (size_t i = 0; i < input_rows_count; ++i) {
-                        vec_null_map_to[i] = false;
                     }
                 }
             }

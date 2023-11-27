@@ -22,6 +22,10 @@ import org.apache.doris.persist.meta.FeMetaFormat;
 public class FeConstants {
     // Database and table's default configurations, we will never change them
     public static short default_replication_num = 3;
+
+    // The default value of bucket setting && auto bucket without estimate_partition_size
+    public static int default_bucket_num = 10;
+
     /*
      * Those two fields is responsible for determining the default key columns in duplicate table.
      * If user does not specify key of duplicate table in create table stmt,
@@ -59,9 +63,9 @@ public class FeConstants {
     public static String null_string = "\\N";
 
     public static long tablet_checker_interval_ms = 20 * 1000L;
-    public static String csv = "csv";
-    public static String csv_with_names = "csv_with_names";
-    public static String csv_with_names_and_types = "csv_with_names_and_types";
+    public static final String csv = "csv";
+    public static final String csv_with_names = "csv_with_names";
+    public static final String csv_with_names_and_types = "csv_with_names_and_types";
 
     public static String text = "text";
 
@@ -71,7 +75,11 @@ public class FeConstants {
     public static String FS_PREFIX_OSS = "oss";
     public static String FS_PREFIX_BOS = "bos";
     public static String FS_PREFIX_COS = "cos";
+    public static String FS_PREFIX_COSN = "cosn";
     public static String FS_PREFIX_OBS = "obs";
+    public static String FS_PREFIX_OFS = "ofs";
+    public static String FS_PREFIX_GFS = "gfs";
+    public static String FS_PREFIX_JFS = "jfs";
     public static String FS_PREFIX_HDFS = "hdfs";
     public static String FS_PREFIX_FILE = "file";
     public static final String INTERNAL_DB_NAME = "__internal_schema";

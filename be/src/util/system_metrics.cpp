@@ -108,6 +108,12 @@ DEFINE_MEMORY_GAUGE_METRIC(jemalloc_metadata_bytes, MetricUnit::BYTES);
 DEFINE_MEMORY_GAUGE_METRIC(jemalloc_resident_bytes, MetricUnit::BYTES);
 DEFINE_MEMORY_GAUGE_METRIC(jemalloc_mapped_bytes, MetricUnit::BYTES);
 DEFINE_MEMORY_GAUGE_METRIC(jemalloc_retained_bytes, MetricUnit::BYTES);
+DEFINE_MEMORY_GAUGE_METRIC(jemalloc_tcache_bytes, MetricUnit::BYTES);
+DEFINE_MEMORY_GAUGE_METRIC(jemalloc_pactive_num, MetricUnit::NOUNIT);
+DEFINE_MEMORY_GAUGE_METRIC(jemalloc_pdirty_num, MetricUnit::NOUNIT);
+DEFINE_MEMORY_GAUGE_METRIC(jemalloc_pmuzzy_num, MetricUnit::NOUNIT);
+DEFINE_MEMORY_GAUGE_METRIC(jemalloc_dirty_purged_num, MetricUnit::NOUNIT);
+DEFINE_MEMORY_GAUGE_METRIC(jemalloc_muzzy_purged_num, MetricUnit::NOUNIT);
 #endif
 
 struct MemoryMetrics {
@@ -133,6 +139,12 @@ struct MemoryMetrics {
         INT_GAUGE_METRIC_REGISTER(entity, memory_jemalloc_resident_bytes);
         INT_GAUGE_METRIC_REGISTER(entity, memory_jemalloc_mapped_bytes);
         INT_GAUGE_METRIC_REGISTER(entity, memory_jemalloc_retained_bytes);
+        INT_GAUGE_METRIC_REGISTER(entity, memory_jemalloc_tcache_bytes);
+        INT_GAUGE_METRIC_REGISTER(entity, memory_jemalloc_pactive_num);
+        INT_GAUGE_METRIC_REGISTER(entity, memory_jemalloc_pdirty_num);
+        INT_GAUGE_METRIC_REGISTER(entity, memory_jemalloc_pmuzzy_num);
+        INT_GAUGE_METRIC_REGISTER(entity, memory_jemalloc_dirty_purged_num);
+        INT_GAUGE_METRIC_REGISTER(entity, memory_jemalloc_muzzy_purged_num);
 #endif
     }
 
@@ -158,6 +170,12 @@ struct MemoryMetrics {
     IntGauge* memory_jemalloc_resident_bytes;
     IntGauge* memory_jemalloc_mapped_bytes;
     IntGauge* memory_jemalloc_retained_bytes;
+    IntGauge* memory_jemalloc_tcache_bytes;
+    IntGauge* memory_jemalloc_pactive_num;
+    IntGauge* memory_jemalloc_pdirty_num;
+    IntGauge* memory_jemalloc_pmuzzy_num;
+    IntGauge* memory_jemalloc_dirty_purged_num;
+    IntGauge* memory_jemalloc_muzzy_purged_num;
 #endif
 };
 
@@ -301,6 +319,10 @@ struct ProcMetrics {
     IntAtomicCounter* proc_procs_blocked;
 };
 
+DEFINE_GAUGE_CORE_METRIC_PROTOTYPE_2ARG(max_disk_io_util_percent, MetricUnit::PERCENT);
+DEFINE_GAUGE_CORE_METRIC_PROTOTYPE_2ARG(max_network_send_bytes_rate, MetricUnit::BYTES);
+DEFINE_GAUGE_CORE_METRIC_PROTOTYPE_2ARG(max_network_receive_bytes_rate, MetricUnit::BYTES);
+
 const char* SystemMetrics::_s_hook_name = "system_metrics";
 
 SystemMetrics::SystemMetrics(MetricRegistry* registry, const std::set<std::string>& disk_devices,
@@ -318,6 +340,10 @@ SystemMetrics::SystemMetrics(MetricRegistry* registry, const std::set<std::strin
     _install_snmp_metrics(_server_entity.get());
     _install_load_avg_metrics(_server_entity.get());
     _install_proc_metrics(_server_entity.get());
+
+    INT_GAUGE_METRIC_REGISTER(_server_entity.get(), max_disk_io_util_percent);
+    INT_GAUGE_METRIC_REGISTER(_server_entity.get(), max_network_send_bytes_rate);
+    INT_GAUGE_METRIC_REGISTER(_server_entity.get(), max_network_receive_bytes_rate);
 }
 
 SystemMetrics::~SystemMetrics() {
@@ -422,6 +448,9 @@ void SystemMetrics::_install_memory_metrics(MetricEntity* entity) {
 void SystemMetrics::_update_memory_metrics() {
     _memory_metrics->memory_allocated_bytes->set_value(PerfCounters::get_vm_rss());
     get_metrics_from_proc_vmstat();
+}
+
+void SystemMetrics::update_allocator_metrics() {
 #if defined(ADDRESS_SANITIZER) || defined(LEAK_SANITIZER) || defined(THREAD_SANITIZER)
     LOG(INFO) << "Memory tracking is not available with address sanitizer builds.";
 #elif defined(USE_JEMALLOC)
@@ -437,6 +466,18 @@ void SystemMetrics::_update_memory_metrics() {
             MemInfo::get_je_metrics("stats.mapped"));
     _memory_metrics->memory_jemalloc_retained_bytes->set_value(
             MemInfo::get_je_metrics("stats.retained"));
+    _memory_metrics->memory_jemalloc_tcache_bytes->set_value(
+            MemInfo::get_je_all_arena_metrics("tcache_bytes"));
+    _memory_metrics->memory_jemalloc_pactive_num->set_value(
+            MemInfo::get_je_all_arena_metrics("pactive"));
+    _memory_metrics->memory_jemalloc_pdirty_num->set_value(
+            MemInfo::get_je_all_arena_metrics("pdirty"));
+    _memory_metrics->memory_jemalloc_pmuzzy_num->set_value(
+            MemInfo::get_je_all_arena_metrics("pmuzzy"));
+    _memory_metrics->memory_jemalloc_dirty_purged_num->set_value(
+            MemInfo::get_je_all_arena_metrics("dirty_purged"));
+    _memory_metrics->memory_jemalloc_muzzy_purged_num->set_value(
+            MemInfo::get_je_all_arena_metrics("muzzy_purged"));
 #else
     _memory_metrics->memory_tcmalloc_allocated_bytes->set_value(
             MemInfo::get_tc_metrics("generic.total_physical_bytes"));
@@ -856,6 +897,19 @@ void SystemMetrics::get_max_net_traffic(const std::map<std::string, int64_t>& ls
 
     *send_rate = max_send / interval_sec;
     *rcv_rate = max_rcv / interval_sec;
+}
+
+void SystemMetrics::update_max_disk_io_util_percent(const std::map<std::string, int64_t>& lst_value,
+                                                    int64_t interval_sec) {
+    max_disk_io_util_percent->set_value(get_max_io_util(lst_value, interval_sec));
+}
+
+void SystemMetrics::update_max_network_send_bytes_rate(int64_t max_send_bytes_rate) {
+    max_network_send_bytes_rate->set_value(max_send_bytes_rate);
+}
+
+void SystemMetrics::update_max_network_receive_bytes_rate(int64_t max_receive_bytes_rate) {
+    max_network_receive_bytes_rate->set_value(max_receive_bytes_rate);
 }
 
 void SystemMetrics::_install_proc_metrics(MetricEntity* entity) {

@@ -76,9 +76,8 @@ Status LoadChannelMgr::init(int64_t process_mem_limit) {
     // it's not quite helpfull to reduce memory pressure.
     // In this case we need to pick multiple load channels to reduce memory more effectively.
     _load_channel_min_mem_to_reduce = _load_hard_mem_limit * 0.1;
-    _mem_tracker = std::make_unique<MemTracker>("LoadChannelMgr");
-    _mem_tracker_set = std::make_unique<MemTrackerLimiter>(MemTrackerLimiter::Type::LOAD,
-                                                           "LoadChannelMgrTrackerSet");
+    _mem_tracker =
+            std::make_unique<MemTrackerLimiter>(MemTrackerLimiter::Type::LOAD, "LoadChannelMgr");
     REGISTER_HOOK_METRIC(load_channel_mem_consumption,
                          [this]() { return _mem_tracker->consumption(); });
     _last_success_channel = new_lru_cache("LastestSuccessChannelCache", 1024);
@@ -106,7 +105,7 @@ Status LoadChannelMgr::open(const PTabletWriterOpenRequest& params) {
             auto channel_mem_tracker = std::make_unique<MemTracker>(
                     fmt::format("LoadChannel#senderIp={}#loadID={}", params.sender_ip(),
                                 load_id.to_string()),
-                    nullptr, ExecEnv::GetInstance()->load_channel_mgr()->mem_tracker_set());
+                    ExecEnv::GetInstance()->load_channel_mgr()->mem_tracker());
 #else
             auto channel_mem_tracker = std::make_unique<MemTracker>(fmt::format(
                     "LoadChannel#senderIp={}#loadID={}", params.sender_ip(), load_id.to_string()));
@@ -220,7 +219,7 @@ Status LoadChannelMgr::_start_load_channels_clean() {
 void LoadChannelMgr::_handle_mem_exceed_limit() {
     // Check the soft limit.
     DCHECK(_load_soft_mem_limit > 0);
-    int64_t process_mem_limit = MemInfo::mem_limit() * config::soft_mem_limit_frac;
+    int64_t process_mem_limit = MemInfo::soft_mem_limit();
     if (_mem_tracker->consumption() < _load_soft_mem_limit &&
         MemInfo::proc_mem_no_allocator_cache() < process_mem_limit) {
         return;
@@ -229,12 +228,15 @@ void LoadChannelMgr::_handle_mem_exceed_limit() {
     bool reducing_mem_on_hard_limit = false;
     std::vector<std::shared_ptr<LoadChannel>> channels_to_reduce_mem;
     {
+        MonotonicStopWatch timer;
+        timer.start();
         std::unique_lock<std::mutex> l(_lock);
         while (_should_wait_flush) {
-            LOG(INFO) << "Reached the load hard limit " << _load_hard_mem_limit
-                      << ", waiting for flush";
             _wait_flush_cond.wait(l);
         }
+        LOG(INFO) << "Reached the load hard limit " << _load_hard_mem_limit
+                  << ", waited for flush, time_ns:" << timer.elapsed_time();
+
         bool hard_limit_reached = _mem_tracker->consumption() >= _load_hard_mem_limit ||
                                   MemInfo::proc_mem_no_allocator_cache() >= process_mem_limit;
         // Some other thread is flushing data, and not reached hard limit now,
@@ -345,6 +347,8 @@ void LoadChannelMgr::_handle_mem_exceed_limit() {
         if (_soft_reduce_mem_in_progress) {
             _soft_reduce_mem_in_progress = false;
         }
+        // refresh mem tacker to avoid duplicate reduce
+        _refresh_mem_tracker_without_lock();
     }
     return;
 }

@@ -18,10 +18,7 @@
 #pragma once
 
 #include "exec/olap_utils.h"
-#include "exprs/bitmapfilter_predicate.h"
-#include "exprs/bloomfilter_predicate.h"
 #include "exprs/function_filter.h"
-#include "exprs/hybrid_set.h"
 #include "olap/reader.h"
 #include "util/runtime_profile.h"
 #include "vec/exec/scan/vscanner.h"
@@ -38,20 +35,22 @@ struct FilterPredicates;
 class NewOlapScanner : public VScanner {
 public:
     NewOlapScanner(RuntimeState* state, NewOlapScanNode* parent, int64_t limit, bool aggregation,
-                   bool need_agg_finalize, const TPaloScanRange& scan_range,
-                   RuntimeProfile* profile);
+                   bool need_agg_finalize, RuntimeProfile* profile);
 
     Status open(RuntimeState* state) override;
 
     Status close(RuntimeState* state) override;
 
-public:
     Status prepare(const TPaloScanRange& scan_range, const std::vector<OlapScanRange*>& key_ranges,
                    VExprContext** vconjunct_ctx_ptr, const std::vector<TCondition>& filters,
                    const FilterPredicates& filter_predicates,
                    const std::vector<FunctionFilter>& function_filters);
 
     const std::string& scan_disk() const { return _tablet->data_dir()->path(); }
+
+    doris::TabletStorageType get_storage_type() override {
+        return doris::TabletStorageType::STORAGE_TYPE_LOCAL;
+    }
 
 protected:
     Status _get_block_impl(RuntimeState* state, Block* block, bool* eos) override;
@@ -67,7 +66,6 @@ private:
 
     Status _init_return_columns();
 
-private:
     bool _aggregation;
     bool _need_agg_finalize;
 
@@ -84,7 +82,6 @@ private:
     // ========= profiles ==========
     int64_t _compressed_bytes_read = 0;
     int64_t _raw_rows_read = 0;
-    RuntimeProfile* _profile;
     bool _profile_updated = false;
 };
 } // namespace vectorized

@@ -111,10 +111,7 @@ public:
         LOG(FATAL) << "get_permutation not supported in ColumnDictionary";
     }
 
-    void reserve(size_t n) override {
-        _reserve_size = n;
-        _codes.reserve(n);
-    }
+    void reserve(size_t n) override { _codes.reserve(n); }
 
     const char* get_family_name() const override { return "ColumnDictionary"; }
 
@@ -214,6 +211,17 @@ public:
         LOG(FATAL) << "should not call replace_column_data_default in ColumnDictionary";
     }
 
+    /**
+     * Just insert dictionary data items, the items will append into _dict.
+     */
+    void insert_many_dict_data(const StringRef* dict_array, uint32_t dict_num) {
+        _dict.reserve(_dict.size() + dict_num);
+        for (uint32_t i = 0; i < dict_num; ++i) {
+            auto value = StringValue(dict_array[i].data, dict_array[i].size);
+            _dict.insert_value(value);
+        }
+    }
+
     void insert_many_dict_data(const int32_t* data_array, size_t start_index,
                                const StringRef* dict_array, size_t data_num,
                                uint32_t dict_num) override {
@@ -232,6 +240,12 @@ public:
     }
 
     void convert_dict_codes_if_necessary() override {
+        // Avoid setting `_dict_sorted` to true when `_dict` is empty.
+        // Because `_dict` maybe keep empty after inserting some null rows.
+        if (_dict.empty()) {
+            return;
+        }
+
         if (!is_dict_sorted()) {
             _dict.sort();
             _dict_sorted = true;
@@ -251,11 +265,11 @@ public:
         return _dict.find_code_by_bound(value, greater, eq);
     }
 
-    void generate_hash_values_for_runtime_filter() override {
-        _dict.generate_hash_values_for_runtime_filter(_type);
+    void initialize_hash_values_for_runtime_filter() override {
+        _dict.initialize_hash_values_for_runtime_filter();
     }
 
-    uint32_t get_hash_value(uint32_t idx) const { return _dict.get_hash_value(_codes[idx]); }
+    uint32_t get_hash_value(uint32_t idx) const { return _dict.get_hash_value(_codes[idx], _type); }
 
     void find_codes(const phmap::flat_hash_set<StringValue>& values,
                     std::vector<vectorized::UInt8>& selected) const {
@@ -272,6 +286,8 @@ public:
 
     bool is_dict_sorted() const { return _dict_sorted; }
 
+    bool is_dict_empty() const { return _dict.empty(); }
+
     bool is_dict_code_converted() const { return _dict_code_converted; }
 
     MutableColumnPtr convert_to_predicate_column_if_dictionary() override {
@@ -279,7 +295,7 @@ public:
             convert_dict_codes_if_necessary();
         }
         auto res = vectorized::PredicateColumnType<TYPE_STRING>::create();
-        res->reserve(_reserve_size);
+        res->reserve(_codes.capacity());
         for (size_t i = 0; i < _codes.size(); ++i) {
             auto& code = reinterpret_cast<T&>(_codes[i]);
             auto value = _dict.get_value(code);
@@ -299,6 +315,10 @@ public:
         }
         return result;
     }
+
+    size_t dict_size() const { return _dict.size(); }
+
+    std::string dict_debug_string() const { return _dict.debug_string(); }
 
     class Dictionary {
     public:
@@ -327,31 +347,38 @@ public:
         inline const StringValue& get_value(T code) const { return (*_dict_data)[code]; }
 
         // The function is only used in the runtime filter feature
-        inline void generate_hash_values_for_runtime_filter(FieldType type) {
+        inline void initialize_hash_values_for_runtime_filter() {
             if (_hash_values.empty()) {
                 _hash_values.resize(_dict_data->size());
-                for (size_t i = 0; i < _dict_data->size(); i++) {
-                    auto& sv = (*_dict_data)[i];
-                    // The char data is stored in the disk with the schema length,
-                    // and zeros are filled if the length is insufficient
-
-                    // When reading data, use shrink_char_type_column_suffix_zero(_char_type_idx)
-                    // Remove the suffix 0
-                    // When writing data, use the CharField::consume function to fill in the trailing 0.
-
-                    // For dictionary data of char type, sv.len is the schema length,
-                    // so use strnlen to remove the 0 at the end to get the actual length.
-                    int32_t len = sv.len;
-                    if (type == OLAP_FIELD_TYPE_CHAR) {
-                        len = strnlen(sv.ptr, sv.len);
-                    }
-                    uint32_t hash_val = HashUtil::murmur_hash3_32(sv.ptr, len, 0);
-                    _hash_values[i] = hash_val;
-                }
+                _compute_hash_value_flags.resize(_dict_data->size());
+                _compute_hash_value_flags.assign(_dict_data->size(), 0);
             }
         }
 
-        inline uint32_t get_hash_value(T code) const { return _hash_values[code]; }
+        inline uint32_t get_hash_value(T code, FieldType type) const {
+            if (_compute_hash_value_flags[code]) {
+                return _hash_values[code];
+            } else {
+                auto& sv = (*_dict_data)[code];
+                // The char data is stored in the disk with the schema length,
+                // and zeros are filled if the length is insufficient
+
+                // When reading data, use shrink_char_type_column_suffix_zero(_char_type_idx)
+                // Remove the suffix 0
+                // When writing data, use the CharField::consume function to fill in the trailing 0.
+
+                // For dictionary data of char type, sv.size is the schema length,
+                // so use strnlen to remove the 0 at the end to get the actual length.
+                int32_t len = sv.len;
+                if (type == OLAP_FIELD_TYPE_CHAR) {
+                    len = strnlen(sv.ptr, sv.len);
+                }
+                uint32_t hash_val = HashUtil::murmur_hash3_32(sv.ptr, len, 0);
+                _hash_values[code] = hash_val;
+                _compute_hash_value_flags[code] = 1;
+                return _hash_values[code];
+            }
+        }
 
         // For > , code takes upper_bound - 1; For >= , code takes upper_bound
         // For < , code takes upper_bound; For <=, code takes upper_bound - 1
@@ -396,9 +423,13 @@ public:
             _dict_data->clear();
             _code_convert_table.clear();
             _hash_values.clear();
+            _compute_hash_value_flags.clear();
         }
 
-        void clear_hash_values() { _hash_values.clear(); }
+        void clear_hash_values() {
+            _hash_values.clear();
+            _compute_hash_value_flags.clear();
+        }
 
         void sort() {
             size_t dict_size = _dict_data->size();
@@ -432,9 +463,30 @@ public:
 
         size_t byte_size() { return _dict_data->size() * sizeof((*_dict_data)[0]); }
 
-        bool empty() { return _dict_data->empty(); }
+        bool empty() const { return _dict_data->empty(); }
 
         size_t avg_str_len() { return empty() ? 0 : _total_str_len / _dict_data->size(); }
+
+        size_t size() const {
+            if (!_dict_data) {
+                return 0;
+            }
+            return _dict_data->size();
+        }
+
+        std::string debug_string() const {
+            std::string str = "[";
+            if (_dict_data) {
+                for (size_t i = 0; i < _dict_data->size(); i++) {
+                    if (i) {
+                        str += ',';
+                    }
+                    str += (*_dict_data)[i].to_string();
+                }
+            }
+            str += ']';
+            return str;
+        }
 
     private:
         StringValue _null_value = StringValue();
@@ -447,7 +499,8 @@ public:
         // But in TPC-DS 1GB q60,we see no significant improvement.
         // This may because the magnitude of the data is not large enough(in q60, only about 80k rows data is filtered for largest table)
         // So we may need more test here.
-        HashValueContainer _hash_values;
+        mutable HashValueContainer _hash_values;
+        mutable std::vector<uint8> _compute_hash_value_flags;
         IColumn::Permutation _perm;
         size_t _total_str_len;
     };

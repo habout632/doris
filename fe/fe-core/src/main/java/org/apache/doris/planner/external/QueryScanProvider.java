@@ -17,11 +17,16 @@
 
 package org.apache.doris.planner.external;
 
+import org.apache.doris.catalog.Env;
+import org.apache.doris.catalog.FsBroker;
+import org.apache.doris.catalog.HdfsResource;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.MetaNotFoundException;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.util.BrokerUtil;
 import org.apache.doris.planner.external.ExternalFileScanNode.ParamCreateContext;
+import org.apache.doris.planner.external.iceberg.IcebergScanProvider;
+import org.apache.doris.planner.external.iceberg.IcebergSplit;
 import org.apache.doris.system.Backend;
 import org.apache.doris.thrift.TExternalScanRange;
 import org.apache.doris.thrift.TFileAttributes;
@@ -37,6 +42,7 @@ import org.apache.doris.thrift.TScanRangeLocation;
 import org.apache.doris.thrift.TScanRangeLocations;
 
 import com.google.common.base.Joiner;
+import org.apache.hadoop.hive.ql.io.orc.OrcSplit;
 import org.apache.hadoop.mapred.FileSplit;
 import org.apache.hadoop.mapred.InputSplit;
 import org.apache.logging.log4j.LogManager;
@@ -72,12 +78,9 @@ public abstract class QueryScanProvider implements FileScanProviderIf {
                 context.params.setFileAttributes(getFileAttributes());
             }
 
-            if (inputSplit instanceof IcebergSplit) {
-                IcebergScanProvider.setIcebergParams(context, (IcebergSplit) inputSplit);
-            }
             // set hdfs params for hdfs file type.
             Map<String, String> locationProperties = getLocationProperties();
-            if (locationType == TFileType.FILE_HDFS) {
+            if (locationType == TFileType.FILE_HDFS || locationType == TFileType.FILE_BROKER) {
                 String fsName = "";
                 if (this instanceof TVFScanProvider) {
                     fsName = ((TVFScanProvider) this).getFsName();
@@ -89,13 +92,20 @@ public abstract class QueryScanProvider implements FileScanProviderIf {
                     // s3://buckets
                     fsName = fullPath.replace(filePath, "");
                 }
-                THdfsParams tHdfsParams = BrokerUtil.generateHdfsParam(locationProperties);
+                THdfsParams tHdfsParams = HdfsResource.generateHdfsParam(locationProperties);
                 tHdfsParams.setFsName(fsName);
                 context.params.setHdfsParams(tHdfsParams);
+
+                if (locationType == TFileType.FILE_BROKER) {
+                    FsBroker broker = Env.getCurrentEnv().getBrokerMgr().getAnyAliveBroker();
+                    if (broker == null) {
+                        throw new UserException("No alive broker.");
+                    }
+                    context.params.addToBrokerAddresses(new TNetworkAddress(broker.ip, broker.port));
+                }
             } else if (locationType == TFileType.FILE_S3) {
                 context.params.setProperties(locationProperties);
             }
-
             TScanRangeLocations curLocations = newLocations(context.params, backendPolicy);
 
             FileSplitStrategy fileSplitStrategy = new FileSplitStrategy();
@@ -103,10 +113,21 @@ public abstract class QueryScanProvider implements FileScanProviderIf {
             for (InputSplit split : inputSplits) {
                 FileSplit fileSplit = (FileSplit) split;
                 List<String> pathPartitionKeys = getPathPartitionKeys();
-                List<String> partitionValuesFromPath = BrokerUtil.parseColumnsFromPath(fileSplit.getPath().toString(),
+                List<String> partitionValuesFromPath;
+                // For hive split, use the partition value from metastore first.
+                if (fileSplit instanceof HiveSplit && ((HiveSplit) fileSplit).partitionValues != null) {
+                    partitionValuesFromPath = ((HiveSplit) fileSplit).partitionValues;
+                } else {
+                    partitionValuesFromPath = BrokerUtil.parseColumnsFromPath(fileSplit.getPath().toString(),
                         pathPartitionKeys, false);
+                }
 
-                TFileRangeDesc rangeDesc = createFileRangeDesc(fileSplit, partitionValuesFromPath, pathPartitionKeys);
+                TFileRangeDesc rangeDesc = createFileRangeDesc(fileSplit, partitionValuesFromPath, pathPartitionKeys,
+                        locationType);
+                // external data lake table
+                if (split instanceof IcebergSplit) {
+                    IcebergScanProvider.setIcebergParams(rangeDesc, (IcebergSplit) split);
+                }
 
                 curLocations.getScanRange().getExtScanRange().getFileScanRange().addToRanges(rangeDesc);
                 LOG.debug("assign to backend {} with table split: {} ({}, {}), location: {}",
@@ -167,17 +188,31 @@ public abstract class QueryScanProvider implements FileScanProviderIf {
     }
 
     private TFileRangeDesc createFileRangeDesc(FileSplit fileSplit, List<String> columnsFromPath,
-            List<String> columnsFromPathKeys)
+            List<String> columnsFromPathKeys, TFileType locationType)
             throws DdlException, MetaNotFoundException {
         TFileRangeDesc rangeDesc = new TFileRangeDesc();
         rangeDesc.setStartOffset(fileSplit.getStart());
         rangeDesc.setSize(fileSplit.getLength());
+
+        // broker reader needs file size
+        if (locationType == TFileType.FILE_BROKER) {
+            if (fileSplit instanceof OrcSplit) {
+                rangeDesc.setFileSize(((OrcSplit) fileSplit).getFileLength());
+            } else if (fileSplit instanceof HiveSplit) {
+                rangeDesc.setFileSize(((HiveSplit) fileSplit).getFileSize());
+            } else {
+                throw new DdlException("File size can not be got, please do not use broker to read this file. "
+                        + "Try to use hdfs reader or s3 reader.");
+            }
+        }
+
         rangeDesc.setColumnsFromPath(columnsFromPath);
         rangeDesc.setColumnsFromPathKeys(columnsFromPathKeys);
 
         if (getLocationType() == TFileType.FILE_HDFS) {
             rangeDesc.setPath(fileSplit.getPath().toUri().getPath());
-        } else if (getLocationType() == TFileType.FILE_S3) {
+        } else if (getLocationType() == TFileType.FILE_S3 || getLocationType() == TFileType.FILE_BROKER) {
+            // need full path
             rangeDesc.setPath(fileSplit.getPath().toString());
         }
         return rangeDesc;

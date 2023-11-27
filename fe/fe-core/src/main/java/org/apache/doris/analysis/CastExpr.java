@@ -27,6 +27,7 @@ import org.apache.doris.catalog.PrimitiveType;
 import org.apache.doris.catalog.ScalarFunction;
 import org.apache.doris.catalog.ScalarType;
 import org.apache.doris.catalog.Type;
+import org.apache.doris.catalog.TypeUtils;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.Pair;
 import org.apache.doris.qe.ConnectContext;
@@ -150,8 +151,7 @@ public class CastExpr extends Expr {
 
     private static boolean disableRegisterCastingFunction(Type fromType, Type toType) {
         // Disable casting from boolean to decimal or datetime or date
-        if (fromType.isBoolean() && (toType.equals(Type.DECIMALV2) || toType.isDecimalV3()
-                || toType.isDateType())) {
+        if (fromType.isBoolean() && (toType.equals(Type.DECIMALV2) || toType.isDateType())) {
             return true;
         }
 
@@ -160,7 +160,7 @@ public class CastExpr extends Expr {
             return true;
         }
         // Disable no-op casting
-        return fromType.equals(toType);
+        return fromType.equals(toType) && !fromType.isDecimalV3() && !fromType.isDatetimeV2();
     }
 
     public static void initBuiltins(FunctionSet functionSet) {
@@ -281,7 +281,7 @@ public class CastExpr extends Expr {
         Type childType = getChild(0).getType();
 
         // this cast may result in loss of precision, but the user requested it
-        noOp = Type.matchExactType(childType, type);
+        noOp = Type.matchExactType(childType, type, true);
 
         if (noOp) {
             // For decimalv2, we do not perform an actual cast between different precision/scale. Instead, we just
@@ -304,7 +304,8 @@ public class CastExpr extends Expr {
 
         this.opcode = TExprOpcode.CAST;
         FunctionName fnName = new FunctionName(getFnName(type));
-        Function searchDesc = new Function(fnName, Arrays.asList(collectChildReturnTypes()), Type.INVALID, false);
+        Function searchDesc = new Function(fnName, Arrays.asList(getActualArgTypes(collectChildReturnTypes())),
+                Type.INVALID, false);
         if (type.isScalarType()) {
             if (isImplicit) {
                 fn = Env.getCurrentEnv().getFunction(
@@ -330,7 +331,8 @@ public class CastExpr extends Expr {
         }
 
         if (PrimitiveType.typeWithPrecision.contains(type.getPrimitiveType())) {
-            Preconditions.checkState(type.getPrimitiveType() == fn.getReturnType().getPrimitiveType(),
+            Preconditions.checkState(type.isDecimalV3() == fn.getReturnType().isDecimalV3()
+                            || type.isDatetimeV2() == fn.getReturnType().isDatetimeV2(),
                     type + " != " + fn.getReturnType());
         } else {
             Preconditions.checkState(type.matchesType(fn.getReturnType()), type + " != " + fn.getReturnType());
@@ -396,8 +398,8 @@ public class CastExpr extends Expr {
     }
 
     @Override
-    public Expr getResultValue() throws AnalysisException {
-        recursiveResetChildrenResult();
+    public Expr getResultValue(boolean inView) throws AnalysisException {
+        recursiveResetChildrenResult(inView);
         final Expr value = children.get(0);
         if (!(value instanceof LiteralExpr)) {
             return this;
@@ -406,6 +408,9 @@ public class CastExpr extends Expr {
         try {
             targetExpr = castTo((LiteralExpr) value);
         } catch (AnalysisException ae) {
+            if (ConnectContext.get() != null) {
+                ConnectContext.get().getState().reset();
+            }
             targetExpr = this;
         } catch (NumberFormatException nfe) {
             targetExpr = new NullLiteral();
@@ -415,7 +420,11 @@ public class CastExpr extends Expr {
 
     private Expr castTo(LiteralExpr value) throws AnalysisException {
         if (value instanceof NullLiteral) {
-            return value;
+            if (targetTypeDef != null) {
+                return NullLiteral.create(targetTypeDef.getType());
+            } else {
+                return NullLiteral.create(type);
+            }
         } else if (type.isIntegerType()) {
             return new IntLiteral(value.getLongValue(), type);
         } else if (type.isLargeIntType()) {
@@ -444,7 +453,7 @@ public class CastExpr extends Expr {
         out.writeBoolean(isImplicit);
         if (targetTypeDef.getType() instanceof ScalarType) {
             ScalarType scalarType = (ScalarType) targetTypeDef.getType();
-            scalarType.write(out);
+            TypeUtils.writeScalaType(scalarType, out);
         } else {
             throw new IOException("Can not write type " + targetTypeDef.getType());
         }
@@ -463,7 +472,7 @@ public class CastExpr extends Expr {
     @Override
     public void readFields(DataInput in) throws IOException {
         isImplicit = in.readBoolean();
-        ScalarType scalarType = ScalarType.read(in);
+        ScalarType scalarType = TypeUtils.readScalaType(in);
         targetTypeDef = new TypeDef(scalarType);
         int counter = in.readInt();
         for (int i = 0; i < counter; i++) {

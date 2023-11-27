@@ -365,7 +365,6 @@ public class BDBEnvironment {
                 db.close();
             } catch (DatabaseException exception) {
                 LOG.error("Error closing db {} will exit", db.getDatabaseName(), exception);
-                System.exit(-1);
             }
         }
         openedDatabases.clear();
@@ -375,7 +374,6 @@ public class BDBEnvironment {
                 epochDB.close();
             } catch (DatabaseException exception) {
                 LOG.error("Error closing db {} will exit", epochDB.getDatabaseName(), exception);
-                System.exit(-1);
             }
         }
 
@@ -385,7 +383,6 @@ public class BDBEnvironment {
                 replicatedEnvironment.close();
             } catch (DatabaseException exception) {
                 LOG.error("Error closing replicatedEnvironment", exception);
-                System.exit(-1);
             }
         }
     }
@@ -394,11 +391,11 @@ public class BDBEnvironment {
     public void closeReplicatedEnvironment() {
         if (replicatedEnvironment != null) {
             try {
+                openedDatabases.clear();
                 // Finally, close the store and environment.
                 replicatedEnvironment.close();
             } catch (DatabaseException exception) {
                 LOG.error("Error closing replicatedEnvironment", exception);
-                System.exit(-1);
             }
         }
     }
@@ -408,7 +405,15 @@ public class BDBEnvironment {
         for (int i = 0; i < RETRY_TIME; i++) {
             try {
                 // open the environment
-                replicatedEnvironment = new ReplicatedEnvironment(envHome, replicationConfig, environmentConfig);
+                replicatedEnvironment =
+                        new ReplicatedEnvironment(envHome, replicationConfig, environmentConfig);
+
+                // start state change listener
+                StateChangeListener listener = new BDBStateChangeListener();
+                replicatedEnvironment.setStateChangeListener(listener);
+
+                // open epochDB. the first parameter null means auto-commit
+                epochDB = replicatedEnvironment.openDatabase(null, "epochDB", dbConfig);
                 break;
             } catch (DatabaseException e) {
                 if (i < RETRY_TIME - 1) {

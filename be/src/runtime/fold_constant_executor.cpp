@@ -167,14 +167,14 @@ Status FoldConstantExecutor::_init(const TQueryGlobals& query_globals) {
     Status status =
             DescriptorTbl::create(_runtime_state->obj_pool(), TDescriptorTable(), &desc_tbl);
     if (UNLIKELY(!status.ok())) {
-        LOG(WARNING) << "Failed to create descriptor table, msg: " << status.get_error_msg();
-        return Status::Uninitialized(status.get_error_msg());
+        LOG(WARNING) << "Failed to create descriptor table, msg: " << status;
+        return status;
     }
     _runtime_state->set_desc_tbl(desc_tbl);
     status = _runtime_state->init_mem_trackers(FoldConstantExecutor::_dummy_id);
     if (UNLIKELY(!status.ok())) {
-        LOG(WARNING) << "Failed to init mem trackers, msg: " << status.get_error_msg();
-        return Status::Uninitialized(status.get_error_msg());
+        LOG(WARNING) << "Failed to init mem trackers, msg: " << status;
+        return status;
     }
 
     _runtime_profile = _runtime_state->runtime_profile();
@@ -249,6 +249,13 @@ string FoldConstantExecutor::_get_result(void* src, size_t size, PrimitiveType s
             date_value.to_string(str);
             return str;
         }
+    }
+    case TYPE_DATETIMEV2: {
+        auto date_value = reinterpret_cast<
+                doris::vectorized::DateV2Value<doris::vectorized::DateTimeV2ValueType>*>(src);
+        char str[MAX_DTVALUE_STR_LEN];
+        date_value->to_string(str);
+        return str;
     }
     case TYPE_DECIMALV2: {
         return reinterpret_cast<DecimalV2Value*>(src)->to_string();

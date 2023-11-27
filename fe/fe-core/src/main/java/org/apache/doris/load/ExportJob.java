@@ -38,7 +38,6 @@ import org.apache.doris.analysis.TupleDescriptor;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
-import org.apache.doris.catalog.JdbcTable;
 import org.apache.doris.catalog.MysqlTable;
 import org.apache.doris.catalog.OdbcTable;
 import org.apache.doris.catalog.PrimitiveType;
@@ -52,6 +51,7 @@ import org.apache.doris.common.Status;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
+import org.apache.doris.common.util.DebugUtil;
 import org.apache.doris.common.util.SqlParserUtils;
 import org.apache.doris.common.util.TimeUtils;
 import org.apache.doris.planner.DataPartition;
@@ -67,6 +67,7 @@ import org.apache.doris.planner.ScanNode;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.Coordinator;
 import org.apache.doris.qe.OriginStatement;
+import org.apache.doris.qe.QeProcessorImpl;
 import org.apache.doris.qe.SessionVariable;
 import org.apache.doris.qe.SqlModeHelper;
 import org.apache.doris.rewrite.ExprRewriter;
@@ -117,7 +118,9 @@ public class ExportJob implements Writable {
     }
 
     private long id;
+    private String queryId;
     private String label;
+    private String user;
     private long dbId;
     private long tableId;
     private BrokerDesc brokerDesc;
@@ -127,12 +130,11 @@ public class ExportJob implements Writable {
     private String lineDelimiter;
     private Map<String, String> properties = Maps.newHashMap();
     private List<String> partitions;
-
     private TableName tableName;
-
     private String sql = "";
-
     private JobState state;
+    // If set to true, the profile of export job with be pushed to ProfileManager
+    private volatile boolean enableProfile = false;
     private long createTimeMs;
     private long startTimeMs;
     private long finishTimeMs;
@@ -176,6 +178,7 @@ public class ExportJob implements Writable {
 
     public ExportJob() {
         this.id = -1;
+        this.queryId = "";
         this.dbId = -1;
         this.tableId = -1;
         this.state = JobState.PENDING;
@@ -190,6 +193,7 @@ public class ExportJob implements Writable {
         this.columnSeparator = "\t";
         this.lineDelimiter = "\n";
         this.columns = "";
+        this.user = "";
     }
 
     public ExportJob(long jobId) {
@@ -202,12 +206,12 @@ public class ExportJob implements Writable {
         Database db = Env.getCurrentInternalCatalog().getDbOrDdlException(dbName);
         Preconditions.checkNotNull(stmt.getBrokerDesc());
         this.brokerDesc = stmt.getBrokerDesc();
-
         this.columnSeparator = stmt.getColumnSeparator();
         this.lineDelimiter = stmt.getLineDelimiter();
         this.properties = stmt.getProperties();
         this.label = this.properties.get(ExportStmt.LABEL);
-
+        this.queryId = ConnectContext.get() != null ? DebugUtil.printId(ConnectContext.get().queryId()) : "N/A";
+        this.user = ConnectContext.get() != null ? ConnectContext.get().getQualifiedUser() : "N/A";
         String path = stmt.getPath();
         Preconditions.checkArgument(!Strings.isNullOrEmpty(path));
         this.whereExpr = stmt.getWhereExpr();
@@ -236,6 +240,7 @@ public class ExportJob implements Writable {
         if (ConnectContext.get() != null) {
             SessionVariable var = ConnectContext.get().getSessionVariable();
             this.sessionVariables.put(SessionVariable.SQL_MODE, Long.toString(var.getSqlMode()));
+            this.enableProfile = var.enableProfile();
         } else {
             this.sessionVariables.put(SessionVariable.SQL_MODE, String.valueOf(SqlModeHelper.MODE_DEFAULT));
         }
@@ -280,15 +285,22 @@ public class ExportJob implements Writable {
         return types;
     }
 
-    private String genHeader(Map<String, String> properties) {
+    private String genHeader(Map<String, String> properties) throws UserException {
         String header = "";
         if (properties.containsKey("format")) {
             String headerType = properties.get("format");
-            if (headerType.equals(FeConstants.csv_with_names)) {
-                header = genNames();
-            } else if (headerType.equals(FeConstants.csv_with_names_and_types)) {
-                header = genNames();
-                header += genTypes();
+            switch (headerType) {
+                case FeConstants.csv:
+                    break;
+                case FeConstants.csv_with_names:
+                    header = genNames();
+                    break;
+                case FeConstants.csv_with_names_and_types:
+                    header = genNames();
+                    header += genTypes();
+                    break;
+                default:
+                    throw new DdlException("Unknown format for export: " + headerType);
             }
         }
         return header;
@@ -420,7 +432,7 @@ public class ExportJob implements Writable {
                 scanNode = new MysqlScanNode(new PlanNodeId(0), exportTupleDesc, (MysqlTable) this.exportTable);
                 break;
             case JDBC:
-                scanNode = new JdbcScanNode(new PlanNodeId(0), exportTupleDesc, (JdbcTable) this.exportTable);
+                scanNode = new JdbcScanNode(new PlanNodeId(0), exportTupleDesc, false);
                 break;
             default:
                 break;
@@ -443,7 +455,7 @@ public class ExportJob implements Writable {
         return olapScanNode;
     }
 
-    private PlanFragment genPlanFragment(Table.TableType type, ScanNode scanNode) throws UserException {
+   private PlanFragment genPlanFragment(Table.TableType type, ScanNode scanNode) throws UserException {
         PlanFragment fragment = null;
         switch (exportTable.getType()) {
             case OLAP:
@@ -457,7 +469,8 @@ public class ExportJob implements Writable {
                         new PlanFragmentId(nextId.getAndIncrement()), scanNode, DataPartition.UNPARTITIONED);
                 break;
             default:
-                break;
+                LOG.info("Table Type unsupport export, ExportTable type : {}", exportTable.getType());
+                throw new UserException("Table Type unsupport export :" + exportTable.getType());
         }
         fragment.setOutputExprs(createOutputExprs());
 
@@ -471,7 +484,7 @@ public class ExportJob implements Writable {
         }
 
         return fragment;
-    }
+    }    
 
     private List<Expr> createOutputExprs() {
         List<Expr> outputExprs = Lists.newArrayList();
@@ -522,7 +535,7 @@ public class ExportJob implements Writable {
         return whereExpr;
     }
 
-    public JobState getState() {
+    public synchronized JobState getState() {
         return state;
     }
 
@@ -652,11 +665,26 @@ public class ExportJob implements Writable {
     }
 
     public synchronized void cancel(ExportFailMsg.CancelType type, String msg) {
-        releaseSnapshotPaths();
         if (msg != null) {
             failMsg = new ExportFailMsg(type, msg);
         }
-        updateState(ExportJob.JobState.CANCELLED, false);
+        if (updateState(ExportJob.JobState.CANCELLED, false)) {
+            // cancel all running coordinators, so that the scheduler's worker thread will be released
+            for (Coordinator coordinator : coordList) {
+                Coordinator registeredCoordinator = QeProcessorImpl.INSTANCE.getCoordinator(coordinator.getQueryId());
+                if (registeredCoordinator != null) {
+                    registeredCoordinator.cancel();
+                }
+            }
+
+            // release snapshot
+            Status releaseSnapshotStatus = releaseSnapshotPaths();
+            if (!releaseSnapshotStatus.ok()) {
+                // snapshot will be removed by GC thread on BE, finally.
+                LOG.warn("failed to release snapshot for export job: {}. err: {}", id,
+                        releaseSnapshotStatus.getErrorMsg());
+            }
+        }
     }
 
     public synchronized boolean updateState(ExportJob.JobState newState) {
@@ -664,6 +692,9 @@ public class ExportJob implements Writable {
     }
 
     public synchronized boolean updateState(ExportJob.JobState newState, boolean isReplay) {
+        if (isFinalState()) {
+            return false;
+        }
         state = newState;
         switch (newState) {
             case PENDING:
@@ -685,6 +716,10 @@ public class ExportJob implements Writable {
             Env.getCurrentEnv().getEditLog().logExportUpdateState(id, newState);
         }
         return true;
+    }
+
+    public synchronized boolean isFinalState() {
+        return this.state == ExportJob.JobState.CANCELLED || this.state == ExportJob.JobState.FINISHED;
     }
 
     public Status releaseSnapshotPaths() {
@@ -720,6 +755,18 @@ public class ExportJob implements Writable {
 
     public String getLabel() {
         return label;
+    }
+
+    public String getQueryId() {
+        return queryId;
+    }
+
+    public String getUser() {
+        return user;
+    }
+
+    public boolean getEnableProfile() {
+        return enableProfile;
     }
 
     @Override

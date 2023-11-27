@@ -17,11 +17,13 @@
 
 #include "vec/sink/vmysql_result_writer.h"
 
+#include "olap/hll.h"
 #include "runtime/buffer_control_block.h"
 #include "runtime/jsonb_value.h"
 #include "runtime/large_int_value.h"
 #include "runtime/runtime_state.h"
 #include "vec/columns/column_array.h"
+#include "vec/columns/column_complex.h"
 #include "vec/columns/column_nullable.h"
 #include "vec/columns/column_vector.h"
 #include "vec/common/assert_cast.h"
@@ -46,7 +48,7 @@ Status VMysqlResultWriter::init(RuntimeState* state) {
     if (nullptr == _sinker) {
         return Status::InternalError("sinker is NULL pointer.");
     }
-
+    set_output_object_data(state->return_object_data_as_binary());
     return Status::OK();
 }
 
@@ -91,7 +93,27 @@ Status VMysqlResultWriter::_add_one_column(const ColumnPtr& column_ptr,
             }
 
             if constexpr (type == TYPE_OBJECT) {
-                buf_ret = _buffer.push_null();
+                if (column->is_bitmap() && output_object_data()) {
+                    const vectorized::ColumnComplexType<BitmapValue>* pColumnComplexType =
+                            assert_cast<const vectorized::ColumnComplexType<BitmapValue>*>(
+                                    column.get());
+                    BitmapValue bitmapValue = pColumnComplexType->get_element(i);
+                    size_t size = bitmapValue.getSizeInBytes();
+                    std::unique_ptr<char[]> buf = std::make_unique<char[]>(size);
+                    bitmapValue.write(buf.get());
+                    buf_ret = _buffer.push_string(buf.get(), size);
+                } else if (column->is_hll() && output_object_data()) {
+                    const vectorized::ColumnComplexType<HyperLogLog>* pColumnComplexType =
+                            assert_cast<const vectorized::ColumnComplexType<HyperLogLog>*>(
+                                    column.get());
+                    HyperLogLog hyperLogLog = pColumnComplexType->get_element(i);
+                    size_t size = hyperLogLog.max_serialized_size();
+                    std::unique_ptr<char[]> buf = std::make_unique<char[]>(size);
+                    hyperLogLog.serialize((uint8*)buf.get());
+                    buf_ret = _buffer.push_string(buf.get(), size);
+                } else {
+                    buf_ret = _buffer.push_null();
+                }
             }
             if constexpr (type == TYPE_VARCHAR) {
                 const auto string_val = column->get_data_at(i);
@@ -152,10 +174,10 @@ Status VMysqlResultWriter::_add_one_column(const ColumnPtr& column_ptr,
                 } else {
                     if (WhichDataType(remove_nullable(nested_type_ptr)).is_string()) {
                         buf_ret = _buffer.push_string("'", 1);
-                        buf_ret = _add_one_cell(data, j, nested_type_ptr, _buffer);
+                        buf_ret = _add_one_cell(data, j, nested_type_ptr, _buffer, scale);
                         buf_ret = _buffer.push_string("'", 1);
                     } else {
-                        buf_ret = _add_one_cell(data, j, nested_type_ptr, _buffer);
+                        buf_ret = _add_one_cell(data, j, nested_type_ptr, _buffer, scale);
                     }
                 }
                 begin = false;
@@ -233,8 +255,7 @@ Status VMysqlResultWriter::_add_one_column(const ColumnPtr& column_ptr,
             if constexpr (type == TYPE_DATETIME) {
                 char buf[64];
                 auto time_num = data[i];
-                VecDateTimeValue time_val;
-                memcpy(static_cast<void*>(&time_val), &time_num, sizeof(Int64));
+                VecDateTimeValue time_val = binary_cast<Int64, VecDateTimeValue>(time_num);
                 // TODO(zhaochun), this function has core risk
                 char* pos = time_val.to_string(buf);
                 buf_ret = _buffer.push_string(buf, pos - buf - 1);
@@ -242,16 +263,16 @@ Status VMysqlResultWriter::_add_one_column(const ColumnPtr& column_ptr,
             if constexpr (type == TYPE_DATEV2) {
                 char buf[64];
                 auto time_num = data[i];
-                doris::vectorized::DateV2Value<DateV2ValueType> date_val;
-                memcpy(static_cast<void*>(&date_val), &time_num, sizeof(UInt32));
+                DateV2Value<DateV2ValueType> date_val =
+                        binary_cast<UInt32, DateV2Value<DateV2ValueType>>(time_num);
                 char* pos = date_val.to_string(buf);
                 buf_ret = _buffer.push_string(buf, pos - buf - 1);
             }
             if constexpr (type == TYPE_DATETIMEV2) {
-                char buf[64];
                 auto time_num = data[i];
-                doris::vectorized::DateV2Value<DateTimeV2ValueType> date_val;
-                memcpy(static_cast<void*>(&date_val), &time_num, sizeof(UInt64));
+                char buf[64];
+                DateV2Value<DateTimeV2ValueType> date_val =
+                        binary_cast<UInt64, DateV2Value<DateTimeV2ValueType>>(time_num);
                 char* pos = date_val.to_string(buf, scale);
                 buf_ret = _buffer.push_string(buf, pos - buf - 1);
             }
@@ -272,7 +293,7 @@ Status VMysqlResultWriter::_add_one_column(const ColumnPtr& column_ptr,
 }
 
 int VMysqlResultWriter::_add_one_cell(const ColumnPtr& column_ptr, size_t row_idx,
-                                      const DataTypePtr& type, MysqlRowBuffer& buffer) {
+                                      const DataTypePtr& type, MysqlRowBuffer& buffer, int scale) {
     WhichDataType which(type->get_type_id());
     if (which.is_nullable() && column_ptr->is_null_at(row_idx)) {
         return buffer.push_null();
@@ -329,8 +350,7 @@ int VMysqlResultWriter::_add_one_cell(const ColumnPtr& column_ptr, size_t row_id
     } else if (which.is_date_or_datetime()) {
         auto& column_vector = assert_cast<const ColumnVector<Int64>&>(*column);
         auto value = column_vector[row_idx].get<Int64>();
-        VecDateTimeValue datetime;
-        memcpy(static_cast<void*>(&datetime), static_cast<void*>(&value), sizeof(value));
+        VecDateTimeValue datetime = binary_cast<Int64, VecDateTimeValue>(value);
         if (which.is_date()) {
             datetime.cast_to_date();
         }
@@ -340,10 +360,18 @@ int VMysqlResultWriter::_add_one_cell(const ColumnPtr& column_ptr, size_t row_id
     } else if (which.is_date_v2()) {
         auto& column_vector = assert_cast<const ColumnVector<UInt32>&>(*column);
         auto value = column_vector[row_idx].get<UInt32>();
-        DateV2Value<DateV2ValueType> datev2;
-        memcpy(static_cast<void*>(&datev2), static_cast<void*>(&value), sizeof(value));
+        DateV2Value<DateV2ValueType> datev2 =
+                binary_cast<UInt32, DateV2Value<DateV2ValueType>>(value);
         char buf[64];
         char* pos = datev2.to_string(buf);
+        return buffer.push_string(buf, pos - buf - 1);
+    } else if (which.is_date_time_v2()) {
+        auto& column_vector = assert_cast<const ColumnVector<UInt64>&>(*column);
+        auto value = column_vector[row_idx].get<UInt64>();
+        DateV2Value<DateTimeV2ValueType> datetimev2 =
+                binary_cast<UInt64, DateV2Value<DateTimeV2ValueType>>(value);
+        char buf[64];
+        char* pos = datetimev2.to_string(buf, scale);
         return buffer.push_string(buf, pos - buf - 1);
     } else if (which.is_decimal32()) {
         DataTypePtr nested_type = type;
@@ -624,16 +652,19 @@ Status VMysqlResultWriter::append_block(Block& input_block) {
             break;
         }
         case TYPE_ARRAY: {
+            // Currently all functions only support single-level nested arrays，
+            // so we use Array's child scale to represent the scale of nested type.
+            scale = _output_vexpr_ctxs[i]->root()->type().children[0].scale;
             if (type_ptr->is_nullable()) {
                 auto& nested_type =
                         assert_cast<const DataTypeNullable&>(*type_ptr).get_nested_type();
                 auto& sub_type = assert_cast<const DataTypeArray&>(*nested_type).get_nested_type();
                 status = _add_one_column<PrimitiveType::TYPE_ARRAY, true>(column_ptr, result,
-                                                                          sub_type);
+                                                                          sub_type, scale);
             } else {
                 auto& sub_type = assert_cast<const DataTypeArray&>(*type_ptr).get_nested_type();
                 status = _add_one_column<PrimitiveType::TYPE_ARRAY, false>(column_ptr, result,
-                                                                           sub_type);
+                                                                           sub_type, scale);
             }
             break;
         }

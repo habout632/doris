@@ -29,6 +29,7 @@ import org.apache.doris.common.DdlException;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
 import org.apache.doris.common.util.SqlUtils;
+import org.apache.doris.persist.gson.GsonPostProcessable;
 import org.apache.doris.persist.gson.GsonUtils;
 import org.apache.doris.thrift.TColumn;
 import org.apache.doris.thrift.TColumnType;
@@ -52,12 +53,16 @@ import java.util.Set;
 /**
  * This class represents the column-related metadata.
  */
-public class Column implements Writable {
+public class Column implements Writable, GsonPostProcessable {
     private static final Logger LOG = LogManager.getLogger(Column.class);
     public static final String DELETE_SIGN = "__DORIS_DELETE_SIGN__";
     public static final String SEQUENCE_COL = "__DORIS_SEQUENCE_COL__";
+    public static final String VERSION_COL = "__DORIS_VERSION_COL__";
     private static final String COLUMN_ARRAY_CHILDREN = "item";
     public static final int COLUMN_UNIQUE_ID_INIT_VALUE = -1;
+
+    public static final Column UNSUPPORTED_COLUMN = new Column("unknown",
+            Type.UNSUPPORTED, true, null, true, null, "invalid", true, null, -1, null);
 
     @SerializedName(value = "name")
     private String name;
@@ -86,6 +91,16 @@ public class Column implements Writable {
     private ColumnStats stats;     // cardinality and selectivity etc.
     @SerializedName(value = "children")
     private List<Column> children;
+    /**
+     * This is similar as `defaultValue`. Differences are:
+     * 1. `realDefaultValue` indicates the **default underlying literal**.
+     * 2. Instead, `defaultValue` indicates the **original expression** which is specified by users.
+     *
+     * For example, if user create a table with (columnA, DATETIME, DEFAULT CURRENT_TIMESTAMP)
+     * `realDefaultValue` here is current date time while `defaultValue` is `CURRENT_TIMESTAMP`.
+     */
+    @SerializedName(value = "realDefaultValue")
+    private String realDefaultValue;
     // Define expr may exist in two forms, one is analyzed, and the other is not analyzed.
     // Currently, analyzed define expr is only used when creating materialized views,
     // so the define expr in RollupJob must be analyzed.
@@ -133,12 +148,18 @@ public class Column implements Writable {
     public Column(String name, Type type, boolean isKey, AggregateType aggregateType, boolean isAllowNull,
             String defaultValue, String comment) {
         this(name, type, isKey, aggregateType, isAllowNull, defaultValue, comment, true, null,
-                COLUMN_UNIQUE_ID_INIT_VALUE);
+                COLUMN_UNIQUE_ID_INIT_VALUE, defaultValue);
+    }
+
+    public Column(String name, Type type, boolean isKey, AggregateType aggregateType, boolean isAllowNull,
+            String comment, boolean visible, int colUniqueId) {
+        this(name, type, isKey, aggregateType, isAllowNull, null, comment, visible, null,
+                colUniqueId, null);
     }
 
     public Column(String name, Type type, boolean isKey, AggregateType aggregateType, boolean isAllowNull,
             String defaultValue, String comment, boolean visible, DefaultValueExprDef defaultValueExprDef,
-            int colUniqueId) {
+            int colUniqueId, String realDefaultValue) {
         this.name = name;
         if (this.name == null) {
             this.name = "";
@@ -154,6 +175,7 @@ public class Column implements Writable {
         this.isKey = isKey;
         this.isAllowNull = isAllowNull;
         this.defaultValue = defaultValue;
+        this.realDefaultValue = realDefaultValue;
         this.defaultValueExprDef = defaultValueExprDef;
         this.comment = comment;
         this.stats = new ColumnStats();
@@ -172,6 +194,7 @@ public class Column implements Writable {
         this.isCompoundKey = column.isCompoundKey();
         this.isAllowNull = column.isAllowNull();
         this.defaultValue = column.getDefaultValue();
+        this.realDefaultValue = column.realDefaultValue;
         this.defaultValueExprDef = column.defaultValueExprDef;
         this.comment = column.getComment();
         this.stats = column.getStats();
@@ -202,6 +225,10 @@ public class Column implements Writable {
 
     public String getName() {
         return this.name;
+    }
+
+    public String getNonShadowName() {
+        return removeNamePrefix(name);
     }
 
     public String getDisplayName() {
@@ -253,6 +280,12 @@ public class Column implements Writable {
         // aggregationType is NONE for unique table with merge on write.
         return !visible && (aggregationType == AggregateType.REPLACE
                 || aggregationType == AggregateType.NONE) && nameEquals(SEQUENCE_COL, true);
+    }
+
+    public boolean isVersionColumn() {
+        // aggregationType is NONE for unique table with merge on write.
+        return !visible && (aggregationType == AggregateType.REPLACE
+                || aggregationType == AggregateType.NONE) && nameEquals(VERSION_COL, true);
     }
 
     public PrimitiveType getDataType() {
@@ -380,7 +413,8 @@ public class Column implements Writable {
         }
         tColumn.setIsKey(this.isKey);
         tColumn.setIsAllowNull(this.isAllowNull);
-        tColumn.setDefaultValue(this.defaultValue);
+        // keep compatibility
+        tColumn.setDefaultValue(this.realDefaultValue == null ? this.defaultValue : this.realDefaultValue);
         tColumn.setVisible(visible);
         toChildrenThrift(this, tColumn);
 
@@ -436,11 +470,16 @@ public class Column implements Writable {
         }
 
         if (type.isNumericType() && other.type.isStringType()) {
-            Integer lSize = type.getColumnStringRepSize();
-            Integer rSize = other.type.getColumnStringRepSize();
-            if (rSize < lSize) {
-                throw new DdlException(
-                        "Can not change from wider type " + type.toSql() + " to narrower type " + other.type.toSql());
+            try {
+                Integer lSize = type.getColumnStringRepSize();
+                Integer rSize = other.type.getColumnStringRepSize();
+                if (rSize < lSize) {
+                    throw new DdlException(
+                            "Can not change from wider type " + type.toSql() + " to narrower type "
+                                    + other.type.toSql());
+                }
+            } catch (TypeException e) {
+                throw new DdlException(e.getMessage());
             }
         }
 
@@ -494,8 +533,8 @@ public class Column implements Writable {
     }
 
     public static String removeNamePrefix(String colName) {
-        if (colName.startsWith(SchemaChangeHandler.SHADOW_NAME_PRFIX)) {
-            return colName.substring(SchemaChangeHandler.SHADOW_NAME_PRFIX.length());
+        if (colName.startsWith(SchemaChangeHandler.SHADOW_NAME_PREFIX)) {
+            return colName.substring(SchemaChangeHandler.SHADOW_NAME_PREFIX.length());
         }
         return colName;
     }
@@ -504,11 +543,11 @@ public class Column implements Writable {
         if (isShadowColumn(colName)) {
             return colName;
         }
-        return SchemaChangeHandler.SHADOW_NAME_PRFIX + colName;
+        return SchemaChangeHandler.SHADOW_NAME_PREFIX + colName;
     }
 
     public static boolean isShadowColumn(String colName) {
-        return colName.startsWith(SchemaChangeHandler.SHADOW_NAME_PRFIX);
+        return colName.startsWith(SchemaChangeHandler.SHADOW_NAME_PREFIX);
     }
 
     public Expr getDefineExpr() {
@@ -535,14 +574,30 @@ public class Column implements Writable {
     }
 
     public String toSql() {
-        return toSql(false);
+        return toSql(false, false);
     }
 
     public String toSql(boolean isUniqueTable) {
+        return toSql(isUniqueTable, false);
+    }
+
+    public String toSql(boolean isUniqueTable, boolean isCompatible) {
         StringBuilder sb = new StringBuilder();
         sb.append("`").append(name).append("` ");
         String typeStr = type.toSql();
-        sb.append(typeStr);
+
+        // show change datetimeV2/dateV2 to datetime/date
+        if (isCompatible) {
+            if (type.isDatetimeV2()) {
+                sb.append("datetime");
+            } else if (type.isDateV2()) {
+                sb.append("date");
+            } else {
+                sb.append(typeStr);
+            }
+        } else {
+            sb.append(typeStr);
+        }
         if (aggregationType != null && aggregationType != AggregateType.NONE && !isUniqueTable
                 && !isAggregationTypeImplicit) {
             sb.append(" ").append(aggregationType.name());
@@ -573,7 +628,8 @@ public class Column implements Writable {
     @Override
     public int hashCode() {
         return Objects.hash(name, getDataType(), getStrLen(), getPrecision(), getScale(), aggregationType,
-                isAggregationTypeImplicit, isKey, isAllowNull, defaultValue, comment, children, visible);
+                isAggregationTypeImplicit, isKey, isAllowNull, defaultValue, comment, children, visible,
+                realDefaultValue);
     }
 
     @Override
@@ -599,7 +655,30 @@ public class Column implements Writable {
                 && getScale() == other.getScale()
                 && Objects.equals(comment, other.comment)
                 && visible == other.visible
-                && Objects.equals(children, other.children);
+                && Objects.equals(children, other.children)
+                && Objects.equals(realDefaultValue, other.realDefaultValue);
+    }
+
+    // distribution column compare only care about attrs which affect data,
+    // do not care about attrs, such as comment
+    public boolean equalsForDistribution(Column other) {
+        if (other == this) {
+            return true;
+        }
+
+        return name.equalsIgnoreCase(other.name)
+                && Objects.equals(getDefaultValue(), other.getDefaultValue())
+                && Objects.equals(aggregationType, other.aggregationType)
+                && isAggregationTypeImplicit == other.isAggregationTypeImplicit
+                && isKey == other.isKey
+                && isAllowNull == other.isAllowNull
+                && getDataType().equals(other.getDataType())
+                && getStrLen() == other.getStrLen()
+                && getPrecision() == other.getPrecision()
+                && getScale() == other.getScale()
+                && visible == other.visible
+                && Objects.equals(children, other.children)
+                && Objects.equals(realDefaultValue, other.realDefaultValue);
     }
 
     @Override
@@ -622,6 +701,7 @@ public class Column implements Writable {
         notNull = in.readBoolean();
         if (notNull) {
             defaultValue = Text.readString(in);
+            realDefaultValue = defaultValue;
         }
         stats = ColumnStats.read(in);
 
@@ -698,5 +778,17 @@ public class Column implements Writable {
 
     public void setCompoundKey(boolean compoundKey) {
         isCompoundKey = compoundKey;
+    }
+
+    @Override
+    public void gsonPostProcess() throws IOException {
+        // This just for bugfix. Because when user upgrade from 0.x to 1.1.x,
+        // the length of String type become 1. The reason is not very clear and maybe fixed by #14275.
+        // Here we try to rectify the error string length, by setting all String' length to MAX_STRING_LENGTH
+        // when replaying edit log.
+        if (type.isScalarType() && type.getPrimitiveType() == PrimitiveType.STRING
+                && type.getLength() != ScalarType.MAX_STRING_LENGTH) {
+            ((ScalarType) type).setLength(ScalarType.MAX_STRING_LENGTH);
+        }
     }
 }

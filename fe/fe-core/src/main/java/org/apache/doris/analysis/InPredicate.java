@@ -157,6 +157,7 @@ public class InPredicate extends Predicate {
     @Override
     public void analyzeImpl(Analyzer analyzer) throws AnalysisException {
         super.analyzeImpl(analyzer);
+        this.checkIncludeBitmap();
 
         if (contains(Subquery.class)) {
             // An [NOT] IN predicate with a subquery must contain two children, the second of
@@ -291,8 +292,8 @@ public class InPredicate extends Predicate {
     }
 
     @Override
-    public Expr getResultValue() throws AnalysisException {
-        recursiveResetChildrenResult();
+    public Expr getResultValue(boolean inView) throws AnalysisException {
+        recursiveResetChildrenResult(inView);
         final Expr leftChildValue = getChild(0);
         if (!(leftChildValue instanceof LiteralExpr) || !isLiteralChildren()) {
             return this;

@@ -20,6 +20,8 @@
 
 #include "vec/data_types/data_type_factory.hpp"
 
+#include "data_type_time.h"
+
 namespace doris::vectorized {
 
 DataTypePtr DataTypeFactory::create_data_type(const doris::Field& col_desc) {
@@ -85,19 +87,22 @@ DataTypePtr DataTypeFactory::create_data_type(const TypeDescriptor& col_desc, bo
         nested = std::make_shared<vectorized::DataTypeDateV2>();
         break;
     case TYPE_DATETIMEV2:
-        nested = std::make_shared<vectorized::DataTypeDateTimeV2>(col_desc.scale);
+        nested = vectorized::create_datetimev2(col_desc.scale);
         break;
     case TYPE_DATETIME:
         nested = std::make_shared<vectorized::DataTypeDateTime>();
         break;
     case TYPE_TIME:
     case TYPE_TIMEV2:
+        nested = std::make_shared<vectorized::DataTypeTime>();
+        break;
     case TYPE_DOUBLE:
         nested = std::make_shared<vectorized::DataTypeFloat64>();
         break;
     case TYPE_STRING:
     case TYPE_CHAR:
     case TYPE_VARCHAR:
+    case TYPE_BINARY:
         nested = std::make_shared<vectorized::DataTypeString>();
         break;
     case TYPE_JSONB:
@@ -170,7 +175,7 @@ DataTypePtr DataTypeFactory::_create_primitive_data_type(const FieldType& type, 
         result = std::make_shared<vectorized::DataTypeDateV2>();
         break;
     case OLAP_FIELD_TYPE_DATETIMEV2:
-        result = std::make_shared<vectorized::DataTypeDateTimeV2>(scale);
+        result = vectorized::create_datetimev2(scale);
         break;
     case OLAP_FIELD_TYPE_DATETIME:
         result = std::make_shared<vectorized::DataTypeDateTime>();
